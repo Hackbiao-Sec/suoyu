@@ -1909,12 +1909,19 @@ class StagesMixin:
         if not roots:
             self.progress("space", 100, "无已确认根域")
             return
-        limit = max(1, int(self.opt("space_max_roots", 60) or 60))
-        if len(roots) > limit:
+        # 0（或负数）= 不截断，把本轮确认的根域全部反查一遍；填正数才启用熔断
+        try:
+            limit = int(self.opt("space_max_roots", 0) or 0)
+        except (TypeError, ValueError):
+            limit = 0
+        if limit > 0 and len(roots) > limit:
             # 原来是字典序截断，大集团几十个根域时被砍掉的往往是资产最多那几棵
             roots = self._rank_roots(roots)[:limit]
-            self.log("space", f"根域超过上限，按主目标 + 已收集资产量排序后查前 {limit} 个"
-                              "（要查更多到「设置 → 采集参数 → 空间测绘 → 根域上限」调大）", "warn")
+            self.log("space", f"根域 {len(roots)} 棵超过你设的上限，按主目标 + 已收集资产量排序后只查前 {limit} 个；"
+                              "被砍掉的根域这一轮不会有新资产。要全查就把「设置 → 采集参数 → 空间测绘 → 根域上限」改成 0",
+                     "warn")
+        elif limit <= 0:
+            self.log("space", f"根域上限已关闭，本轮 {len(roots)} 棵根域全部反查（配额按根域 × 引擎消耗）")
         size = max(20, min(1000, int(self.opt("space_size", 100) or 100)))
         self.log("space", f"空间测绘开始：{len(roots)} 个根域 × {len(engines)} 台引擎"
                           f"（{', '.join(engines)}）")
@@ -2369,6 +2376,8 @@ class StagesMixin:
         errs: Counter = Counter()
         alive: list[str] = []
         blocked_log: list[str] = []
+        # 状态码回填用的对照表：host / ip + 端口 → 探测到的码
+        live_marks: list[dict] = []
 
         def absorb(info) -> None:
             """把一条探测结果并进资产表 / 计数器。主出口与备用出口的结果走同一套判定。"""
@@ -2380,6 +2389,13 @@ class StagesMixin:
                 return
             if not info.status:
                 return
+            _host = host_of(info.url) or ""
+            live_marks.append({
+                "host": _host,
+                "ip": next(iter(self.ips.get(_host) or ()), "") if _host else "",
+                "port": port_of(info.url) or 0,
+                "status": info.status,
+            })
             found += 1
             # 盾页 / 反代错误页 / 本机抓包代理占位页：有响应但正文不是这个站。
             # 存成 site 会让「拦截页」冒充资产，还会把盾的名字当成指纹与标题。
@@ -2496,6 +2512,12 @@ class StagesMixin:
                             f"{ALT_EXIT_BUDGET} 条，可用 alt_exit_budget 调整）；"
                             f"被盾挡住的站需要正文时把 http.scan_via_proxy 打开重跑", "warn")
         self.stats["sites"] = found
+        # domain / ip / service / api 自己不发 HTTP，按这次探测结果回填状态码，
+        # 资产列表才看得出哪一条是活的
+        if live_marks:
+            hit = store.mark_liveness(self.task_id, live_marks)
+            if hit:
+                self.log("web", f"状态码回填：{hit} 条域名/端口/接口资产补上存活码")
         # 网关占位页说明出口没到源站：探测方式错了，换出口重跑才拿得到业务站
         gate = sum(v for k, v in errs.items() if k.startswith("拦截:网关占位页"))
         if gate:
@@ -3488,6 +3510,13 @@ class StagesMixin:
             self.log("report", f"合并去重跳过：{str(e)[:120]}", "warn")
 
         kinds: Counter = Counter()
+        # 爬虫 / 深挖新增的 api、domain 行没赶上 web 阶段那次回填，这里再补一遍
+        try:
+            filled = store.backfill_liveness_from_sites(self.task_id)
+            if filled:
+                self.log("report", f"状态码补齐：{filled} 条资产按同主机站点回填")
+        except Exception as e:
+            self.log("report", f"状态码补齐跳过：{str(e)[:100]}", "warn")
         cdn_count = 0
         rows = store.query_assets(task_id=self.task_id, limit=200000)
         for r in rows:

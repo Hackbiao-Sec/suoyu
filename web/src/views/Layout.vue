@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { NAV } from '@/router'
 import { useAuthStore, useUiStore } from '@/stores'
-import { listTasks } from '@/api/endpoints'
+import { activeTasks } from '@/api/endpoints'
 import Icon from '@/components/Icon.vue'
 
 const auth = useAuthStore()
@@ -48,9 +48,8 @@ async function refreshBadges() {
     engineOk.value = false
   }
   try {
-    const res = await listTasks({ limit: 200 })
-    const items = res.items || []
-    runningCount.value = items.filter((t) => t.status === 'running' || t.status === 'pending').length
+    const res = await activeTasks()
+    runningCount.value = Number(res.running || 0) + Number(res.pending || 0)
   } catch {
     runningCount.value = 0
   }

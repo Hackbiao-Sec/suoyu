@@ -108,9 +108,11 @@ DEFAULTS: dict = {
         "openai": {"key": "", "relay": "", "api": "https://api.openai.com", "model": "gpt-4o-mini", "enabled": False},
     },
     "ai": {
-        "engine": "",        # 空=自动（deepseek 优先，其次 openai）
+        "engine": "",        # 空=自动（models 第一条，其次 deepseek，再 openai）
         "timeout": 90,
         "temperature": 0.2,
+        # 可切换的多套 LLM：[{name, model, base, key, note}]。base 写根地址（不带 /v1）
+        "models": [],
     },
     "http": {
         "timeout": 12,
@@ -177,7 +179,7 @@ DEFAULTS: dict = {
         # 留空 = 用配置里已填 key 的全部引擎；也可写死，如 ["fofa","hunter"]
         "space_engines": [],
         "space_size": 100,             # 每个根域每台引擎取多少条
-        "space_max_roots": 60,         # 单任务最多查多少个根域，防大集团把配额打光
+        "space_max_roots": 0,          # 单任务最多查多少个根域；0 = 不限（默认全查，填正数才熔断）
     },
     "deep": {
         # 深度挖掘阶段（对齐参考项目 P5）
@@ -373,9 +375,44 @@ class ConfigStore:
             if isinstance(v, dict):
                 out[k] = self._strip_masked(v, base.get(k) or {})
                 continue
+            if isinstance(v, list):
+                out[k] = self._strip_list(v, base.get(k))
+                continue
             if isinstance(v, str) and v and set(v) == {"*"}:
                 continue
             out[k] = v
+        return out
+
+    def _strip_list(self, value: list, base) -> list:
+        """列表里被打码的值按原条目找回（先按 name 对，再按下标）。
+
+        ``_deep_merge`` 对列表是整段替换，打码键不能像 dict 那样直接丢掉，
+        否则设置页一保存，``ai.models[].key`` 就被写成 ``********``。
+        """
+        old = base if isinstance(base, list) else []
+        out = []
+        for i, item in enumerate(value):
+            if not isinstance(item, dict):
+                # 字符串条目（如 cookie_pool: ["ck1", "ck2"]）打码后按原下标还原
+                if isinstance(item, str) and item and set(item) == {"*"} and i < len(old):
+                    out.append(old[i])
+                else:
+                    out.append(item)
+                continue
+            ref = None
+            name = item.get("name")
+            if name:
+                ref = next((o for o in old if isinstance(o, dict) and o.get("name") == name), None)
+            if ref is None and i < len(old) and isinstance(old[i], dict):
+                ref = old[i]
+            ref = ref or {}
+            merged = self._strip_masked(item, ref)
+            for k, orig in ref.items():
+                if k in merged:
+                    continue
+                if isinstance(item.get(k), str) and set(item.get(k) or "") == {"*"}:
+                    merged[k] = orig
+            out.append(merged)
         return out
 
     # ───────── 打码输出 ─────────
@@ -412,11 +449,49 @@ def src_base(name: str, fallback: str) -> str:
     return _norm_base(sec.get('relay') or sec.get('api') or fallback)
 
 
+def ai_models() -> list[dict]:
+    """``ai.models``：可切换的多套大模型，一条 = {name, model, base, key, note}。
+
+    base 统一存根地址（不带 ``/v1``），调用方自己拼 ``/v1/chat/completions``；
+    配置里照抄别处带 ``/v1`` 的写法也接得住，这里会削掉，免得拼成 ``/v1/v1/``。
+    """
+    raw = config.get('ai', 'models') or []
+    if isinstance(raw, dict):           # 也允许写成 name: {...} 的字典
+        raw = [dict(v, name=v.get('name') or k) for k, v in raw.items() if isinstance(v, dict)]
+    out: list[dict] = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get('name') or item.get('model') or '').strip()
+        model = str(item.get('model') or '').strip()
+        key = str(item.get('key') or item.get('api_key') or '').strip()
+        if not (name and model and key):
+            continue
+        base = _norm_base(item.get('base') or item.get('base_url') or '')
+        if base.lower().endswith('/v1'):
+            base = base[:-3].rstrip('/')
+        out.append({'name': name, 'model': model, 'key': key, 'base': base,
+                    'note': str(item.get('note') or '')})
+    return out
+
+
 def llm_engine() -> dict:
-    """当前生效的 LLM：{name, key, base, model}；没有可用 Key 时返回 {}。"""
+    """当前生效的 LLM：{name, key, base, model}；没有可用 Key 时返回 {}。
+
+    优先级：``ai.engine`` 点名的 ``ai.models`` 条目 → ``ai.models`` 第一条 →
+    原来的 ``sources.deepseek`` / ``sources.openai``（老配置继续能用）。
+    """
     official = {"deepseek": "https://api.deepseek.com", "openai": "https://api.openai.com"}
     default_model = {"deepseek": "deepseek-chat", "openai": "gpt-4o-mini"}
-    order = [config.get("ai", "engine") or "", "deepseek", "openai"]
+    picks = ai_models()
+    by_name = {p['name']: p for p in picks}
+    want = str(config.get("ai", "engine") or "").strip()
+    chosen = by_name.get(want) if want else (picks[0] if picks else None)
+    if chosen:
+        return {"name": chosen['name'], "key": chosen['key'],
+                "base": chosen['base'] or official.get(chosen['name'], "https://api.openai.com"),
+                "model": chosen['model']}
+    order = [want, "deepseek", "openai"]
     seen: set[str] = set()
     for name in order:
         if not name or name in seen:

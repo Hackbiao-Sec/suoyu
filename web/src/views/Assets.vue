@@ -1,12 +1,13 @@
 <script setup>
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import PageHead from '@/components/PageHead.vue'
 import Icon from '@/components/Icon.vue'
 import AssetTable from '@/components/AssetTable.vue'
 import {
   assetFacets, exportSheets, exportWorkbook, getTask, listAssets, listModules,
-  listTasks, riskOverview,
+  listTasks, repairLiveness, riskOverview,
 } from '@/api/endpoints'
 
 const route = useRoute()
@@ -271,6 +272,21 @@ function pick(field, value) {
   search()
 }
 
+// 历史任务的域名 / 接口 / 端口行没探过 HTTP，状态一直是空。
+// 这里按已探到的站点状态回填同主机的行，补完刷新就能看出死活。
+const repairing = ref(false)
+async function repairAlive() {
+  repairing.value = true
+  try {
+    const res = await repairLiveness(filters.task_id || '')
+    ElMessage.success(`已补全 ${res.updated || 0} 条资产的存活状态`)
+    await search()
+    loadFacets()
+  } finally {
+    repairing.value = false
+  }
+}
+
 function pickSurface(key) {
   filters.surface = filters.surface === key ? '' : key
   search()
@@ -489,6 +505,9 @@ onMounted(() => {
   <div class="stack">
     <PageHead title="资产台账" desc="全库检索：域名、站点、IP、服务、工商主体统一入库，按分表 / 任务 / 资产面拆开看">
       <template #actions>
+        <button class="btn sm" :disabled="repairing" @click="repairAlive">
+          <Icon name="bolt" :size="13" />{{ repairing ? '补全中…' : '补全存活状态' }}
+        </button>
         <button class="btn sm" @click="openRisk"><Icon name="bolt" :size="13" />脆弱资产</button>
         <button class="btn sm" :disabled="exporting" @click="exportAll">
           <Icon name="download" :size="13" />{{ exporting ? '导出中…' : '导出整本 Excel' }}

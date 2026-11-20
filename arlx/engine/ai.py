@@ -88,8 +88,9 @@ async def test() -> dict:
     try:
         txt = await chat("只回复两个字母：OK", timeout=45)
     except AIError as e:
-        return {"ok": False, "msg": str(e), **status()}
-    return {"ok": True, "msg": f"连通正常，回包：{txt.strip()[:40]}", **status()}
+        # status() 自带一个 msg，必须排在后面拼，否则真实报错会被它覆盖
+        return {**status(), "ok": False, "msg": str(e)}
+    return {**status(), "ok": True, "msg": f"连通正常，回包：{txt.strip()[:40]}"}
 
 
 # ─────────────── 1. 测绘语法 ───────────────

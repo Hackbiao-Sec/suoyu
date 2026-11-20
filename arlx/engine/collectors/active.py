@@ -17,18 +17,22 @@ from urllib.parse import urlsplit, urlunsplit
 
 import yaml
 
-from ...config import ROOT
+from ...config import DATA_DIR, ROOT
 from ...utils import is_ip, is_valid_domain, normalize_url, root_domain
 from ..dns_engine import DnsEngine
 from ..http_engine import probe
 from . import ownership
 
 DICT_DIR = ROOT / "arlx" / "dicts"
+# 界面上改过的字典落这里，同名时覆盖内置那份；打包后也能持久化
+USER_DICT_DIR = DATA_DIR / "dicts"
 
 
 # ─────────────── 域名爆破 ───────────────
 async def load_dict(name: str) -> list[str]:
-    p = DICT_DIR / name
+    p = USER_DICT_DIR / name
+    if not p.exists():
+        p = DICT_DIR / name
     if not p.exists():
         return []
     return [w.strip() for w in p.read_text(encoding="utf-8", errors="ignore").splitlines() if w.strip()]

@@ -3,7 +3,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import PageHead from '@/components/PageHead.vue'
 import Icon from '@/components/Icon.vue'
-import { aiStatus as aiStatusApi, getConfig, installTools, listAudit, listChannels, netDiagnose, saveChannels, saveConfig, setRelay, spaceEngines, spaceProbe, spaceProbeAll, testAi, testChannels, testConfig, throttleReset, throttleSave, throttleState, toolsCatalog, toolsStatus } from '@/api/endpoints'
+import { aiStatus as aiStatusApi, credState as credStateApi, getConfig, installTools, listAudit, listChannels, netDiagnose, saveChannels, saveConfig, setRelay, spaceEngines, spaceProbe, spaceProbeAll, testAi, testChannels, testConfig, throttleReset, throttleSave, throttleState, toolsCatalog, toolsStatus } from '@/api/endpoints'
 
 const loading = ref(false)
 const saving = ref(false)
@@ -68,7 +68,7 @@ const proxy = reactive({ url: '', sources_via_proxy: false, scan_via_proxy: fals
 const server = reactive({ host: '0.0.0.0', port: 5113, auth: true, api_key: '' })
 const deep = reactive({ ai_search: false, ai_triage: true })
 const mobile = reactive({ deep: true, jadx: false, apktool: false })
-const ai = reactive({ engine: '', timeout: 90, temperature: 0.2 })
+const ai = reactive({ engine: '', timeout: 90, temperature: 0.2, models: [] })
 const bulkRelay = ref('')
 const relayPicks = ref(['fofa'])
 
@@ -256,6 +256,11 @@ const credForm = reactive(Object.fromEntries(CRED_SOURCES.map((s) => [
   s.key, Object.fromEntries(s.fields.map(([f]) => [f, ''])),
 ])))
 const credPaste = reactive(Object.fromEntries(CRED_SOURCES.map((s) => [s.key, ''])))
+// 备用登录态：一行一份，保存后进 sources.<key>.cookie_pool；主值被封就自动轮换
+const credPool = reactive(Object.fromEntries(CRED_SOURCES.map((s) => [s.key, ''])))
+const credPoolDirty = reactive(Object.fromEntries(CRED_SOURCES.map((s) => [s.key, false])))
+// 后端内存里的池子状态（配了几份 / 当前第几份 / 哪份在冷却）
+const poolState = reactive({})
 
 // 把浏览器里复制的一整段（可能带 Request Headers 全文）归一成可用的 Cookie 行
 function normalizeCookie(text) {
@@ -298,6 +303,55 @@ function credReady(key) {
   return Object.values(v).some((x) => String(x || '').trim())
 }
 
+// 备用登录态一行一份：清洗成 Cookie 行、去重，保存后进 sources.<key>.cookie_pool
+function poolLines(key) {
+  const seen = new Set()
+  const out = []
+  for (const line of String(credPool[key] || '').split(/\r?\n/)) {
+    const v = normalizeCookie(line)
+    if (!v || seen.has(v)) continue
+    seen.add(v)
+    out.push(v)
+  }
+  return out
+}
+
+function applyCredPool(key) {
+  const lines = poolLines(key)
+  credPool[key] = lines.join('\n')
+  credPoolDirty[key] = true
+  if (!lines.length) return ElMessage.warning('没认出备用 Cookie，每行写一份 key=value; k2=v2')
+  ElMessage.success(`已整理成 ${lines.length} 份备用登录态，点保存生效`)
+}
+
+function clearPool(key) {
+  credPool[key] = ''
+  credPoolDirty[key] = true
+  ElMessage.info('已清空备用登录态，保存后只剩主值那一份')
+}
+
+// 池子现状：后端内存里配了几份、当前用第几份、还有几份在冷却
+function poolHint(key) {
+  const st = poolState[key]
+  if (!st || !st.total) return ''
+  const slots = Array.isArray(st.slots) ? st.slots : []
+  const cooling = slots.filter((s) => Number(s.cooling) > 0).length
+  const active = slots.find((s) => s.idx === st.active)
+  const tail = active ? `当前第 ${active.idx + 1} 份 …${active.tail}` : `共 ${st.total} 份`
+  return cooling ? `${tail} · ${cooling} 份冷却中` : tail
+}
+
+async function loadPool() {
+  try {
+    const res = await credStateApi()
+    const map = {}
+    for (const it of res.pool || []) map[it.source] = it
+    for (const k of CRED_KEYS) poolState[k] = map[k] || null
+  } catch {
+    /* 后端旧版没有这个接口，忽略 */
+  }
+}
+
 // 连过测试：后端按来源发一次真实请求，回的是「认了 / 没认 / 没填」，不用去任务日志里猜
 const credTesting = reactive({})
 const credState = reactive(Object.fromEntries(CRED_KEYS.map((k) => [k, null])))
@@ -316,12 +370,56 @@ const aiStatus = reactive({ ready: false, msg: '' })
 const aiMsg = ref('')
 const aiTesting = ref(false)
 
-// AI 面板编辑的就是 deepseek / openai 这一份配置，避免两处不一致
-const aiModel = computed({
-  get: () => sources[ai.engine === 'openai' ? 'openai' : 'deepseek'] || {},
-  set: (v) => { sources[ai.engine === 'openai' ? 'openai' : 'deepseek'] = v },
-})
+// ai.models：可以并存多套大模型（DeepSeek 官方 / autorouter 中转 / 本地修片…），
+// 引擎选哪条，下面表单就编哪条；老配置里只有 sources.deepseek / openai 的照样能选。
+const aiRows = computed(() => (Array.isArray(ai.models) ? ai.models : []))
+const aiLegacy = computed(() => (ai.engine === 'openai' || ai.engine === 'deepseek' ? ai.engine : ''))
+const aiRow = computed(() => aiRows.value.find((m) => m.name === ai.engine) || aiRows.value[0] || null)
+// 兜底对象固定，不然没条目时输入框写进每次新建的 {}，用户以为填上了其实丢了
+const aiBlank = {}
+const aiModel = computed(() => (aiLegacy.value ? sources[aiLegacy.value] || aiBlank : aiRow.value || aiBlank))
 const aiMasked = computed(() => String(aiModel.value?.key || '').includes('*'))
+
+// 引擎下拉：自动（第一条）/ 每条自定义模型 / 两个官方兜底
+const aiOptions = computed(() => [
+  { value: '', label: '自动（用列表第一条）' },
+  ...aiRows.value.map((m) => ({ value: m.name, label: `${m.name} · ${m.model || '未填模型'}` })),
+  { value: 'deepseek', label: 'DeepSeek（老配置 sources.deepseek）' },
+  { value: 'openai', label: 'OpenAI（老配置 sources.openai）' },
+])
+
+function aiPick(name) {
+  ai.engine = name
+}
+
+function aiAdd() {
+  if (!Array.isArray(ai.models)) ai.models = []
+  let n = ai.models.length + 1
+  while (ai.models.some((m) => m.name === `model${n}`)) n += 1
+  const item = { name: `model${n}`, model: '', base: '', key: '', note: '' }
+  ai.models.push(item)
+  ai.engine = item.name
+}
+
+function aiDel() {
+  const cur = aiRow.value
+  if (!cur) return
+  const idx = ai.models.indexOf(cur)
+  if (idx >= 0) ai.models.splice(idx, 1)
+  if (ai.engine === cur.name) ai.engine = aiRows.value[0]?.name || ''
+}
+
+// 改名要同步 engine，否则下拉指向一个不存在的条目，状态会退回「未接入」
+const aiName = computed({
+  get: () => aiRow.value?.name || '',
+  set: (v) => {
+    const name = String(v || '').trim()
+    const row = aiRow.value
+    if (!name || !row) return
+    if (ai.engine === row.name) ai.engine = name
+    row.name = name
+  },
+})
 
 const sourceList = computed(() =>
   Object.keys(SOURCE_META).map((k) => ({
@@ -503,6 +601,7 @@ async function load() {
     Object.assign(deep, cfg.deep || {})
     Object.assign(mobile, cfg.mobile || {})
     Object.assign(ai, cfg.ai || {})
+    loadPool()
   } finally {
     loading.value = false
   }
@@ -558,6 +657,8 @@ async function save() {
         const v = String(credForm[s.key][f] || '').trim()
         if (v) filled[f] = v
       }
+      // 备用登录态只在这次真编辑过时才提交：清空就送 [] 让后端删掉整段池子
+      if (credPoolDirty[s.key]) filled.cookie_pool = poolLines(s.key)
       if (Object.keys(filled).length) credPatch[s.key] = filled
     }
     await saveConfig({
@@ -569,6 +670,8 @@ async function save() {
       proxy: { ...proxy },
       server: { ...server },
     })
+    for (const k of CRED_KEYS) credPoolDirty[k] = false
+    loadPool()
     saved.value = true
     setTimeout(() => { saved.value = false }, 2400)
   } finally {
@@ -963,6 +1066,23 @@ onMounted(() => {
               <span class="field-label">{{ label }}</span>
               <textarea v-model="credForm[c.key][f]" class="textarea mono" style="min-height: 62px" placeholder="留空 = 不改动已保存的值" />
             </div>
+            <div class="field">
+              <span class="field-label">
+                备用登录态（一行一份）
+                <span v-if="poolHint(c.key)" class="muted" style="font-size: 11px; margin-left: 6px">{{ poolHint(c.key) }}</span>
+              </span>
+              <textarea
+                v-model="credPool[c.key]"
+                class="textarea mono"
+                style="min-height: 62px"
+                placeholder="每行一份完整 Cookie，例如：&#10;uin=abc; key=def&#10;uin=ghi; key=jkl"
+              />
+              <div class="row" style="gap: 6px">
+                <button class="btn xs" @click="applyCredPool(c.key)"><Icon name="check" :size="11" />清洗去重</button>
+                <button class="btn xs" @click="clearPool(c.key)"><Icon name="trash" :size="11" />清空备用</button>
+                <span class="field-hint flex-1">主值被 429 / 403 挡下就按顺序换下一份重打，冷却过了自动回来。</span>
+              </div>
+            </div>
             <details>
               <summary class="muted" style="cursor: pointer; font-size: 12px">怎么取</summary>
               <span class="field-hint">{{ c.how }}</span>
@@ -1126,30 +1246,70 @@ onMounted(() => {
         </div>
         <div class="panel-body stack" style="gap: 10px">
           <div class="field">
-            <span class="field-label">首选引擎</span>
+            <span class="field-label">首选引擎（可并存多套，切换即生效）</span>
             <select v-model="ai.engine" class="input">
-              <option value="">自动（DeepSeek 优先）</option>
-              <option value="deepseek">DeepSeek</option>
-              <option value="openai">OpenAI</option>
+              <option v-for="o in aiOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
             </select>
           </div>
+          <div class="ai-list">
+            <div
+              v-for="m in aiRows" :key="m.name"
+              class="ai-item" :class="{ on: aiRow && aiRow.name === m.name }"
+              @click="aiPick(m.name)"
+            >
+              <div class="ai-item-top">
+                <span class="ai-item-name">{{ m.name }}</span>
+                <span class="mono muted">{{ m.model || '未填模型' }}</span>
+              </div>
+              <div class="mono muted ellipsis">{{ m.base || '未填地址（走官方）' }}</div>
+              <div v-if="m.note" class="muted ellipsis">{{ m.note }}</div>
+            </div>
+            <div v-if="!aiRows.length" class="empty">还没有模型条目，点「新增模型」填一条</div>
+          </div>
+          <div class="row" style="gap: 8px">
+            <button class="btn xs" @click="aiAdd"><Icon name="plus" :size="11" />新增模型</button>
+            <button class="btn xs" :disabled="!aiRow" @click="aiDel"><Icon name="trash" :size="11" />删除当前</button>
+          </div>
+          <div v-if="aiLegacy" class="field-hint">
+            正在编辑老配置 <span class="mono">sources.{{ aiLegacy }}</span>：它的 Key / 地址 / 模型名是任务里 P1、研判、小结真正读的那一份。
+          </div>
+          <template v-else>
+            <div class="row" style="gap: 10px">
+              <div class="field flex-1">
+                <span class="field-label">条目名（引擎下拉显示这个名字）</span>
+                <input v-model="aiName" class="input mono" placeholder="deepseek-flash" />
+              </div>
+              <div class="field flex-1">
+                <span class="field-label">模型名（发给 API 的 model）</span>
+                <input v-model="aiModel.model" class="input mono" placeholder="deepseek-chat" />
+              </div>
+            </div>
+            <div class="field">
+              <span class="field-label">接口根地址（不带 /v1，程序自己拼 /v1/chat/completions）</span>
+              <input v-model="aiModel.base" class="input mono" placeholder="https://api.deepseek.com" />
+            </div>
+          </template>
           <div class="field">
             <span class="field-label">API Key</span>
             <input v-model="aiModel.key" class="input mono" type="password" :placeholder="aiMasked ? '已保存（不改动则保留原值）' : 'sk-…'" />
           </div>
-          <div class="field">
-            <span class="field-label">中转站 / 自定义地址（例如 https://your-relay.com，必须能转发 /v1/chat/completions）</span>
-            <input v-model="aiModel.relay" class="input mono" placeholder="https://api.deepseek.com" />
-          </div>
-          <div class="row" style="gap: 10px">
+          <div v-if="aiLegacy" class="row" style="gap: 10px">
+            <div class="field flex-1">
+              <span class="field-label">中转站 / 自定义地址（必须能转发 /v1/chat/completions）</span>
+              <input v-model="aiModel.relay" class="input mono" placeholder="https://api.deepseek.com" />
+            </div>
             <div class="field flex-1">
               <span class="field-label">模型名</span>
               <input v-model="aiModel.model" class="input mono" placeholder="deepseek-chat" />
             </div>
-            <div class="field" style="width: 110px">
-              <span class="field-label">超时（秒）</span>
-              <input v-model.number="ai.timeout" class="input mono" type="number" />
-            </div>
+          </div>
+          <div v-else class="field">
+            <span class="field-label">备注（这条是干什么的，比如「本地 8787 修片，服务没起时不可用」）</span>
+            <input v-model="aiModel.note" class="input" placeholder="说明这条模型的用途" />
+          </div>
+          <div class="field" style="width: 130px">
+            <span class="field-label">超时（秒）</span>
+            <input v-model.number="ai.timeout" class="input mono" type="number" />
           </div>
           <div class="row">
             <button class="btn xs" :disabled="aiTesting" @click="testAI"><Icon name="bolt" :size="11" />测试大模型</button>
@@ -1432,4 +1592,15 @@ onMounted(() => {
 .chan-note { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chan-ms { font-size: 11px; text-align: right; }
 .chan-row .switch { cursor: pointer; }
+
+/* 多模型清单：点一条就切到它，下面表单跟着变 */
+.ai-list { display: flex; flex-direction: column; gap: 4px; max-height: 210px; overflow: auto; }
+.ai-item {
+  padding: 5px 8px; border: 1px solid var(--line); border-radius: 5px;
+  cursor: pointer; display: flex; flex-direction: column; gap: 2px; font-size: 11.5px;
+}
+.ai-item:hover { background: var(--surface-2); }
+.ai-item.on { border-color: var(--accent); background: var(--surface-2); }
+.ai-item-top { display: flex; align-items: baseline; gap: 8px; }
+.ai-item-name { font-weight: 600; color: var(--text); }
 </style>

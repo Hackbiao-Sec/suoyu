@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import DATA_DIR, ROOT, config, src_base
 from .db import RISK_RULES, SURFACE_LABEL, audit, store
+from .db import with_liveness, live_state
 from .engine import ai as ai_engine
 from .engine import beauty
 from .engine import dedupe
@@ -162,13 +163,13 @@ async def me(request: Request) -> dict:
 
 # ─────────────── 配置 ───────────────
 @app.get("/api/config")
-async def get_config(request: Request) -> dict:
+def get_config(request: Request) -> dict:
     current_user(request)
     return {"ok": True, "config": config.masked()}
 
 
 @app.post("/api/config")
-async def set_config(request: Request, patch: dict = Body(...)) -> dict:
+def set_config(request: Request, patch: dict = Body(...)) -> dict:
     user = current_user(request)
     masked = config.masked()
     config.persist(patch)
@@ -176,6 +177,17 @@ async def set_config(request: Request, patch: dict = Body(...)) -> dict:
     audit("config_update", json.dumps(list(patch.keys())), user=user)
     _ = masked
     return {"ok": True, "config": config.masked()}
+
+
+@app.get("/api/creds")
+def creds_state(request: Request) -> dict:
+    """各来源的登录态池：配了几份、当前用第几份、哪份在冷却。
+
+    池子只在内存里记冷却，所以这里看到的就是这一轮采集正在用的那份。
+    """
+    current_user(request)
+    from .engine import creds as creds_mod
+    return {"ok": True, "pool": creds_mod.state()}
 
 
 @app.post("/api/config/test")
@@ -251,14 +263,14 @@ async def test_config(request: Request, body: dict = Body(...)) -> dict:
 
 
 @app.get("/api/sources")
-async def list_sources(request: Request) -> dict:
+def list_sources(request: Request) -> dict:
     current_user(request)
     return {"ok": True, "items": source_meta(), "free": FREE_SOURCES}
 
 
 # ─────────────── 渠道：目录 / 开关 / 自检 ───────────────
 @app.get("/api/channels")
-async def list_channels(request: Request) -> dict:
+def list_channels(request: Request) -> dict:
     """渠道目录 + 启用开关 + 上次自检结果。"""
     current_user(request)
     from .engine import channels as channels_mod
@@ -267,7 +279,7 @@ async def list_channels(request: Request) -> dict:
 
 
 @app.post("/api/channels")
-async def save_channels(request: Request, body: dict = Body(...)) -> dict:
+def save_channels(request: Request, body: dict = Body(...)) -> dict:
     """改开关：{off: [key…]} 整表覆盖，或 {key, enabled} 单路切换。"""
     user = current_user(request)
     from .engine import channels as channels_mod
@@ -305,17 +317,109 @@ async def test_channels(request: Request, body: dict = Body(...)) -> dict:
 
 
 @app.get("/api/options")
-async def list_options(request: Request) -> dict:
+def list_options(request: Request) -> dict:
     current_user(request)
-    from .engine.collectors.active import DICT_DIR
+    from .engine import dicts as dicts_mod
 
-    dicts = sorted(p.name for p in DICT_DIR.glob("*.txt"))
+    dicts = sorted({d["name"] for d in dicts_mod.list_dicts()})
     from .engine.portscan import PORT_PRESET_LABELS
 
     return {"ok": True, "ports": list(PORT_PRESETS), "dicts": dicts,
             "port_presets": [{"v": k, "label": v} for k, v in PORT_PRESET_LABELS.items()],
             "phases": [{"key": k, "label": lab} for _, k, lab in pipeline.PHASES],
             "tools": {n: enterprise.tool_available(n) for n in enterprise.TOOL_PATHS}}
+
+
+# ─────────────── 字典管理 ───────────────
+@app.get("/api/dicts")
+def dicts_index(request: Request) -> dict:
+    """字典清单：行数、来源（内置/用户覆盖）、被哪个采集步骤引用。"""
+    current_user(request)
+    from .engine import dicts as dicts_mod
+
+    return {"ok": True,
+            "user_dir": str(dicts_mod.USER_DIR),
+            "builtin_dir": str(dicts_mod.BUILTIN_DIR),
+            "items": dicts_mod.list_dicts(),
+            "bindings": dicts_mod._binding_state()}
+
+
+@app.get("/api/dicts/{name}")
+def dicts_preview(request: Request, name: str, offset: int = Query(0),
+                        limit: int = Query(2000), raw: int = Query(0)) -> dict:
+    current_user(request)
+    from .engine import dicts as dicts_mod
+
+    try:
+        return {"ok": True, **dicts_mod.read_dict(name, offset, limit, raw=bool(raw))}
+    except FileNotFoundError:
+        raise HTTPException(404, "字典不存在")
+
+
+@app.post("/api/dicts")
+def dicts_create(request: Request, body: dict = Body(...)) -> dict:
+    """新建字典；同名内置字典会写一份用户覆盖文件，内置原文件不动。"""
+    user = current_user(request)
+    from .engine import dicts as dicts_mod
+
+    name = str(body.get("name") or "").strip()
+    content = body.get("content") or ""
+    words = dicts_mod.clean_words(content if isinstance(content, str) else "\n".join(content))
+    try:
+        out = dicts_mod.write_dict(name, words, append=bool(body.get("append")))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    audit("dicts.create", name, f"写入 {out['lines']} 行", user)
+    return {"ok": True, **out}
+
+
+@app.put("/api/dicts/{name}")
+def dicts_update(request: Request, name: str, body: dict = Body(...)) -> dict:
+    user = current_user(request)
+    from .engine import dicts as dicts_mod
+
+    mode = str(body.get("mode") or "replace")
+    content = body.get("content") or ""
+    words = dicts_mod.clean_words(content if isinstance(content, str) else "\n".join(content))
+    if mode == "append" and not words:
+        raise HTTPException(400, "追加内容为空")
+    try:
+        out = dicts_mod.write_dict(name, words, append=(mode == "append"))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    audit("dicts.update", name, f"{mode} → {out['lines']} 行", user)
+    return {"ok": True, **out}
+
+
+@app.delete("/api/dicts/{name}")
+def dicts_delete(request: Request, name: str) -> dict:
+    user = current_user(request)
+    from .engine import dicts as dicts_mod
+
+    try:
+        out = dicts_mod.delete_dict(name)
+    except FileNotFoundError:
+        raise HTTPException(404, "用户字典里没有这份文件（内置字典只能覆盖，不能删除）")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    audit("dicts.delete", name, "删除用户覆盖", user)
+    return {"ok": True, **out}
+
+
+@app.post("/api/dicts/{name}/bind")
+def dicts_bind(request: Request, name: str, body: dict = Body(...)) -> dict:
+    """把某个采集配置项指向这份字典。"""
+    user = current_user(request)
+    from .engine import dicts as dicts_mod
+
+    try:
+        out = dicts_mod.bind(name, str(body.get("key") or ""))
+    except FileNotFoundError:
+        raise HTTPException(404, "字典不存在")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    audit("dicts.bind", name, f"{out['key']} → {name}", user)
+    return {"ok": True, **out}
 
 
 # ─────────────── 任务 ───────────────
@@ -375,9 +479,21 @@ def _decorate_tasks(items: list[dict]) -> list[dict]:
 
 
 @app.get("/api/tasks")
-async def list_tasks(request: Request, limit: int = 100) -> dict:
+def list_tasks(request: Request, limit: int = 100) -> dict:
+    # 同步 SQLite 聚合放线程池跑：写成 async def 会把事件循环占住，
+    # 任务列表一刷新，同时在加载的任务详情就跟着卡住。
     current_user(request)
     return {"ok": True, "items": _decorate_tasks(store.list_tasks(limit))}
+
+
+@app.get("/api/tasks/active")
+def active_tasks(request: Request) -> dict:
+    """顶栏 / 左栏角标专用：只回各状态任务数，不拉任务表和资产聚合。"""
+    current_user(request)
+    counts = store.task_status_counts()
+    return {"ok": True, "counts": counts,
+            "running": int(counts.get("running", 0)),
+            "pending": int(counts.get("pending", 0))}
 
 
 @app.get("/api/modules")
@@ -392,7 +508,7 @@ async def list_modules(request: Request) -> dict:
 
 
 @app.get("/api/tasks/{task_id}")
-async def get_task(request: Request, task_id: str) -> dict:
+def get_task(request: Request, task_id: str) -> dict:
     current_user(request)
     task = store.get_task(task_id)
     if not task:
@@ -403,7 +519,7 @@ async def get_task(request: Request, task_id: str) -> dict:
 
 
 @app.post("/api/tasks/{task_id}/stop")
-async def stop_task(request: Request, task_id: str) -> dict:
+def stop_task(request: Request, task_id: str) -> dict:
     user = current_user(request)
     ok = pipeline.stop_task(task_id)
     audit("task_stop", task_id, user=user)
@@ -465,7 +581,7 @@ async def rerun_task(request: Request, task_id: str, stage: str = "") -> dict:
 
 
 @app.get("/api/stages/rerun")
-async def rerun_stages(request: Request) -> dict:
+def rerun_stages(request: Request) -> dict:
     """可单独重跑的阶段，给前端阶段弹窗按名字开关按钮"""
     current_user(request)
     return {"ok": True, "stages": pipeline.RERUN_STAGES,
@@ -474,7 +590,7 @@ async def rerun_stages(request: Request) -> dict:
 
 # ─────────────── 功能单项执行 ───────────────
 @app.get("/api/ops")
-async def ops_catalog(request: Request) -> dict:
+def ops_catalog(request: Request) -> dict:
     """全部可单独执行的功能：阶段类（建任务跑）与直连类（同步出结果）。
 
     给「功能自检」页做清单：每项吃哪种输入、依赖哪些上游、有哪些参数。
@@ -549,7 +665,7 @@ async def ops_run(request: Request, body: dict = Body(...)) -> dict:
 
 
 @app.get("/api/tasks/{task_id}/logs")
-async def task_logs(request: Request, task_id: str, after_id: int = 0, limit: int = 500) -> dict:
+def task_logs(request: Request, task_id: str, after_id: int = 0, limit: int = 500) -> dict:
     current_user(request)
     return {"ok": True, "items": store.get_logs(task_id, after_id, limit)}
 
@@ -585,7 +701,7 @@ async def task_stream(request: Request, task_id: str) -> StreamingResponse:
 
 # ─────────────── 资产 ───────────────
 @app.get("/api/assets")
-async def query_assets(request: Request, kind: str = "", kinds: str = "", keyword: str = "",
+def query_assets(request: Request, kind: str = "", kinds: str = "", keyword: str = "",
                        host: str = "", ip: str = "", root_domain: str = "", task_id: str = "",
                        cdn: str = "", port: int = 0, limit: int = 100, offset: int = 0,
                        order: str = "last_seen DESC", is_new: int = 0,
@@ -605,22 +721,36 @@ async def query_assets(request: Request, kind: str = "", kinds: str = "", keywor
             it["extra"] = json.loads(it.pop("extra_json", "") or "{}")
         except Exception:
             it["extra"] = {}
+        # 存活状态：站点看状态码，域名看解析，端口看是实测还是测绘收录
+        with_liveness(it)
     total = store.count_assets(**{k: v for k, v in f.items()
                                   if k not in ("limit", "offset", "order")})
     return {"ok": True, "items": items, "total": total}
 
 
+@app.post("/api/assets/liveness")
+def repair_liveness(request: Request, task_id: str = "") -> dict:
+    """补全存活状态：把已探到的站点状态码回填给同主机的域名 / 端口 / 接口行。
+
+    历史任务（以及 web 探测之后才落库的接口、域名行）状态码一直是空的，资产表里
+    看不出死活。这里按任务或全库补一遍，补完前端刷新即可看到「存活 / 响应 / 解析」。
+    """
+    current_user(request)
+    hit = store.repair_liveness(task_id)
+    return {"ok": True, "updated": hit, "task_id": task_id}
+
+
 # 注意顺序：/api/assets/facets 必须注册在 /api/assets/{asset_id} 之前，
 # 否则 "facets" 会被当成 asset_id 解析成整数直接 422。
 @app.get("/api/assets/facets")
-async def facets(request: Request, task_id: str = "", stage: str = "") -> dict:
+def facets(request: Request, task_id: str = "", stage: str = "") -> dict:
     current_user(request)
     return {"ok": True, "surfaces": store.surface_counts(task_id=task_id, stage=stage),
             "labels": SURFACE_LABEL, **store.facets(task_id=task_id, stage=stage)}
 
 
 @app.get("/api/risk")
-async def risk_view(request: Request, task_id: str = "", limit: int = 12) -> dict:
+def risk_view(request: Request, task_id: str = "", limit: int = 12) -> dict:
     """脆弱资产：整体预览与按任务分隔共用这一个接口"""
     current_user(request)
     return {"ok": True, "task_id": task_id, "rules": [k for k, _l, _c in RISK_RULES],
@@ -629,7 +759,7 @@ async def risk_view(request: Request, task_id: str = "", limit: int = 12) -> dic
 
 
 @app.get("/api/risk/by-task")
-async def risk_by_task(request: Request, limit: int = 200) -> dict:
+def risk_by_task(request: Request, limit: int = 200) -> dict:
     """按任务分隔的脆弱资产：每趟侦察各自有多少条、落在哪几个桶"""
     current_user(request)
     return {"ok": True, "labels": {k: label for k, label, _c in RISK_RULES},
@@ -637,7 +767,7 @@ async def risk_by_task(request: Request, limit: int = 200) -> dict:
 
 
 @app.get("/api/tasks/{task_id}/summary")
-async def task_summary(request: Request, task_id: str) -> dict:
+def task_summary(request: Request, task_id: str) -> dict:
     """单个任务自己的资产收集画像：分类、来源、根域、阶段证据。
 
     任务详情的资产 tab 靠这个接口回答「这趟到底收到了什么、哪一路出的」，
@@ -710,7 +840,7 @@ async def task_summary(request: Request, task_id: str) -> dict:
 
 
 @app.get("/api/tasks/{task_id}/stages")
-async def task_stages(request: Request, task_id: str) -> dict:
+def task_stages(request: Request, task_id: str) -> dict:
     """逐阶段明细：每个阶段跑了多久、打了多少日志、这一阶段收进了哪些资产。
 
     任务详情的阶段轨迹要能点开，靠这个接口回答「点进去到底能看什么」。
@@ -765,42 +895,45 @@ async def task_stages(request: Request, task_id: str) -> dict:
         # 归属优先看关联表记的阶段；老任务没记阶段时回落到时间窗。
         # 资产行按 url 全局合并：first_seen 可能是别的任务留下的，所以
         # 「首次见到」或「这趟又见到」（last_seen 每次 upsert 都刷新）都算本阶段产出。
-        kinds = [dict(r) for r in c.execute(
-            "SELECT a.kind value, COUNT(*) count FROM assets a JOIN task_assets t"
-            " ON t.asset_id=a.id WHERE t.task_id=? AND t.stage=?"
-            " GROUP BY a.kind ORDER BY count DESC", (task_id, key)).fetchall()]
+        # 明细一次取回，kinds / sources / ports / roots 在内存里聚合。
+        # 原来每阶段 6 条 join 扫描，14 个阶段就是 84 条，点开任务要等一秒。
+        cols = ("SELECT a.id, a.kind, a.url, a.title, a.status_code, a.fingerprint, a.sources,"
+                " a.host, a.ip, a.ips, a.port, a.root_domain"
+                " FROM assets a JOIN task_assets t ON t.asset_id=a.id WHERE ")
         where = "t.task_id=? AND t.stage=?"
         vals: tuple = (task_id, key)
-        if not kinds:
+        rows = c.execute(cols + where + " ORDER BY a.id DESC LIMIT 5000", vals).fetchall()
+        if not rows:
             where = ("t.task_id=? AND (t.stage IS NULL OR t.stage='') AND ("
                      "a.first_seen BETWEEN ? AND ? OR a.last_seen BETWEEN ? AND ?)")
             vals = (task_id, lo, hi + 1, lo, hi + 1)
-            kinds = [dict(r) for r in c.execute(
-                "SELECT a.kind value, COUNT(*) count FROM assets a JOIN task_assets t"
-                " ON t.asset_id=a.id WHERE " + where + " GROUP BY a.kind ORDER BY count DESC",
-                vals).fetchall()]
-        assets = [dict(r) for r in c.execute(
-            "SELECT a.id, a.kind, a.url, a.title, a.status_code, a.fingerprint, a.sources"
-            " FROM assets a JOIN task_assets t ON t.asset_id=a.id WHERE " + where +
-            " ORDER BY a.id DESC LIMIT 60", vals).fetchall()]
+            rows = c.execute(cols + where + " ORDER BY a.id DESC LIMIT 5000", vals).fetchall()
 
-        # 点开阶段要看的不只是清单，还要能一眼看出这一阶段「从哪来、落在哪些口、扫了哪几个根域」
-        def dist(sql: str) -> list[dict]:
-            return [dict(r) for r in c.execute(sql, vals).fetchall()]
+        kc: dict[str, int] = {}
+        sc: dict[str, int] = {}
+        pc: dict[int, int] = {}
+        rc: dict[str, int] = {}
+        for r in rows:
+            k = r["kind"] or "unknown"
+            kc[k] = kc.get(k, 0) + 1
+            s = (r["sources"] or "").strip() or "未知"
+            sc[s] = sc.get(s, 0) + 1
+            p = int(r["port"] or 0)
+            if p > 0:
+                pc[p] = pc.get(p, 0) + 1
+            # 工商 / 备案这类资产本身没有域名，只统计带根域的，别把几百条顶进榜首
+            rd = r["root_domain"] or ""
+            if rd:
+                rc[rd] = rc.get(rd, 0) + 1
 
-        sources = dist("SELECT COALESCE(NULLIF(a.sources,''),'未知') name, COUNT(*) count"
-                       " FROM assets a JOIN task_assets t ON t.asset_id=a.id WHERE " + where +
-                       " GROUP BY name ORDER BY count DESC LIMIT 12")
-        ports = dist("SELECT a.port port, COUNT(*) count FROM assets a JOIN task_assets t"
-                     " ON t.asset_id=a.id WHERE " + where +
-                     " AND a.port IS NOT NULL AND a.port>0 GROUP BY a.port"
-                     " ORDER BY count DESC LIMIT 12")
-        # 工商 / 备案这类资产本身没有域名，塞进「未归类」会把几百条顶到第一行，
-        # 真正带域名的几个反而被挤出榜，所以这里只统计有根域的
-        roots = dist("SELECT a.root_domain name, COUNT(*) count"
-                     " FROM assets a JOIN task_assets t ON t.asset_id=a.id WHERE " + where +
-                     " AND a.root_domain IS NOT NULL AND a.root_domain<>''"
-                     " GROUP BY name ORDER BY count DESC LIMIT 12")
+        def top(counter: dict, limit: int = 12) -> list[tuple]:
+            return sorted(counter.items(), key=lambda kv: -kv[1])[:limit]
+
+        kinds = [{"value": k, "count": n} for k, n in top(kc)]
+        assets = [with_liveness(dict(r)) for r in rows[:60]]
+        sources = [{"name": k, "count": n} for k, n in top(sc)]
+        ports = [{"port": k, "count": n} for k, n in top(pc)]
+        roots = [{"name": k, "count": n} for k, n in top(rc)]
         # 阶段窗只在开头写过一次时 start=end，算出来是 0 秒；日志跨度更接近真实耗时。
         # 两者取大：真跑了一刻钟的阶段不该显示 0 秒，一跳就过的阶段也别被日志拉长。
         span = max(max(0.0, (hi or 0) - (lo or 0)),
@@ -889,7 +1022,7 @@ def _ubo_of(d: dict, root: dict) -> dict:
 
 
 @app.get("/api/tasks/{task_id}/equity")
-async def task_equity_tree(request: Request, task_id: str) -> dict:
+def task_equity_tree(request: Request, task_id: str) -> dict:
     """股权穿透树：把链路拍平成 parent → children，交给前端画树图。
 
     ``chain`` 里每一项都带 parent / ratio / acc_ratio / depth，
@@ -956,7 +1089,7 @@ async def task_equity_tree(request: Request, task_id: str) -> dict:
 
 
 @app.get("/api/tasks/{task_id}/sources")
-async def task_sources(request: Request, task_id: str) -> dict:
+def task_sources(request: Request, task_id: str) -> dict:
     """渠道面板：这次任务用了哪些数据渠道，哪些失效 / 额度尽 / 没配凭据。
 
     数据在采集时按「阶段 + 渠道」累加写入 ``task_sources``，这里只做聚合和排序，
@@ -969,7 +1102,7 @@ async def task_sources(request: Request, task_id: str) -> dict:
 
 
 @app.get("/api/assets/{asset_id}")
-async def asset_detail(request: Request, asset_id: int) -> dict:
+def asset_detail(request: Request, asset_id: int) -> dict:
     current_user(request)
     rows = store.query_assets(limit=1)
     conn = store.conn()
@@ -981,12 +1114,13 @@ async def asset_detail(request: Request, asset_id: int) -> dict:
         d["extra"] = json.loads(d.pop("extra_json", "") or "{}")
     except Exception:
         d["extra"] = {}
+    with_liveness(d)
     _ = rows
     return {"ok": True, "item": d}
 
 
 @app.get("/api/stats")
-async def stats(request: Request) -> dict:
+def stats(request: Request) -> dict:
     current_user(request)
     data = store.stats()
     data["tasks"] = len(store.list_tasks(1000))
@@ -995,7 +1129,7 @@ async def stats(request: Request) -> dict:
 
 
 @app.get("/api/diff")
-async def asset_diff(request: Request, root: str = "", limit: int = 200) -> dict:
+def asset_diff(request: Request, root: str = "", limit: int = 200) -> dict:
     """每轮快照对比：返回各根域最近一次的新增数量与新增条目"""
     current_user(request)
     roots = [root] if root else [r["root_domain"] for r in store.stats().get("top_roots", [])]
@@ -1014,7 +1148,7 @@ async def asset_diff(request: Request, root: str = "", limit: int = 200) -> dict
 
 # 全资产导出的列：基础列全体共用，其余按类型补。列名用中文，
 # 直接丢给 Excel / 交接文档不用再翻译一遍。
-EXPORT_BASE_COLS = ["类型", "地址", "主机", "IP", "端口", "根域", "标题", "状态码", "指纹",
+EXPORT_BASE_COLS = ["类型", "地址", "主机", "IP", "端口", "根域", "标题", "状态码", "存活", "指纹",
                     "服务", "中间件", "CDN", "来源", "首次发现", "最后发现",
                     "协议", "应用", "Whois", "ISP", "OS", "地区", "更新时间"]
 EXPORT_EXTRA_COLS = ["应用名", "接口路径", "所属页面", "Banner", "服务标识", "证书主体",
@@ -1029,8 +1163,43 @@ EXPORT_SHEETS: dict[str, dict] = {
     # 测绘阶段落两类资产：裸 IP 记服务、域名记域名。hostname 那批跟被动子域混在
     # 同一个 kind 里，按 kind 分不开，所以这张表只放裸 IP 服务 —— 至少条数是真的。
     "space": {"label": "空间测绘", "kinds": ["service"],
-              "cols": ["ID", "URL", "IP", "端口", "协议", "标题", "指纹", "应用",
+              "cols": ["ID", "URL", "IP", "端口", "存活", "协议", "标题", "指纹", "应用",
                        "Whois", "ICP备案", "ISP", "OS", "地区", "更新时间", "来源"]},
+    # ── 主资产类型各占一张表：站点 / 域名 / IP / 接口 / JS / 组件 / 泄露 / VHost / 仓库 / 邮箱 ──
+    # 之前只有测绘和 C 段分表，domain / site / api 这些量最大的类型全挤在「全量资产」里，
+    # 交接时要在几万行里手工筛。按 kind 拆开后每张表列也按该类型的口径给。
+    "site": {"label": "站点", "kinds": ["site"],
+             "cols": ["ID", "URL", "域名", "IP", "端口", "状态码", "存活", "标题", "指纹", "中间件",
+                      "CDN", "应用", "协议", "证书主体", "证书到期", "来源", "首次发现",
+                      "最后发现", "更新时间"]},
+    "domain": {"label": "域名", "kinds": ["domain"],
+               "cols": ["ID", "域名", "IP", "端口", "根域", "标题", "状态码", "存活", "来源",
+                        "Whois", "ISP", "地区", "首次发现", "最后发现"]},
+    "ip": {"label": "IP 地址", "kinds": ["ip"],
+           "cols": ["ID", "IP", "端口", "存活", "根域", "ASN", "持有者", "ISP", "OS", "地区",
+                    "标题", "来源", "最后发现"]},
+    "api": {"label": "接口", "kinds": ["api"],
+            "cols": ["ID", "URL", "域名", "接口路径", "所属页面", "状态码", "存活", "标题",
+                     "指纹", "应用", "来源", "首次发现", "最后发现"]},
+    "js": {"label": "JS 文件", "kinds": ["js"],
+           "cols": ["ID", "URL", "域名", "接口路径", "所属页面", "状态码", "存活", "指纹",
+                    "来源", "最后发现"]},
+    "component": {"label": "组件", "kinds": ["component"],
+                  "cols": ["ID", "URL", "域名", "名称", "当前版本", "指纹", "应用",
+                           "来源", "证据", "最后发现"]},
+    "leak": {"label": "敏感泄露", "kinds": ["leak", "leakfile"],
+             "cols": ["ID", "URL", "域名", "泄露类型", "泄露内容", "命中的位置", "状态码",
+                      "存活", "标题", "证据", "来源", "最后发现"]},
+    "vhost": {"label": "VHost", "kinds": ["vhost"],
+              "cols": ["ID", "URL", "域名", "IP", "端口", "状态码", "存活", "标题", "指纹",
+                       "来源", "最后发现"]},
+    "git": {"label": "Git 仓库", "kinds": ["git"],
+            "cols": ["ID", "URL", "仓库", "域名", "状态码", "存活", "证据", "来源", "最后发现"]},
+    "email": {"label": "邮箱", "kinds": ["email", "mailinfo"],
+              "cols": ["ID", "邮箱", "域名", "邮箱来源", "数据关联", "来源", "最后发现"]},
+    "equity": {"label": "股权关系", "kinds": ["equity"],
+               "cols": ["ID", "公司名称", "企业名称", "股东名称", "持股比例", "数据关联",
+                        "来源", "最后发现"]},
     # C 段单独一张表：旁站 / 同段业务页（sibling）和 ASN 归集出的网段（netblock）。
     # 这两类资产量小、跟主资产口径不同，混进全量表容易被当成目标主站，单独导才看得清。
     "csegment": {"label": "C段/网段", "kinds": ["sibling", "netblock"],
@@ -1204,6 +1373,8 @@ def _export_row(r: dict) -> dict:
         "IP": r.get("ip"), "端口": r.get("port"), "根域": r.get("root_domain"),
         "标题": r.get("title") or extra.get("title") or "",
         "状态码": r.get("status_code"),
+        # 存活：站点看码、域名看解析、端口看实测/测绘，一眼分得清死活
+        "存活": live_state(r)[1],
         # 指纹：页面指纹优先，测绘平台回的产品名兜底——平台那行本来就带一串产品
         "指纹": _brief(fp) or _brief(extra.get("product")),
         "服务": r.get("service") or extra.get("service") or "",
@@ -1362,9 +1533,9 @@ def _export_rows(name: str, kind: str = "", ratio: float = 0.0, **filters: Any) 
 
 
 @app.get("/api/export/sheets")
-async def export_sheets(request: Request, task_id: str = "", root_domain: str = "",
-                        keyword: str = "", host: str = "", ip: str = "",
-                        ratio: float = 0.0) -> dict:
+def export_sheets(request: Request, task_id: str = "", root_domain: str = "",
+                  keyword: str = "", host: str = "", ip: str = "",
+                  ratio: float = 0.0) -> dict:
     """分表清单 + 各自条数：前端「分类导出」直接按这个渲染成多表清单。
 
     条数按去重资产算，和资产页、任务列表同一个口径；空表也返回，方便看着勾。
@@ -1373,23 +1544,27 @@ async def export_sheets(request: Request, task_id: str = "", root_domain: str = 
     current_user(request)
     clean = _export_filters(task_id=task_id, root_domain=root_domain,
                             keyword=keyword, host=host, ip=ip)
+    # 一条 GROUP BY 数完所有类型：以前每张表都拉 10 万行只为数长度，整页要 2.6s
+    kind_counts = store.asset_kind_counts(**clean)
+    total = sum(kind_counts.values())
+    gate = max(float(ratio or 0), 0.0)
     items = []
     for key, conf in EXPORT_SHEETS.items():
-        wanted = list(conf["kinds"]) or [""]
-        seen: set[int] = set()
-        gate = float(ratio or 0) if key in RATIO_SHEETS else 0.0
-        for one in wanted:
-            for r in store.query_assets(kind=one or None, limit=100000, order="id",
-                                        min_ratio=gate or None, **clean):
-                seen.add(int(r["id"]))
+        kinds = [str(k) for k in (conf["kinds"] or [])]
+        if key in RATIO_SHEETS and gate:
+            count = store.count_assets(kinds=kinds or None, min_ratio=gate, **clean)
+        elif kinds:
+            count = sum(int(kind_counts.get(k, 0)) for k in kinds)
+        else:
+            count = total
         items.append({"key": key, "label": conf["label"], "cols": conf["cols"],
-                      "kinds": list(conf["kinds"]), "count": len(seen),
+                      "kinds": kinds, "count": count,
                       "ratio": key in RATIO_SHEETS})
     return {"ok": True, "items": items}
 
 
 @app.get("/api/export")
-async def export(request: Request, fmt: str = "csv", sheet: str = "all", kind: str = "",
+def export(request: Request, fmt: str = "csv", sheet: str = "all", kind: str = "",
                  root_domain: str = "", task_id: str = "", keyword: str = "", host: str = "",
                  ip: str = "", port: int = 0, cdn: str = "", ratio: float = 0.0) -> Response:
     """资产导出：csv / json / jsonl，``sheet`` 决定导哪张表。
@@ -1440,8 +1615,24 @@ def _cell_safe(value: Any, limit: int = 32000) -> str:
     return text[:limit]
 
 
+# 工作表名另有禁用字符（\ / * ? : [ ]），碰上 openpyxl 直接 ValueError
+_SHEET_BAD = str.maketrans({c: "-" for c in "\\/*?:[]"})
+# reserve 给 Excel 自动补重名时加的 "(2)" 后缀
+_sheet_seen: dict = {}
+
+
+def _sheet_title(value: Any, limit: int = 28) -> str:
+    """工作表名：剔掉 Excel 禁用字符，压到 31 字以内并保证同名唯一。"""
+    text = _cell_safe(value, 400).translate(_SHEET_BAD).replace("'", "·").strip()
+    text = text or "Sheet"
+    base = text[:limit]
+    n = _sheet_seen.get(base, 0)
+    _sheet_seen[base] = n + 1
+    return base if not n else f"{base}({n + 1})"
+
+
 @app.get("/api/export/xlsx")
-async def export_xlsx(request: Request, task_id: str = "", root_domain: str = "",
+def export_xlsx(request: Request, task_id: str = "", root_domain: str = "",
                       keyword: str = "", host: str = "", ip: str = "", cdn: str = "",
                       ratio: float = 0.0, sheets: str = "") -> Response:
     """一次导出多张表：子公司 / 对外投资 / ICP / 企业 / 站点 / APP / 小程序…各占一个工作表。
@@ -1465,6 +1656,7 @@ async def export_xlsx(request: Request, task_id: str = "", root_domain: str = ""
 
     wb = Workbook()
     wb.remove(wb.active)
+    _sheet_seen.clear()
     head_font = Font(bold=True, color="FFFFFF")
     head_fill = PatternFill("solid", fgColor="2F5D8A")
     written: list[str] = []
@@ -1479,7 +1671,7 @@ async def export_xlsx(request: Request, task_id: str = "", root_domain: str = ""
             continue
         items = [_export_row(dict(r)) for r in rows]
         cols = conf["cols"]
-        ws = wb.create_sheet(title=_cell_safe(conf["label"], 31) or key)
+        ws = wb.create_sheet(title=_sheet_title(conf["label"]) or key)
         ws.append([_cell_safe(c, 120) for c in cols])
         for cell in ws[1]:
             cell.font = head_font
@@ -1525,17 +1717,17 @@ async def search(request: Request, body: dict = Body(...)) -> dict:
 
 # ─────────────── 总览 / 资产组 / 分面 ───────────────
 @app.get("/api/health")
-async def health() -> dict:
+def health() -> dict:
     return {"ok": True, "app": "suoyu", "version": "2.7.0", "ts": time.time()}
 
 
 @app.get("/api/version")
-async def version() -> dict:
+def version() -> dict:
     return {"ok": True, "app": "天鉴·索舆", "version": "2.7.0", "build": "2026.11"}
 
 
 @app.get("/api/throttle")
-async def throttle_state(request: Request) -> dict:
+def throttle_state(request: Request) -> dict:
     """各来源当前的节流 / 冷却状态，给「细节可控」页和任务日志对照用。"""
     current_user(request)
     sec = config.section("throttle") or {}
@@ -1556,7 +1748,7 @@ THROTTLE_NUM = {
 
 
 @app.post("/api/throttle")
-async def throttle_save(request: Request, patch: dict = Body(...)) -> dict:
+def throttle_save(request: Request, patch: dict = Body(...)) -> dict:
     """改节流口径：全局间隔 / 并发 / 熔断阈值 / 冷却，以及单来源的间隔。
 
     改完立刻生效（节流器每次取许可都读配置），不用重启服务。
@@ -1621,7 +1813,7 @@ async def throttle_save(request: Request, patch: dict = Body(...)) -> dict:
 
 
 @app.post("/api/throttle/reset")
-async def throttle_reset(request: Request) -> dict:
+def throttle_reset(request: Request) -> dict:
     """清空节流状态：换了账号或熔断误判后手工解封，不用重启服务。"""
     current_user(request)
     throttle.reset()
@@ -1629,13 +1821,13 @@ async def throttle_reset(request: Request) -> dict:
 
 
 @app.get("/api/overview")
-async def overview(request: Request) -> dict:
+def overview(request: Request) -> dict:
     current_user(request)
     return {"ok": True, **store.overview()}
 
 
 @app.get("/api/groups")
-async def groups(request: Request, keyword: str = "", limit: int = 300,
+def groups(request: Request, keyword: str = "", limit: int = 300,
                  by: str = "root") -> dict:
     """资产分组：by=root 按根域（全局视角），by=task 按任务（一个任务一组）"""
     current_user(request)
@@ -1698,7 +1890,7 @@ async def fingerprints(request: Request, keyword: str = "", tag: str = "",
 
 
 @app.post("/api/fingerprints")
-async def add_fingerprint(request: Request, body: dict = Body(...)) -> dict:
+def add_fingerprint(request: Request, body: dict = Body(...)) -> dict:
     user = current_user(request)
     name = (body.get("name") or "").strip()
     if not name:
@@ -1709,7 +1901,7 @@ async def add_fingerprint(request: Request, body: dict = Body(...)) -> dict:
 
 
 @app.delete("/api/fingerprints/{name}")
-async def del_fingerprint(request: Request, name: str) -> dict:
+def del_fingerprint(request: Request, name: str) -> dict:
     current_user(request)
     store.delete_fingerprint(name)
     return {"ok": True}
@@ -1825,7 +2017,7 @@ def _norm_official(eng: dict, sec: dict) -> str:
 
 
 @app.get("/api/space/engines")
-async def space_engines(request: Request) -> dict:
+def space_engines(request: Request) -> dict:
     current_user(request)
     out = []
     for e in SPACE_ENGINES:
@@ -1879,7 +2071,7 @@ async def space_probe_all(request: Request) -> dict:
 
 
 @app.get("/api/space/syntax")
-async def space_syntax(request: Request, platform: str = "", keyword: str = "") -> dict:
+def space_syntax(request: Request, platform: str = "", keyword: str = "") -> dict:
     """内置测绘语法模板（OA / 中间件 / 框架 / 备案过滤），可按平台筛选"""
     current_user(request)
     items = space_mod.templates(platform, keyword)
@@ -2116,7 +2308,7 @@ ONECLICK_PRESETS = {
 
 
 @app.get("/api/oneclick/presets")
-async def oneclick_presets(request: Request) -> dict:
+def oneclick_presets(request: Request) -> dict:
     current_user(request)
     return {"ok": True, "items": [{"key": k, **v} for k, v in ONECLICK_PRESETS.items()]}
 
@@ -2328,13 +2520,13 @@ pipeline.oneclick_expand = _oneclick_expand
 
 # ─────────────── 模板 / 计划 / 审计 ───────────────
 @app.get("/api/templates")
-async def templates(request: Request) -> dict:
+def templates(request: Request) -> dict:
     current_user(request)
     return {"ok": True, "items": store.list_templates()}
 
 
 @app.post("/api/templates")
-async def save_template(request: Request, body: dict = Body(...)) -> dict:
+def save_template(request: Request, body: dict = Body(...)) -> dict:
     current_user(request)
     name = (body.get("name") or "").strip()
     if not name:
@@ -2344,20 +2536,20 @@ async def save_template(request: Request, body: dict = Body(...)) -> dict:
 
 
 @app.delete("/api/templates/{name}")
-async def del_template(request: Request, name: str) -> dict:
+def del_template(request: Request, name: str) -> dict:
     current_user(request)
     store.delete_template(name)
     return {"ok": True}
 
 
 @app.get("/api/schedules")
-async def schedules(request: Request) -> dict:
+def schedules(request: Request) -> dict:
     current_user(request)
     return {"ok": True, "items": store.list_schedules()}
 
 
 @app.post("/api/schedules")
-async def save_schedule(request: Request, body: dict = Body(...)) -> dict:
+def save_schedule(request: Request, body: dict = Body(...)) -> dict:
     user = current_user(request)
     sid = body.get("id") or hashlib.md5(f"{time.time()}{body.get('target')}".encode()).hexdigest()[:12]
     item = {
@@ -2375,14 +2567,14 @@ async def save_schedule(request: Request, body: dict = Body(...)) -> dict:
 
 
 @app.delete("/api/schedules/{sid}")
-async def del_schedule(request: Request, sid: str) -> dict:
+def del_schedule(request: Request, sid: str) -> dict:
     current_user(request)
     store.delete_schedule(sid)
     return {"ok": True}
 
 
 @app.patch("/api/schedules/{sid}")
-async def patch_schedule(request: Request, sid: str, body: dict = Body(...)) -> dict:
+def patch_schedule(request: Request, sid: str, body: dict = Body(...)) -> dict:
     """启用 / 暂停周期任务；重新启用时把 next_run 推到下一周期"""
     user = current_user(request)
     item = next((s for s in store.list_schedules() if s["id"] == sid), None)
@@ -2400,20 +2592,20 @@ async def patch_schedule(request: Request, sid: str, body: dict = Body(...)) -> 
 
 
 @app.get("/api/audit")
-async def audit_log(request: Request, limit: int = 200) -> dict:
+def audit_log(request: Request, limit: int = 200) -> dict:
     current_user(request)
     rows = store.conn().execute("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return {"ok": True, "items": [dict(r) for r in rows]}
 
 
 @app.get("/api/tools")
-async def tools(request: Request) -> dict:
+def tools(request: Request) -> dict:
     current_user(request)
     return {"ok": True, "items": {n: enterprise.tool_available(n) for n in enterprise.TOOL_PATHS}}
 
 
 @app.get("/api/tools/catalog")
-async def tools_catalog(request: Request) -> dict:
+def tools_catalog(request: Request) -> dict:
     """外部工具清单：装没装、装在哪、怎么手动装。"""
     current_user(request)
     from .engine import installer
@@ -2444,7 +2636,7 @@ async def tools_install(request: Request, body: dict = Body(...)) -> dict:
 
 
 @app.get("/api/tools/progress")
-async def tools_progress(request: Request) -> dict:
+def tools_progress(request: Request) -> dict:
     """安装进度：长下载时前端轮询这个，看已经拉了多少字节。"""
     current_user(request)
     from .engine import installer
@@ -2453,19 +2645,19 @@ async def tools_progress(request: Request) -> dict:
 
 
 @app.get("/api/ports")
-async def ports(request: Request, preset: str = "top100") -> dict:
+def ports(request: Request, preset: str = "top100") -> dict:
     current_user(request)
     return {"ok": True, "ports": ports_for_type(preset)}
 
 
 @app.get("/api/utils/ports")
-async def parse_ports_api(request: Request, text: str = "") -> dict:
+def parse_ports_api(request: Request, text: str = "") -> dict:
     current_user(request)
     return {"ok": True, "ports": parse_ports(text)}
 
 
 @app.post("/api/utils/beautify")
-async def beautify_api(request: Request, body: dict) -> dict:
+def beautify_api(request: Request, body: dict) -> dict:
     """把压缩的 JS/HTML/JSON 还原成可读结构，并抽出字符串常量与接口地址。"""
     current_user(request)
     text = str(body.get("text") or "")
@@ -2514,7 +2706,7 @@ async def handshake_api(request: Request, body: dict) -> dict:
 
 
 @app.get("/api/export/jsonl")
-async def export_jsonl(request: Request, task_id: str = "", limit: int = 5000) -> dict:
+def export_jsonl(request: Request, task_id: str = "", limit: int = 5000) -> dict:
     """存活站点按通用 JSONL 字段导出（jarm/hash、csp、asn、cert_issuer 等）。"""
     current_user(request)
     rows = store.query_assets(kind="site", task_id=task_id or None,
@@ -2601,14 +2793,14 @@ def _unused(*args: Any) -> None:
 
 # ─────────────── 带外回显（OOB） ───────────────
 @app.get("/api/listener/hits")
-async def listener_hits(request: Request, task_id: str = "", token: str = "",
+def listener_hits(request: Request, task_id: str = "", token: str = "",
                         limit: int = 200) -> dict:
     current_user(request)
     return {"ok": True, **listener.status(), "hits": listener.hits(task_id, token, limit)}
 
 
 @app.post("/api/listener/alloc")
-async def listener_alloc(request: Request, body: dict = Body(...)) -> dict:
+def listener_alloc(request: Request, body: dict = Body(...)) -> dict:
     """给任务手工发一个 token（自动任务在 pipeline 里已经发过，这里是补发/自测用）。"""
     current_user(request)
     task_id = str(body.get("task_id") or "").strip()
@@ -2638,19 +2830,19 @@ async def listener_callback(token: str, request: Request) -> Response:
 
 
 @app.get("/api/status")
-async def app_status(request: Request) -> dict:
+def app_status(request: Request) -> dict:
     """套壳（Electron）轮询用的就绪探针，不需要登录。"""
     return {"ok": True, "app": "天鉴·索舆", "version": "2.7.0", "build": _build_id()}
 
 
 @app.get("/api/dashboard/stats")
-async def dashboard_stats(request: Request) -> dict:
+def dashboard_stats(request: Request) -> dict:
     current_user(request)
     return {"ok": True, **store.overview()}
 
 
 @app.post("/api/sources/relay")
-async def set_relay(request: Request, body: dict = Body(...)) -> dict:
+def set_relay(request: Request, body: dict = Body(...)) -> dict:
     """一次性给多个数据源设置中转站（同一代理商的统一入口），relay=空串即回官方"""
     user = current_user(request)
     relay = str(body.get("relay") or "").strip().rstrip("/")

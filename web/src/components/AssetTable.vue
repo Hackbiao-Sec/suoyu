@@ -82,6 +82,10 @@ function fmtTime(ts) {
   const p = (n) => String(n).padStart(2, '0')
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
+// 存活：后端 live_state 给 alive / alive_text，站点看码、域名看解析、端口看实测
+const ALIVE_CLS = { alive: 'ok', open: 'ok', dns: 'cyan', auth: 'warn', space: 'info', bad: 'err' }
+const aliveCls = (a) => ALIVE_CLS[a.alive] || ''
+const aliveText = (a) => a.alive_text || (a.status_code ? String(a.status_code) : '未探测')
 const colCount = computed(() => 4 + dynCols.value.length + (showWeb.value ? 6 : 0))
 </script>
 
@@ -94,7 +98,7 @@ const colCount = computed(() => 4 + dynCols.value.length + (showWeb.value ? 6 : 
           <th>{{ showWeb ? '地址' : '名称' }}</th>
           <th v-for="c in dynCols" :key="c.key">{{ c.label }}</th>
           <template v-if="showWeb">
-            <th style="width: 56px">状态</th>
+            <th style="width: 92px">存活</th>
             <th style="width: 118px">IP</th>
             <th style="width: 56px">端口</th>
             <th style="width: 150px">指纹</th>
@@ -116,7 +120,9 @@ const colCount = computed(() => 4 + dynCols.value.length + (showWeb.value ? 6 : 
             {{ exVal(a, c.key) }}
           </td>
           <template v-if="showWeb">
-            <td class="mono">{{ a.status_code || '-' }}</td>
+            <td>
+              <span class="tag" :class="aliveCls(a)" :title="'状态码 ' + (a.status_code || '无')">{{ aliveText(a) }}</span>
+            </td>
             <td class="mono">{{ a.ip || '-' }}</td>
             <td class="mono">{{ a.port || '-' }}</td>
             <td class="ellipsis" style="max-width: 150px">{{ a.fingerprint }}</td>

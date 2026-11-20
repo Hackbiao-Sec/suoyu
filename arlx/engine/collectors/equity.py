@@ -25,6 +25,7 @@ import httpx
 
 from ...config import config
 from .. import channels as channels_mod
+from .. import creds
 from ..throttle import risk_hit, throttle
 from .names import core_same
 
@@ -305,7 +306,16 @@ async def _icp_children(name: str) -> list[dict]:
 
 # ─────────────── 公开工商接口 ───────────────
 def _aqc_ready() -> str:
-    return (_sec("aiqicha").get("cookie") or "").strip()
+    """这一轮该用哪份登录态：池子里取当前那份，全空才算没配。"""
+    return creds.value("aiqicha")
+
+
+def _aqc_sync(cli: httpx.AsyncClient) -> dict:
+    """把池子当前那份 Cookie 刷进请求头，返回 ``pick``（凭据 + 序号）。"""
+    pick = creds.pick("aiqicha")
+    if pick["cred"]:
+        cli.headers["Cookie"] = pick["cred"]
+    return pick
 
 
 def _mark_risk(name: str, why: str, label: str = "") -> dict:
@@ -339,7 +349,13 @@ async def _aqc_get(cli: httpx.AsyncClient, path: str, params: dict,
     path = "/" + str(path or "").lstrip("/")
     body: dict = {}
     attempts = _retry_times()
-    for i in range(attempts):
+    # 被风控就换下一份登录态。换号不算一次重试（不计入 attempts），但最多把池子里
+    # 剩下的那几份各试一遍，免得一份被封的 Cookie 把整轮采集拖成死循环。
+    switch_left = max(0, creds.count("aiqicha") - 1)
+    tries = 0
+    while tries < attempts:
+        tries += 1
+        pick = _aqc_sync(cli)
         if not await throttle.acquire("aiqicha"):
             _RISK_LAST["aiqicha"] = "工商接口冷却中，这一轮跳过该请求"
             return {"__risk": _RISK_LAST["aiqicha"]}
@@ -350,39 +366,63 @@ async def _aqc_get(cli: httpx.AsyncClient, path: str, params: dict,
         except Exception:
             again = True
         else:
+            hit = ""
             if r.status_code == 429:
-                return _mark_risk("aiqicha", "HTTP 429", "公开工商接口")
+                hit = "HTTP 429"
+            elif r.status_code in (401, 403):
+                hit = f"HTTP {r.status_code}"
+            if hit:
+                creds.report("aiqicha", pick["cred"],
+                             "blocked" if r.status_code == 429 else "invalid")
+                if switch_left > 0:
+                    switch_left -= 1
+                    tries -= 1
+                    _RISK_LAST["aiqicha"] = f"公开工商接口 {hit}，已换下一份登录态重试"
+                    continue
+                if r.status_code == 429:
+                    return _mark_risk("aiqicha", "HTTP 429", "公开工商接口")
+                return {}
             if r.status_code >= 500:
                 again = True
             elif r.status_code != 200:
                 return {}
             else:
                 try:
-                    body = r.json()
+                    parsed = r.json()
                 except Exception:
                     again = True
+                else:
+                    if isinstance(parsed, dict) and str(parsed.get("status")) == "1" \
+                            and "系统异常" in str(parsed.get("msg") or ""):
+                        # ``status=1 / msg=系统异常`` 不是「接口改版」：pid 没按 ddw 还原时，
+                        # 任何面板接口都回这一句。记一笔别静默吞掉。
+                        _RISK_LAST["aiqicha"] = (
+                            f"公开工商接口 {path} 回系统异常（pid 或参数不对）")
+                        return {}
+                    hit = risk_hit(parsed)
+                    if hit:
+                        # 风控词命中就当这份登录态被盯上了，换一份再来；都换过才认输
+                        creds.report("aiqicha", pick["cred"], "blocked")
+                        if switch_left > 0:
+                            switch_left -= 1
+                            tries -= 1
+                            _RISK_LAST["aiqicha"] = (
+                                f"公开工商接口 {path} 被风控（{hit}），已换下一份登录态重试")
+                            continue
+                        if soft:
+                            msg = (f"公开工商接口 {path} 返回：{hit}"
+                                   "（该接口本轮跳过，其它接口照常）")
+                            _RISK_LAST["aiqicha"] = msg
+                            return {"__risk": msg}
+                        return _mark_risk("aiqicha", hit, "公开工商接口")
+                    body = parsed
+                    throttle.reward("aiqicha")
+                    creds.report("aiqicha", pick["cred"], "ok")
         if not again:
             break
-        body = {}
-        if i + 1 < attempts:
+        if tries < attempts:
             # 越往后等越久：连错说明对面在限速，短间隔重试只会加重
-            await asyncio.sleep(max(1.0, _expand_sleep()) * (i + 1))
-    if not body:
-        return {}
-    # ``status=1 / msg=系统异常`` 不是「接口改版」：pid 没按 ddw 还原时，任何面板接口
-    # 都回这一句。这里只在已还原 pid 之后仍走到该分支时才记一笔，别静默吞掉。
-    if isinstance(body, dict) and str(body.get("status")) == "1" \
-            and "系统异常" in str(body.get("msg") or ""):
-        _RISK_LAST["aiqicha"] = f"公开工商接口 {path} 回系统异常（pid 或参数不对）"
-        return {}
-    hit = risk_hit(body)
-    if hit:
-        if soft:
-            msg = f"公开工商接口 {path} 返回：{hit}（该接口本轮跳过，其它接口照常）"
-            _RISK_LAST["aiqicha"] = msg
-            return {"__risk": msg}
-        return _mark_risk("aiqicha", hit, "公开工商接口")
-    throttle.reward("aiqicha")
+            await asyncio.sleep(max(1.0, _expand_sleep()) * tries)
     return body
 
 
@@ -393,7 +433,11 @@ async def _aqc_post(cli: httpx.AsyncClient, path: str, form: dict) -> dict:
     path = "/" + str(path or "").lstrip("/")
     body: dict = {}
     attempts = _retry_times()
-    for i in range(attempts):
+    switch_left = max(0, creds.count("aiqicha") - 1)
+    tries = 0
+    while tries < attempts:
+        tries += 1
+        pick = _aqc_sync(cli)
         if not await throttle.acquire("aiqicha"):
             _RISK_LAST["aiqicha"] = "工商接口冷却中，这一轮跳过该请求"
             return {"__risk": _RISK_LAST["aiqicha"]}
@@ -404,28 +448,49 @@ async def _aqc_post(cli: httpx.AsyncClient, path: str, form: dict) -> dict:
         except Exception:
             again = True
         else:
+            hit = ""
             if r.status_code == 429:
-                return _mark_risk("aiqicha", "HTTP 429", "公开工商接口")
+                hit = "HTTP 429"
+            elif r.status_code in (401, 403):
+                hit = f"HTTP {r.status_code}"
+            if hit:
+                creds.report("aiqicha", pick["cred"],
+                             "blocked" if r.status_code == 429 else "invalid")
+                if switch_left > 0:
+                    switch_left -= 1
+                    tries -= 1
+                    _RISK_LAST["aiqicha"] = f"公开工商接口 {hit}，已换下一份登录态重试"
+                    continue
+                if r.status_code == 429:
+                    return _mark_risk("aiqicha", "HTTP 429", "公开工商接口")
+                return {}
             if r.status_code >= 500:
                 again = True
             elif r.status_code != 200:
                 return {}
             else:
                 try:
-                    body = r.json()
+                    parsed = r.json()
                 except Exception:
                     again = True
+                else:
+                    hit = risk_hit(parsed)
+                    if hit:
+                        creds.report("aiqicha", pick["cred"], "blocked")
+                        if switch_left > 0:
+                            switch_left -= 1
+                            tries -= 1
+                            _RISK_LAST["aiqicha"] = (
+                                f"公开工商接口 {path} 被风控（{hit}），已换下一份登录态重试")
+                            continue
+                        return _mark_risk("aiqicha", hit, "公开工商接口")
+                    body = parsed
+                    throttle.reward("aiqicha")
+                    creds.report("aiqicha", pick["cred"], "ok")
         if not again:
             break
-        body = {}
-        if i + 1 < attempts:
-            await asyncio.sleep(max(1.0, _expand_sleep()) * (i + 1))
-    if not body:
-        return {}
-    hit = risk_hit(body)
-    if hit:
-        return _mark_risk("aiqicha", hit, "公开工商接口")
-    throttle.reward("aiqicha")
+        if tries < attempts:
+            await asyncio.sleep(max(1.0, _expand_sleep()) * tries)
     return body
 
 
@@ -1371,25 +1436,51 @@ _COMPANY_LINK = re.compile(
     r'href="https://www\.tianyancha\.com/company/(\d+)"[^>]*>(.*?)</a>', re.S)
 
 
-def _tyc_cred() -> tuple[str, str, str]:
-    """天眼查凭据：``(x-auth-token, x-tycid, Cookie)``。
+def _tyc_from_pick(pick: dict) -> tuple[str, str, str]:
+    """把一份登录态摊成 ``(x-auth-token, x-tycid, Cookie)``。
 
-    ``x-auth-token`` 就是登录态里的 ``auth_token`` JWT，``x-tycid`` 是 ``TYCID``；
-    两个都能从整行 Cookie 里抠出来，所以只粘 Cookie 也能跑通。Cookie 里抠不到时
-    回落到 ``sources.tianyancha`` 下单独填的 ``token`` / ``tycid``——粘过 Cookie 又
-    另填一项的人，不该被 Cookie 里的旧值盖掉。
+    池子条目写成字典时 token / tycid 自成一套，优先用那一套；只粘 Cookie 的条目
+    从 Cookie 里抠；都抠不到才回落到 ``sources.tianyancha`` 单独填的两项——粘过
+    Cookie 又另填一项的人，不该被 Cookie 里的旧值盖掉。
     """
     sec = _sec("tianyancha")
-    cookie = (sec.get("cookie") or "").strip()
-    token = (sec.get("token") or "").strip()
+    cookie = str(pick.get("cred") or "").strip()
+    extra = pick.get("extra") or {}
+    token = str(extra.get("token") or "").strip()
+    if not token:
+        token = (sec.get("token") or "").strip()
     if not token:
         m = re.search(r"(?:^|;\s*)auth_token=([^;]+)", cookie)
         token = m.group(1).strip() if m else ""
-    tycid = (sec.get("tycid") or "").strip()
+    tycid = str(extra.get("tycid") or "").strip()
+    if not tycid:
+        tycid = (sec.get("tycid") or "").strip()
     if not tycid:
         m = re.search(r"(?:^|;\s*)TYCID=([^;]+)", cookie)
         tycid = m.group(1).strip() if m else ""
     return (token, tycid, cookie)
+
+
+def _tyc_cred() -> tuple[str, str, str]:
+    """天眼查当前该用的那份凭据：``(x-auth-token, x-tycid, Cookie)``。
+
+    ``x-auth-token`` 就是登录态里的 ``auth_token`` JWT，``x-tycid`` 是 ``TYCID``；
+    两个都能从整行 Cookie 里抠出来，所以只粘 Cookie 也能跑通。有配置池时从池子里
+    取当前那一份，口径见 ``_tyc_from_pick``。
+    """
+    return _tyc_from_pick(creds.pick("tianyancha"))
+
+
+def _tyc_sync(cli: httpx.AsyncClient) -> dict:
+    """把池子当前那份刷进请求头，返回 ``pick``；换号后下一次请求就带新凭据。"""
+    pick = creds.pick("tianyancha")
+    token, tycid, cookie = _tyc_from_pick(pick)
+    for key, val in (("x-auth-token", token), ("x-tycid", tycid), ("Cookie", cookie)):
+        if val:
+            cli.headers[key] = val
+        else:
+            cli.headers.pop(key, None)
+    return pick
 
 
 def _tyc_headers(token: str, tycid: str, cookie: str, name: str = "") -> dict:
@@ -1516,6 +1607,7 @@ async def _tyc_locate(cli: httpx.AsyncClient, name: str, *,
         gid, hit = "", ""
     if not gid:
         try:
+            _tyc_sync(cli)
             await _pace("tianyancha")
             r = await cli.get(f"{TIANYANCHA_WEB}/search", params={"key": name})
         except Exception:
@@ -1705,7 +1797,12 @@ async def _tyc_call(cli: httpx.AsyncClient, path: str, *,
     base = _tyc_base()
     data: dict = {}
     attempts = _retry_times()
-    for i in range(attempts):
+    # 与爱企查同一套逻辑：被风控就换池子里下一份登录态重来，换号不算重试次数
+    switch_left = max(0, creds.count("tianyancha") - 1)
+    tries = 0
+    while tries < attempts:
+        tries += 1
+        pick = _tyc_sync(cli)
         if not await throttle.acquire("tianyancha"):
             _RISK_LAST["tianyancha"] = "第二工商来源冷却中，这一轮跳过该请求"
             return {"__risk": _RISK_LAST["tianyancha"]}
@@ -1719,36 +1816,58 @@ async def _tyc_call(cli: httpx.AsyncClient, path: str, *,
         except Exception:
             again = True
         else:
+            hit = ""
             if r.status_code == 429:
-                return _mark_risk("tianyancha", "HTTP 429", "第二工商来源")
+                hit = "HTTP 429"
+            elif r.status_code in (401, 403):
+                hit = f"HTTP {r.status_code}"
+            if hit:
+                creds.report("tianyancha", pick["cred"],
+                             "blocked" if r.status_code == 429 else "invalid")
+                if switch_left > 0:
+                    switch_left -= 1
+                    tries -= 1
+                    _RISK_LAST["tianyancha"] = (
+                        f"第二工商来源 {hit}，已换下一份登录态重试")
+                    continue
+                if r.status_code == 429:
+                    return _mark_risk("tianyancha", "HTTP 429", "第二工商来源")
+                return {}
             if r.status_code >= 500:
                 again = True
             elif r.status_code != 200:
                 return {}
             else:
                 try:
-                    data = r.json()
+                    parsed = r.json()
                 except Exception:
                     again = True
+                else:
+                    gate = _tyc_gate(parsed)
+                    if gate:
+                        # 门槛不算风控：照常给节流器记一次成功，冷却留给真被封的时候用，
+                        # 否则一个会员面就能把这个来源整轮打成「不可用」。
+                        _GATE_LAST["tianyancha"] = gate
+                        throttle.reward("tianyancha")
+                        return {"__gate": gate}
+                    _GATE_LAST.pop("tianyancha", None)
+                    hit = risk_hit(parsed)
+                    if hit:
+                        creds.report("tianyancha", pick["cred"], "blocked")
+                        if switch_left > 0:
+                            switch_left -= 1
+                            tries -= 1
+                            _RISK_LAST["tianyancha"] = (
+                                f"第二工商来源被风控（{hit}），已换下一份登录态重试")
+                            continue
+                        return _mark_risk("tianyancha", hit, "第二工商来源")
+                    data = parsed
+                    throttle.reward("tianyancha")
+                    creds.report("tianyancha", pick["cred"], "ok")
         if not again:
             break
-        data = {}
-        if i + 1 < attempts:
-            await asyncio.sleep(max(1.0, _expand_sleep()) * (i + 1))
-    if not data:
-        return {}
-    gate = _tyc_gate(data)
-    if gate:
-        # 门槛不算风控：照常给节流器记一次成功，冷却留给真被封的时候用，
-        # 否则一个会员面就能把这个来源整轮打成「不可用」。
-        _GATE_LAST["tianyancha"] = gate
-        throttle.reward("tianyancha")
-        return {"__gate": gate}
-    _GATE_LAST.pop("tianyancha", None)
-    hit = risk_hit(data)
-    if hit:
-        return _mark_risk("tianyancha", hit, "第二工商来源")
-    throttle.reward("tianyancha")
+        if tries < attempts:
+            await asyncio.sleep(max(1.0, _expand_sleep()) * tries)
     return data
 
 
@@ -2899,11 +3018,12 @@ def _xlb_base() -> str:
 def _xlb_head() -> dict:
     """小蓝本的登录态就是浏览器 Cookie；Token 可留空，填了按网页的方式带 Authorization。"""
     sec = _sec("xiaolanben")
-    cookie = (sec.get("cookie") or "").strip()
+    pick = creds.pick("xiaolanben")
+    cookie = (pick["cred"] or "").strip()
     if not cookie:
         return {}
     head = {"Cookie": cookie}
-    token = (sec.get("token") or "").strip()
+    token = str((pick.get("extra") or {}).get("token") or sec.get("token") or "").strip()
     if token:
         head["Authorization"] = token if token.lower().startswith("encrypt ") else f"encrypt {token}"
     return head
@@ -3102,17 +3222,31 @@ def _jwt_note(token: str) -> str:
     return ""
 
 
-def _cred_of(sec: dict, fields: tuple) -> dict:
-    """按来源把配置里的登录态拾成请求头；缺关键字段返回空 dict。"""
-    cookie = (sec.get("cookie") or "").strip()
+def _cred_of(sec: dict, fields: tuple, pick: dict | None = None) -> dict:
+    """按来源把配置里的登录态拾成请求头；缺关键字段返回空 dict。
+
+    ``pick`` 给出时用池子里那一份（附带该条目自己的 token / tycid），否则用主值。
+    """
+    pick = pick or {}
+    extra = pick.get("extra") or {}
+    cookie = str(pick.get("cred") or sec.get("cookie") or "").strip()
+    token = str(extra.get("token") or sec.get("token") or "").strip()
+    tycid = str(extra.get("tycid") or sec.get("tycid") or "").strip()
     if not cookie:
         return {}
     head = {"Cookie": cookie}
-    if "token" in fields and (sec.get("token") or "").strip():
-        head["Authorization"] = sec["token"].strip()
-    if sec.get("tycid"):
-        head["X-Tycid"] = str(sec["tycid"]).strip()
+    if "token" in fields and token:
+        head["Authorization"] = token
+    if tycid:
+        head["X-Tycid"] = tycid
     return head
+
+
+def _cred_blocked(r: httpx.Response) -> bool:
+    """这份登录态是不是废了：跳登录页 / 401 / 403 / 429 / 正文提示登录。"""
+    if r.status_code in (301, 302, 303, 307, 308, 401, 403, 429):
+        return True
+    return _has_login_hint(r.text)
 
 
 async def _xlb_probe() -> dict:
@@ -3286,25 +3420,52 @@ async def from_backup_sources(name: str) -> Equities:
             continue
         path_q = _SEARCH.get(src)
         url = base.rstrip("/") + (path_q.format(q=quote(name)) if path_q else "/")
-        try:
-            async with _client(timeout=15.0, referer=base) as cli:
-                cli.headers.update(head)
-                r = await cli.get(url, params=None if path_q else {"q": name})
-            loc = str(r.headers.get("location") or "")
-            if r.status_code in (301, 302, 303, 307, 308) and loc:
-                eq.source_status[key] = "blocked"
-                eq.notes.append(f"{src} HTTP {r.status_code} → {loc.split('?')[0][:40]}，"
-                                f"登录态已过期，需要重新复制 Cookie")
+        # 备用源也吃 Cookie 池：这一份被挡就换下一份再打一枪，池子里每份只试一次
+        r = None
+        rows: list[dict] = []
+        tried: set[str] = set()
+        while True:
+            pick = creds.pick(src)
+            if pick["cred"] in tried:
+                break
+            tried.add(pick["cred"])
+            head = _cred_of(sec, fields, pick)
+            if not head:
+                eq.notes.append(f"{src} 未配置登录态，跳过")
+                eq.source_status[key] = "no_credential"
+                r = None
+                break
+            try:
+                async with _client(timeout=15.0, referer=base) as cli:
+                    cli.headers.update(head)
+                    r = await cli.get(url, params=None if path_q else {"q": name})
+            except Exception as e:
+                eq.source_status[key] = "error"
+                eq.notes.append(f"{src} 请求失败：{type(e).__name__}")
+                r = None
+                break
+            if _cred_blocked(r) and len(tried) < creds.count(src):
+                creds.report(src, pick["cred"],
+                             "blocked" if r.status_code in (403, 429) else "invalid")
+                eq.notes.append(f"{src} 当前登录态失效，已换下一份 Cookie 重试")
                 continue
-            if r.status_code != 200 or _has_login_hint(r.text):
-                eq.source_status[key] = "blocked"
-                eq.notes.append(f"{src} HTTP {r.status_code}，登录态可能失效")
-                continue
-            rows = _rows_with_ratio(r.json())
-        except Exception as e:
-            eq.source_status[key] = "error"
-            eq.notes.append(f"{src} 请求失败：{type(e).__name__}")
+            break
+        if r is None:
             continue
+        loc = str(r.headers.get("location") or "")
+        if r.status_code in (301, 302, 303, 307, 308) and loc:
+            eq.source_status[key] = "blocked"
+            eq.notes.append(f"{src} HTTP {r.status_code} → {loc.split('?')[0][:40]}，"
+                            f"登录态已过期，需要重新复制 Cookie")
+            continue
+        if r.status_code != 200 or _has_login_hint(r.text):
+            eq.source_status[key] = "blocked"
+            eq.notes.append(f"{src} HTTP {r.status_code}，登录态可能失效")
+            continue
+        try:
+            rows = _rows_with_ratio(r.json())
+        except Exception:
+            rows = []
         if not rows:
             eq.source_status[key] = "not_found"
             eq.notes.append(f"{src} 未解析到股东 / 投资链路")

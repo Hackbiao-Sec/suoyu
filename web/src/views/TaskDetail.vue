@@ -519,14 +519,15 @@ function fmtTime(ts) {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 async function exportCsv() {
+  // 整本 xlsx：按资产类型各占一张表，审核拿到就能按表翻，不用在几万行宽表里筛
   const http = (await import('@/api/http')).default
-  const res = await http.get('/api/export', {
-    params: { fmt: 'csv', task_id: id.value }, responseType: 'blob',
+  const res = await http.get('/api/export/xlsx', {
+    params: { task_id: id.value }, responseType: 'blob', timeout: 300000,
   })
   const url = URL.createObjectURL(res instanceof Blob ? res : new Blob([res]))
   const a = document.createElement('a')
   a.href = url
-  a.download = `suoyu_task_${id.value}.csv`
+  a.download = `suoyu_task_${id.value}.xlsx`
   a.click()
   URL.revokeObjectURL(url)
 }
@@ -572,7 +573,7 @@ onBeforeUnmount(() => {
           <Icon name="play" :size="12" />重跑任务
         </button>
         <button class="btn sm" @click="exportCsv">
-          <Icon name="download" :size="12" />导出资产
+          <Icon name="download" :size="12" />导出资产（多表）
         </button>
       </template>
     </PageHead>
@@ -1057,7 +1058,7 @@ onBeforeUnmount(() => {
                         <a v-if="String(a.url).startsWith('http')" :href="a.url" target="_blank" rel="noopener">{{ a.url }}</a>
                         <span v-else>{{ a.url }}</span>
                       </td>
-                      <td class="mono">{{ a.status_code || '-' }}</td>
+                      <td class="mono">{{ a.alive_text || a.status_code || '-' }}</td>
                       <td class="ellipsis" style="max-width: 180px">{{ a.fingerprint }}</td>
                       <td class="muted ellipsis" style="max-width: 120px">{{ a.sources }}</td>
                     </tr>

@@ -80,6 +80,43 @@ RISK_RULES: tuple[tuple[str, str, str], ...] = (
 )
 
 
+def live_state(row: dict[str, Any]) -> tuple[str, str]:
+    """资产存活判定：返回 ``(机器状态, 中文说明)``，给列表/导出共用。
+
+    站点行自己探到了状态码就以码为准；域名行没发过 HTTP，能解析出 IP 就算「解析」；
+    端口行按来源分「实测端口开放」和「测绘收录」；其余没探过的老实写「未探测」，
+    不拿「有 ip 字段」冒充存活。
+    """
+    kind = str(row.get("kind") or "")
+    code = int(row.get("status_code") or 0)
+    if code:
+        if code < 400:
+            return "alive", f"存活 {code}"
+        if code < 500:
+            return "auth", f"响应 {code}"
+        return "bad", f"异常 {code}"
+    src = str(row.get("sources") or "")
+    if kind == "domain":
+        has_ip = bool(str(row.get("ip") or "").strip() or str(row.get("ips") or "").strip())
+        return ("dns", "已解析") if has_ip else ("dead", "不解析")
+    if kind in ("ip", "service"):
+        # 端口扫描阶段落的行 = 当时真的连上了；测绘引擎来的只是索引里有过
+        if any(k in src for k in ("portscan", "masscan", "nmap", "probe")):
+            return "open", "端口开放"
+        if kind == "ip":
+            return "dns", "已解析"
+        return "space", "测绘收录"
+    return "unknown", "未探测"
+
+
+def with_liveness(row: dict[str, Any]) -> dict[str, Any]:
+    """把 live_state 摊进行里，前端直接读 ``alive`` / ``alive_text``。"""
+    state, text = live_state(row)
+    row["alive"] = state
+    row["alive_text"] = text
+    return row
+
+
 def normalize_asset(item: dict[str, Any]) -> dict[str, Any]:
     """统一 host / root_domain 后再入库。
 
@@ -316,6 +353,11 @@ class Store:
                 for col, typ in cols.items():
                     if col not in have:
                         c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+            # 阶段明细 / 缺口统计按 (task_id, stage|module) 过滤，建在补列之后
+            c.execute("CREATE INDEX IF NOT EXISTS idx_ta_task_stage"
+                      " ON task_assets(task_id, stage)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_logs_task_module"
+                      " ON logs(task_id, module)")
             c.commit()
         self.repair_assets()
 
@@ -558,6 +600,173 @@ class Store:
             self.conn().commit()
             return int(row["id"])
 
+    def mark_liveness(self, task_id: str, marks: list[dict]) -> int:
+        """把存活探测得到的状态码回填到同一主机的其它资产上。
+
+        domain / ip / service / api 这些行是 DNS、端口扫描、爬虫阶段落的，它们自己
+        没发过 HTTP，状态码一直是空。web 阶段探完后按 host / ip + 端口回填一份，
+        资产表才看得出哪条活着。已经有状态码的行不覆盖（site 自己那条更准）。
+        """
+        if not task_id or not marks:
+            return 0
+
+        def rank(code: int) -> int:
+            # 2xx/3xx 说明页面拿到了，4xx/5xx 只说明端口上站着 HTTP 服务
+            if 200 <= code < 400:
+                return 0
+            return 1 if 400 <= code < 500 else 2
+
+        by_host: dict[str, dict[int, int]] = {}
+        by_ip: dict[str, dict[int, int]] = {}
+        for m in marks:
+            code = int(m.get("status") or 0)
+            if not code:
+                continue
+            port = int(m.get("port") or 0)
+            pairs = ((str(m.get("host") or "").lower(), by_host),
+                     (str(m.get("ip") or "").lower(), by_ip))
+            for key, box in pairs:
+                if not key:
+                    continue
+                slot = box.setdefault(key, {})
+                old = slot.get(port)
+                if old is None or (rank(code), code) < (rank(old), old):
+                    slot[port] = code
+
+        if not by_host and not by_ip:
+            return 0
+
+        def pick(table: dict[str, dict[int, int]], key: str, port: int) -> int:
+            ports = table.get(key)
+            if not ports:
+                return 0
+            if port and port in ports:
+                return ports[port]
+            # 没记端口（domain 行）或端口对不上：先看 443 / 80，再按码值好坏挑一个
+            for p in (443, 80):
+                if p in ports:
+                    return ports[p]
+            return sorted(ports.items(), key=lambda kv: (rank(kv[1]), kv[1]))[0][1]
+
+        updated = 0
+        now = time.time()
+        with self._write_lock:
+            rows = self.conn().execute(
+                "SELECT a.id, a.host, a.ip, a.port, a.status_code"
+                " FROM assets a JOIN task_assets t ON t.asset_id=a.id WHERE t.task_id=?",
+                (task_id,),
+            ).fetchall()
+            for row in rows:
+                if row["status_code"]:
+                    continue
+                host = str(row["host"] or "").lower()
+                ip = str(row["ip"] or "").lower()
+                port = int(row["port"] or 0)
+                code = pick(by_host, host, port) if host else 0
+                if not code and ip:
+                    code = pick(by_ip, ip, port)
+                if not code:
+                    continue
+                self.conn().execute(
+                    "UPDATE assets SET status_code=?, last_seen=? WHERE id=?",
+                    (code, now, row["id"]),
+                )
+                updated += 1
+            if updated:
+                self.conn().commit()
+        return updated
+
+    def backfill_liveness_from_sites(self, task_id: str) -> int:
+        """用本轮已落库的 site 状态码，给同一主机的其它资产补状态码。
+
+        爬虫 / 深挖阶段在 web 探测之后还会新增 api、domain 行，它们没赶上当时那次
+        回填；汇总前再来一遍，保证资产表里同一台主机的状态码一致。
+        """
+        if not task_id:
+            return 0
+        rows = self.conn().execute(
+            "SELECT a.host, a.ip, a.port, a.scheme, a.status_code"
+            " FROM assets a JOIN task_assets t ON t.asset_id=a.id"
+            " WHERE t.task_id=? AND a.kind='site' AND a.status_code IS NOT NULL",
+            (task_id,),
+        ).fetchall()
+        marks = []
+        for r in rows:
+            port = int(r["port"] or 0)
+            if not port:
+                port = 443 if (r["scheme"] or "") == "https" else 80
+            marks.append({"host": r["host"], "ip": r["ip"], "port": port,
+                          "status": r["status_code"]})
+        return self.mark_liveness(task_id, marks)
+
+    def repair_liveness(self, task_id: str = "") -> int:
+        """全库补状态码：拿任务里已探到的 site 状态，回填同一主机的其它行。
+
+        ``mark_liveness`` 只在任务正跑 web 阶段时补一次；历史任务、以及 web 之后才
+        落库的 api / domain 行一直是空的。这里一次性扫全库补一遍，资产列表才有
+        存活状态可看。给 ``task_id`` 就只补那一个任务。
+        """
+        sql = ("SELECT t.task_id, a.host, a.ip, a.port, a.scheme, a.status_code"
+               " FROM assets a JOIN task_assets t ON t.asset_id=a.id"
+               " WHERE a.kind='site' AND a.status_code IS NOT NULL AND a.status_code>0")
+        vals: list[Any] = []
+        if task_id:
+            sql += " AND t.task_id=?"
+            vals.append(task_id)
+
+        def rank(code: int, port: int) -> tuple:
+            # 先挑能拿到页面的码，再挑标准端口，最后挑码小（200 优于 502）
+            if 200 <= code < 400:
+                tier = 0
+            elif 400 <= code < 500:
+                tier = 1
+            else:
+                tier = 2
+            return (tier, 0 if port in (443, 80) else 1, code)
+
+        best: dict[tuple[str, str], tuple[tuple, int]] = {}
+        for r in self.conn().execute(sql, vals):
+            code = int(r["status_code"] or 0)
+            port = int(r["port"] or 0)
+            if not port:
+                port = 443 if (r["scheme"] or "") == "https" else 80
+            key_rank = rank(code, port)
+            for tag, key in (("h", str(r["host"] or "").lower()),
+                             ("i", str(r["ip"] or "").lower())):
+                if not key:
+                    continue
+                slot = (r["task_id"], tag + ":" + key)
+                old = best.get(slot)
+                if old is None or key_rank < old[0]:
+                    best[slot] = (key_rank, code)
+        if not best:
+            return 0
+
+        sql = ("SELECT a.id, a.host, a.ip, t.task_id FROM assets a"
+               " JOIN task_assets t ON t.asset_id=a.id WHERE a.status_code IS NULL")
+        vals = []
+        if task_id:
+            sql += " AND t.task_id=?"
+            vals.append(task_id)
+        now = time.time()
+        marks: list[tuple] = []
+        for r in self.conn().execute(sql, vals):
+            code = 0
+            for tag, key in (("h", str(r["host"] or "").lower()),
+                             ("i", str(r["ip"] or "").lower())):
+                hit = best.get((r["task_id"], tag + ":" + key)) if key else None
+                if hit and (not code or hit[0] < rank(code, 80)):
+                    code = hit[1]
+            if code:
+                marks.append((code, now, r["id"]))
+        if not marks:
+            return 0
+        with self._write_lock:
+            self.conn().executemany(
+                "UPDATE assets SET status_code=?, last_seen=? WHERE id=?", marks)
+            self.conn().commit()
+        return len(marks)
+
     def merge_assets(self, keep_id: int, drop_ids: list[int],
                      extra: dict | None = None) -> int:
         """把重复资产并进保留行：任务关联迁移、sources/ips/extra 合并，再删重复行。
@@ -778,6 +987,20 @@ class Store:
             sql += " WHERE " + " AND ".join(where)
         return int(self.conn().execute(sql, vals).fetchone()[0])
 
+    def asset_kind_counts(self, **filters: Any) -> dict[str, int]:
+        """按资产类型数条数，导出的分表角标用。
+
+        以前每张分表都 ``query_assets(limit=100000)`` 拉一遍全量行只为数长度，
+        27 张表就是 27 遍全表扫；这里一条 GROUP BY 出全部类型。
+        """
+        where, vals = self._asset_where(filters, with_new=True)
+        sql = "SELECT COALESCE(kind,'') kind, COUNT(*) n FROM assets"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " GROUP BY COALESCE(kind,'')"
+        rows = self.conn().execute(sql, vals).fetchall()
+        return {str(r["kind"] or ""): int(r["n"] or 0) for r in rows}
+
     def task_breakdown(self, task_ids: list[str] | None = None,
                        modules: dict[str, dict[str, Any]] | None = None
                        ) -> dict[str, dict[str, Any]]:
@@ -802,50 +1025,60 @@ class Store:
             return out.setdefault(tid, {"total": 0, "kinds": {}, "stages": {},
                                         "pairs": {}, "modules": {}})
 
+        # 分组计数在 SQL 里算完。
+        # 旧写法把 task_assets 明细整表拉回 Python 再按 (阶段, 类型) 建 set 去重：
+        # 200 个任务就是十几万行、上千个 set，点任务列表先卡一秒多。
+        # 同一个资产在一个任务里只占 task_assets 一行、只属于一个阶段和一个类型，
+        # 所以各 (阶段, 类型) 的 COUNT 相加就等于原来的去重总数，结果一致。
+        groups: dict[str, dict[tuple[str, str], int]] = {}
         for r in c.execute(
             "SELECT ta.task_id tid, COALESCE(ta.stage,'') stage, COALESCE(a.kind,'') kind,"
-            " COUNT(a.id) n FROM task_assets ta JOIN assets a ON a.id=ta.asset_id" + where +
-            " GROUP BY ta.task_id, COALESCE(ta.stage,''), COALESCE(a.kind,'')", vals
-        ).fetchall():
-            tid, stage, kind, n = r["tid"], r["stage"], r["kind"], int(r["n"] or 0)
+            " COUNT(DISTINCT ta.asset_id) n FROM task_assets ta"
+            " JOIN assets a ON a.id=ta.asset_id" + where +
+            " GROUP BY ta.task_id, stage, kind", vals
+        ):
+            groups.setdefault(r["tid"], {})[(r["stage"], r["kind"])] = int(r["n"] or 0)
+
+        for tid, pairs in groups.items():
             s = slot(tid)
-            s["pairs"].setdefault(stage, {})[kind] = n
-            s["kinds"][kind] = s["kinds"].get(kind, 0) + n
-            s["stages"][stage] = s["stages"].get(stage, 0) + n
-        for r in c.execute(
-            "SELECT ta.task_id tid, COUNT(DISTINCT a.id) n"
-            " FROM task_assets ta JOIN assets a ON a.id=ta.asset_id" + where +
-            " GROUP BY ta.task_id", vals
-        ).fetchall():
-            slot(r["tid"])["total"] = int(r["n"])
+            stage_n: dict[str, int] = {}
+            kind_n: dict[str, int] = {}
+            total = 0
+            for (stage, kind), n in pairs.items():
+                s["pairs"].setdefault(stage, {})[kind] = n
+                stage_n[stage] = stage_n.get(stage, 0) + n
+                kind_n[kind] = kind_n.get(kind, 0) + n
+                total += n
+            s["stages"] = stage_n
+            s["kinds"] = kind_n
+            s["total"] = total
+
         for key, conf in (modules or {}).items():
             stages = [str(s) for s in (conf.get("stages") or []) if s]
             kinds = [str(k) for k in (conf.get("kinds") or []) if k]
             claimed = [str(s) for s in (conf.get("claimed") or []) if s]
-            cond, args = [], []
-            if stages:
-                cond.append("ta.stage IN (%s)" % ",".join("?" * len(stages)))
-                args.extend(stages)
-            if kinds:
-                # 阶段压根没记，或者记的是 target_parse 这种不归段的阶段 → 按类型认
-                loose = "COALESCE(ta.stage,'')=''"
-                if claimed:
-                    loose = ("(COALESCE(ta.stage,'')='' OR ta.stage NOT IN (%s))"
-                             % ",".join("?" * len(claimed)))
-                cond.append("(%s AND a.kind IN (%s))" % (loose, ",".join("?" * len(kinds))))
-                args.extend(claimed if claimed else [])
-                args.extend(kinds)
-            if not cond:
+            if not stages and not kinds:
                 continue
-            for r in c.execute(
-                "SELECT ta.task_id tid, COUNT(DISTINCT a.id) n"
-                " FROM task_assets ta JOIN assets a ON a.id=ta.asset_id"
-                " WHERE (" + " OR ".join(cond) + ")" +
-                (" AND " + task_cond if task_cond else "") +
-                " GROUP BY ta.task_id", args + vals
-            ).fetchall():
-                slot(r["tid"])["modules"][key] = int(r["n"])
+            want_stage = set(stages)
+            want_kind = set(kinds)
+            claimed_set = set(claimed)
+            for tid, pairs in groups.items():
+                matched = 0
+                for (stage, kind), n in pairs.items():
+                    if stage in want_stage:
+                        matched += n
+                    elif kind in want_kind and (not stage or stage not in claimed_set):
+                        # 阶段压根没记，或者记的是 target_parse 这种不归段的阶段 → 按类型认
+                        matched += n
+                if matched:
+                    slot(tid)["modules"][key] = matched
         return out
+
+    def task_status_counts(self) -> dict[str, int]:
+        """按状态数任务，任务列表顶部/左侧角标用；比拉整张任务表轻得多。"""
+        rows = self.conn().execute(
+            "SELECT status, COUNT(*) n FROM tasks GROUP BY status").fetchall()
+        return {str(r["status"] or ""): int(r["n"] or 0) for r in rows}
 
     def stats(self) -> dict[str, Any]:
         c = self.conn()

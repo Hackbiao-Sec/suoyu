@@ -14,6 +14,8 @@ export const presets = () => http.get('/api/oneclick/presets')
 
 // ── 任务 ──────────────────────────────────────────
 export const listTasks = (params) => http.get('/api/tasks', { params })
+// 顶栏 / 左栏角标：只回各状态任务数，别用 listTasks 拉整张表
+export const activeTasks = () => http.get('/api/tasks/active')
 // 五段口径（主体 / 域名 / 测绘 / 探测 / 深挖）+ 资产类型中文名，三处页面共用
 export const listModules = () => http.get('/api/modules')
 export const createTask = (payload) => http.post('/api/tasks', payload)
@@ -39,6 +41,7 @@ export const oneClick = (payload) => http.post('/api/oneclick', payload)
 export const listAssets = (params) => http.get('/api/assets', { params })
 export const assetDetail = (id) => http.get(`/api/assets/${id}`)
 export const assetFacets = (params) => http.get('/api/assets/facets', { params })
+export const repairLiveness = (taskId = '') => http.post('/api/assets/liveness', null, { params: { task_id: taskId } })
 export const exportAssets = (params) => http.get('/api/export', { params, responseType: 'blob' })
 // 分表册：每张表的条数（子公司 / ICP / 站点…），资产页据此摆分类卡
 export const exportSheets = (params) => http.get('/api/export/sheets', { params })
@@ -97,6 +100,15 @@ export const listTemplates = () => http.get('/api/templates')
 export const saveTemplate = (payload) => http.post('/api/templates', payload)
 export const deleteTemplate = (name) => http.delete(`/api/templates/${encodeURIComponent(name)}`)
 
+// ── 字典管理 ──────────────────────────────────────
+// 内置字典只读；用户在界面上改过的写进 data/dicts 覆盖同名内置文件
+export const listDicts = () => http.get('/api/dicts')
+export const readDict = (name, params) => http.get(`/api/dicts/${encodeURIComponent(name)}`, { params })
+export const createDict = (payload) => http.post('/api/dicts', payload)
+export const saveDict = (name, payload) => http.put(`/api/dicts/${encodeURIComponent(name)}`, payload)
+export const deleteDict = (name) => http.delete(`/api/dicts/${encodeURIComponent(name)}`)
+export const bindDict = (name, key) => http.post(`/api/dicts/${encodeURIComponent(name)}/bind`, { key })
+
 // ── 通知 / 配置 ───────────────────────────────────
 export const getConfig = () => http.get('/api/config')
 export const saveConfig = (payload) => http.post('/api/config', payload)
@@ -108,6 +120,8 @@ export const installTools = (payload) => http.post('/api/tools/install', payload
 export const netDiagnose = (params) => http.get('/api/net/diagnose', { params })
 // 各来源的节流 / 冷却状态，配置页用来核对限速是否生效
 export const throttleState = () => http.get('/api/throttle')
+// 登录态池：每源配了几份 Cookie、当前用第几份、哪份在冷却
+export const credState = () => http.get('/api/creds')
 // 改节流口径：全局间隔 / 并发 / 熔断阈值 / 冷却，以及单来源间隔
 export const throttleSave = (patch) => http.post('/api/throttle', patch)
 export const throttleReset = () => http.post('/api/throttle/reset')

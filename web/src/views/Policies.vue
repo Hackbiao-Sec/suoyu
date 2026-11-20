@@ -46,6 +46,9 @@ const scan = reactive({
   equity_ubo_branches: 3,
   fuzz_dict: 'dir_default.txt',
   dns_source_policy: 'all',
+  space_mapping: true,
+  space_size: 100,
+  space_max_roots: 0,
 })
 const deep = reactive({
   code_leak: true,
@@ -275,6 +278,23 @@ onMounted(async () => {
             <select v-model="scan.dns_source_policy" class="select">
               <option v-for="p in POLICIES" :key="p.v" :value="p.v">{{ p.label }}</option>
             </select>
+          </div>
+          <div class="field">
+            <span class="field-label">空间测绘</span>
+            <label class="opt"><span class="switch" :class="{ on: scan.space_mapping }" @click="scan.space_mapping = !scan.space_mapping" />拿已确认根域去测绘引擎反查</label>
+            <span class="field-hint">补「域名不解析但对外暴露过」的资产（历史解析、旁路入口）；关掉则不消耗测绘配额。</span>
+          </div>
+          <div class="row">
+            <div class="field flex-1">
+              <span class="field-label">每根域每引擎取多少条</span>
+              <input v-model.number="scan.space_size" class="input mono" type="number" min="20" max="1000" />
+              <span class="field-hint">20～1000。调大可多捞长尾，配额消耗同步变多。</span>
+            </div>
+            <div class="field flex-1">
+              <span class="field-label">根域上限（0 = 不限）</span>
+              <input v-model.number="scan.space_max_roots" class="input mono" type="number" min="0" />
+              <span class="field-hint">默认 0：本轮确认的根域全部反查，一棵都不漏。填正数才启用熔断，超出按「主目标根优先 + 已收集资产量降序」截断，被砍掉的根域这一轮不会有新资产。</span>
+            </div>
           </div>
         </div>
       </div>

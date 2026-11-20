@@ -61,8 +61,8 @@ const RATIO_BUCKETS = [
   { key: 'none', label: '无持股比例' },
 ]
 const STATUS_LABEL = {
-  '2xx': '正常 2xx', '3xx': '跳转 3xx', auth: '401/403 需认证',
-  '4xx': '4xx 拒绝', '5xx': '5xx 异常', none: '无状态码', other: '其他',
+  '2xx': '正常 2xx', '3xx': '跳转 3xx', alive: '存活 / 解析', auth: '401/403 需认证',
+  '4xx': '4xx 拒绝', '5xx': '5xx 异常', space: '测绘收录', none: '未探测', other: '其他',
 }
 
 const RATIO_KEYS = ['ratio', 'percent', 'invest_ratio', 'hold_ratio', 'share_ratio', 'acc', 'acc_ratio']
@@ -87,10 +87,17 @@ function ratioBucket(r) {
     return '51'
   return 'lt51'
 }
-function statusKey(code) {
-  const n = Number(code)
-  if (!n)
+// 存活分档：有状态码按码分，没有码的域名/端口行看后端给的 alive
+function statusKey(a) {
+  const n = Number(a && a.status_code)
+  if (!n) {
+    const alive = String((a && a.alive) || '')
+    if (alive === 'alive' || alive === 'open' || alive === 'dns')
+      return 'alive'
+    if (alive === 'space')
+      return 'space'
     return 'none'
+  }
   if (n >= 200 && n < 300)
     return '2xx'
   if (n >= 300 && n < 400)
@@ -261,7 +268,7 @@ const rx = computed(() => {
 const docs = computed(() =>
   rows.value.map((a) => {
     const ratio = ratioOf(a)
-    return { a, ratio, bucket: ratioBucket(ratio), srcs: splitSources(a.sources), stat: statusKey(a.status_code), hay: haystack(a) }
+    return { a, ratio, bucket: ratioBucket(ratio), srcs: splitSources(a.sources), stat: statusKey(a), hay: haystack(a) }
   }),
 )
 
@@ -383,7 +390,7 @@ const portChips = computed(() => {
 const statusChips = computed(() => {
   const base = searched.value.filter((d) => pass(d, 'status'))
   const m = countBy(base, (d) => d.stat)
-  return ['2xx', '3xx', 'auth', '4xx', '5xx', 'none'].filter((k) => m.get(k))
+  return ['2xx', '3xx', 'alive', 'auth', '4xx', '5xx', 'space', 'none'].filter((k) => m.get(k))
     .map((k) => ({ key: k, label: STATUS_LABEL[k], n: m.get(k) }))
 })
 
@@ -495,14 +502,14 @@ function focusSurface(s) {
 }
 
 function exportCsv() {
-  const head = ['类型', '地址', '标题', '状态码', 'IP', '端口', '指纹', '来源', '持股比例', '最近']
+  const head = ['类型', '地址', '标题', '状态码', '存活', 'IP', '端口', '指纹', '来源', '持股比例', '最近']
   const q = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`
   const lines = [head.map(q).join(',')]
   for (const d of filtered.value) {
     const a = d.a
     lines.push([
-      kindLabel(a.kind), a.url, titleText(a) || a.title, a.status_code || '', a.ip || '',
-      a.port || '', a.fingerprint || '', a.sources || '', d.ratio == null ? '' : d.ratio,
+      kindLabel(a.kind), a.url, titleText(a) || a.title, a.status_code || '', a.alive_text || '',
+      a.ip || '', a.port || '', a.fingerprint || '', a.sources || '', d.ratio == null ? '' : d.ratio,
       fmtTime(a.last_seen),
     ].map(q).join(','))
   }
@@ -744,7 +751,7 @@ defineExpose({ reload, focusKind, focusSurface })
                 </td>
                 <td class="ellipsis"><span class="tag">{{ kindLabel(e.d.a.kind) }}</span></td>
                 <td class="mono">
-                  <span :class="'st-' + e.d.stat">{{ e.d.a.status_code || '—' }}</span>
+                  <span :class="'st-' + e.d.stat">{{ e.d.a.alive_text || e.d.a.status_code || '—' }}</span>
                 </td>
                 <td class="mono ellipsis" :title="e.d.a.ip || ''">{{ e.d.a.ip || '' }}</td>
                 <td class="mono">{{ e.d.a.port || '' }}</td>
@@ -978,10 +985,10 @@ defineExpose({ reload, focusKind, focusSurface })
   min-width: 900px;
   table-layout: fixed;
 }
-.ae-table col.c-url { width: 30%; }
-.ae-table col.c-title { width: 19%; }
+.ae-table col.c-url { width: 28%; }
+.ae-table col.c-title { width: 18%; }
 .ae-table col.c-kind { width: 8%; }
-.ae-table col.c-status { width: 5%; }
+.ae-table col.c-status { width: 8%; }
 .ae-table col.c-ip { width: 11%; }
 .ae-table col.c-port { width: 5%; }
 .ae-table col.c-src { width: 12%; }
@@ -1004,8 +1011,10 @@ defineExpose({ reload, focusKind, focusSurface })
 .new-tag { margin-left: 6px; font-size: 9.5px; height: 15px; padding: 0 4px; }
 .st-2xx { color: var(--ok-text); }
 .st-3xx { color: var(--violet-ink); }
+.st-alive { color: var(--ok-text); }
 .st-auth { color: var(--amber); }
 .st-5xx { color: var(--red); }
+.st-space { color: var(--muted); }
 .det-row td { background: rgba(52, 229, 200, 0.03); padding: 10px 12px; }
 .det-grid {
   display: grid;
