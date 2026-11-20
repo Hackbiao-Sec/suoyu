@@ -1,0 +1,205 @@
+"""五段式全收集口径：主体收集 → 域名收集 → 空间测绘 → 主动探测 → 深度挖掘。
+
+任务列表、任务详情、功能自检三处都从这里取阶段分组，避免各写一套阶段表
+（以前前端抄了一份 18 个阶段的数组，后端新增阶段前端就显示不出来）。
+
+一个任务跑了哪几段由 ``options.only_stages`` 决定：空 = 全选；否则只跑了列出的阶段。
+"""
+from __future__ import annotations
+
+MODULES: list[dict] = [
+    {"key": "subject", "label": "主体收集",
+     "hint": "企业主体、ICP 备案、股权穿透、小程序与 App",
+     "stages": ["enterprise", "equity", "mobile"]},
+    {"key": "domain", "label": "域名收集",
+     "hint": "被动子域与字典爆破，扩出根域下全部子域",
+     "stages": ["passive", "brute"]},
+    {"key": "space", "label": "空间测绘",
+     "hint": "测绘引擎按根域检索，产出带端口与标题的资产",
+     "stages": ["space"]},
+    {"key": "probe", "label": "主动探测",
+     "hint": "DNS 解析、端口扫描、Web 存活与指纹",
+     "stages": ["dns", "port", "web"]},
+    {"key": "deep", "label": "深度挖掘",
+     "hint": "爬虫、敏感文件、VHost、接管、旁站与纵深",
+     "stages": ["crawl", "leak", "vhost", "takeover", "sibling", "deep"]},
+]
+
+MODULE_KEYS = [m["key"] for m in MODULES]
+MODULE_LABEL = {m["key"]: m["label"] for m in MODULES}
+MODULE_HINT = {m["key"]: m["hint"] for m in MODULES}
+MODULE_STAGES = {m["key"]: list(m["stages"]) for m in MODULES}
+MODULE_OF = {stage: m["key"] for m in MODULES for stage in m["stages"]}
+
+# 收尾两阶段：不单独成模块，进度算在整条流程上
+TAIL_STAGES = ["assetdiff", "report"]
+STAGE_ORDER = [s for m in MODULES for s in m["stages"]] + TAIL_STAGES
+STAGE_INDEX = {s: i for i, s in enumerate(STAGE_ORDER)}
+STAGE_MODULE = dict(MODULE_OF)
+for _s in TAIL_STAGES:
+    STAGE_MODULE[_s] = "tail"
+
+# 老任务没往 task_assets 里写阶段，只能靠资产类型认它属于哪一段
+KIND_MODULE: dict[str, str] = {
+    "enterprise": "subject", "equity": "subject", "holds": "subject", "branch": "subject",
+    "invest": "subject", "partner": "subject", "icp": "subject", "copyright": "subject",
+    "supplier": "subject", "job": "subject", "applet": "subject", "applet_icp": "subject",
+    "applet_hint": "subject", "mobileapp": "subject", "mobile": "subject", "wxmp": "subject",
+    "wechatoa": "subject", "weibo": "subject", "email": "subject", "mailinfo": "subject",
+    "domain": "domain", "api": "domain", "subdomain": "domain",
+    # 裸 IP 服务是测绘直接落的；站点和 IP 解析结果是探测阶段落的
+    "service": "space",
+    "site": "probe", "ip": "probe",
+    "leak": "deep", "leakfile": "deep", "js": "deep", "component": "deep", "git": "deep",
+    "sibling": "deep", "url": "deep",
+}
+
+KIND_LABEL: dict[str, str] = {
+    "enterprise": "企业主体", "equity": "股权", "holds": "控股企业", "branch": "分支机构",
+    "invest": "对外投资", "partner": "股东", "icp": "ICP 备案", "copyright": "软件著作权",
+    "supplier": "供应商", "job": "招聘", "applet": "小程序", "applet_icp": "小程序备案",
+    "applet_hint": "小程序线索", "mobileapp": "APP", "mobile": "移动应用",
+    "wxmp": "公众号", "wechatoa": "公众号", "weibo": "微博", "email": "邮箱",
+    "mailinfo": "邮件信息", "domain": "域名", "api": "接口", "site": "站点",
+    "service": "服务", "ip": "IP", "leak": "泄露", "leakfile": "泄露文件",
+    "js": "JS 文件", "component": "组件", "git": "代码仓库", "sibling": "旁站",
+}
+
+KIND_ORDER = list(KIND_LABEL)
+
+
+def kind_label(kind: str) -> str:
+    return KIND_LABEL.get(kind or "", kind or "未分类")
+
+
+def stage_label(stage: str) -> str:
+    """阶段中文名。取自流水线的 ``PHASE_LABEL``，这里不再抄一份阶段名单。"""
+    from .pipeline import PHASE_LABEL
+
+    return PHASE_LABEL.get(stage or "", stage or "")
+
+
+def modules_payload() -> list[dict]:
+    """给前端渲染用的静态口径（五段 + 各自阶段 + 提示）。"""
+    return [{"key": m["key"], "label": m["label"], "hint": m["hint"],
+             "stages": list(m["stages"]),
+             "stage_labels": [stage_label(s) for s in m["stages"]]} for m in MODULES]
+
+
+# 日志里的 module 名不全是流水线阶段：调度、存储、邮件 DNS 这些也要有中文名，
+# 否则任务详情把 task / target / store 原样当阶段名显示出来
+LOG_MODULE_LABEL = {
+    "target": "目标归一", "target_parse": "目标归一", "task": "任务调度",
+    "store": "数据存储", "maildns": "邮件 DNS", "system": "系统",
+}
+# 同一个环节在日志与阶段表里用了两个名字，明细里要合成一行，别出现两条「目标归一」
+LOG_MODULE_ALIAS = {"target": "target_parse"}
+
+
+def stage_labels_payload() -> dict[str, str]:
+    """全部阶段（含收尾与日志别名）的中文名，任务详情的分组与 chip 共用一份。"""
+    out = {s: stage_label(s) for s in STAGE_ORDER}
+    for k, v in LOG_MODULE_LABEL.items():
+        out.setdefault(k, v)
+    return out
+
+
+def _selected(only_stages, module_key: str) -> list[str]:
+    # 认不出的阶段键不算选择：执行侧会忽略它们而照跑全流程，
+    # 展示侧若仍按它筛，真跑过的段就会被标成「未选这一路」。
+    picked = {str(s) for s in (only_stages or []) if str(s) in STAGE_ORDER}
+    stages = MODULE_STAGES[module_key]
+    if not picked:
+        return list(stages)
+    return [s for s in stages if s in picked]
+
+
+def module_asset_counts(kinds: dict | None, stages: dict | None) -> dict[str, int]:
+    """按阶段算各模块收了多少资产；没记阶段的老资产退回按类型归段。
+
+    ``db.task_breakdown`` 里能给出精确的模块去重数，这里只是它的兜底（比如
+    拿不到关联表的时候）。
+    """
+    out = {k: 0 for k in MODULE_KEYS}
+    for stage, n in (stages or {}).items():
+        key = STAGE_MODULE.get(stage or "")
+        if key in out:
+            out[key] += int(n or 0)
+    for kind, n in (kinds or {}).items():
+        key = KIND_MODULE.get(kind or "")
+        if key in out:
+            out[key] += int(n or 0)
+    return out
+
+
+def module_scopes() -> dict[str, dict]:
+    """给 ``db.task_breakdown`` 用的模块口径：哪些阶段、哪些类型归这一段。
+
+    第三项 ``claimed`` 是所有归段阶段的并集，db 拿它区分「阶段没写」和「阶段
+    写了但不归任何一段」（``target_parse`` 这种），后者才退回按资产类型认。
+    """
+    kinds: dict[str, list[str]] = {k: [] for k in MODULE_KEYS}
+    for kind, key in KIND_MODULE.items():
+        kinds.setdefault(key, []).append(kind)
+    claimed = list(STAGE_MODULE)
+    return {m["key"]: {"stages": list(m["stages"]), "kinds": kinds.get(m["key"], []),
+                       "claimed": claimed}
+            for m in MODULES}
+
+
+
+def task_modules(only_stages=None, phase: str = "", status: str = "",
+                 counts: dict | None = None) -> list[dict]:
+    """一个任务的五段进度：选没选、跑没跑完、收了多少资产。
+
+    ``phase`` 是任务最后记录的阶段；阶段顺序取 ``STAGE_ORDER``，所以已经走过
+    的阶段算完成，正落在某段里的算进行中，还没到的算待跑。
+    """
+    status = (status or "").lower()
+    cur = STAGE_INDEX.get(phase or "", -1)
+    success = status in ("done", "success", "finished", "ok")
+    alive = status in ("running", "queued", "pending", "starting", "paused")
+    counts = counts or {}
+    out: list[dict] = []
+    for m in MODULES:
+        stages = _selected(only_stages, m["key"])
+        if not stages:
+            out.append({"key": m["key"], "label": m["label"], "hint": m["hint"],
+                        "stages": [], "state": "skip", "pct": 0,
+                        "assets": 0, "note": "未选这一路"})
+            continue
+        idxs = [STAGE_INDEX[s] for s in stages]
+        if success:
+            state, pct = "done", 100
+        elif cur < 0:
+            state, pct = "pending", 0
+        elif cur >= max(idxs):
+            # 最后一段正跑着时先别打勾：阶段落到了这一段，但它还没收尾
+            if cur == max(idxs) and alive:
+                state, pct = "running", 90
+            else:
+                state, pct = "done", 100
+        elif cur < min(idxs):
+            state, pct = "pending", 0
+        else:
+            state = "running" if alive else "partial"
+            passed = len([i for i in idxs if i < cur])
+            pct = int(round(100.0 * (passed + (0.5 if state == "running" else 0)) / len(idxs)))
+            if status in ("failed", "stopped", "error", "interrupted"):
+                state = "stalled"
+        out.append({"key": m["key"], "label": m["label"], "hint": m["hint"],
+                    "stages": stages, "state": state, "pct": max(0, min(100, int(pct))),
+                    "assets": int(counts.get(m["key"], 0) or 0), "note": ""})
+    return out
+
+
+def is_partial(only_stages=None) -> bool:
+    """只跑了一部分阶段的任务：列表里要标成「局部任务」，不是整条流程。
+
+    只认真实阶段键：认不出的键在 executor 那边会被忽略而整条流程照跑，
+    这里若还按它算「局部」，列表就会说局部、实际却是全流程。
+    """
+    picked = {str(s) for s in (only_stages or []) if str(s) in STAGE_ORDER}
+    if not picked:
+        return False
+    return len(picked) < len([s for s in STAGE_ORDER if s not in TAIL_STAGES])
