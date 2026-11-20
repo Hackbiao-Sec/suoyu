@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, Menu, shell } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, Menu, shell } = require("electron");
 const net = require("node:net");
 const http = require("node:http");
 const { spawn } = require("node:child_process");
@@ -10,12 +10,50 @@ const os = require("node:os");
 // 天鉴·索舆 桌面外壳
 // 形态对齐探微：无边框深色窗口 + 内嵌引擎；区别只在于这里的引擎是本地 Python 服务端。
 // 启动顺序：挑一个空闲端口 → 拉起 resources/bin/suoyu-server.exe → 探活 → 加载页面。
+// 窗口按钮：主窗口不用 titleBarOverlay（原生按钮会压在顶栏菜单上且配色跟界面无关），
+// 改由网页顶栏自绘，按钮通过 preload 桥接到这里的 ipcMain 处理。
 // ────────────────────────────────────────────────────────────────
 
 let win = null;
 let server = null;
 let serverPort = 0;
 let quitting = false;
+
+// ── 自绘窗口按钮的 IPC ─────────────────────────────────────────
+// 按发送方定位窗口：内嵌窗口和外链窗口共用同一套网页按钮，不写死主窗口。
+const senderWindow = (event) => BrowserWindow.fromWebContents(event.sender);
+
+ipcMain.on("win:minimize", (event) => {
+  const target = senderWindow(event);
+  if (target) target.minimize();
+});
+
+ipcMain.on("win:toggle-maximize", (event) => {
+  const target = senderWindow(event);
+  if (!target) return;
+  if (target.isMaximized()) target.unmaximize();
+  else target.maximize();
+});
+
+ipcMain.on("win:close", (event) => {
+  const target = senderWindow(event);
+  if (target) target.close();
+});
+
+ipcMain.on("win:is-maximized", (event) => {
+  const target = senderWindow(event);
+  event.returnValue = Boolean(target && target.isMaximized());
+});
+
+/** 把最大化状态推给网页，按钮才能换「最大化 / 还原」图形 */
+function trackMaximized(target) {
+  const push = () => {
+    if (target.isDestroyed()) return;
+    target.webContents.send("win:maximized", target.isMaximized());
+  };
+  target.on("maximize", push);
+  target.on("unmaximize", push);
+}
 
 const LOG_DIR = () => {
   const dir = path.join(app.getPath("userData"), "logs");
@@ -134,13 +172,14 @@ async function waitReady(port, timeoutMs = 60000) {
  * 任何一次外链拉起都会让桌面外壳失去「单窗口平台」的形态。
  */
 function openInnerWindow(url) {
+  // 外链窗口里是别人的页面，没有我们的顶栏可以放自绘按钮，
+  // 所以保留系统标题栏，保证这类窗口始终能拖动和关闭。
   const child = new BrowserWindow({
     width: 1320,
     height: 880,
     backgroundColor: "#060b11",
     title: "天鉴·索舆",
-    titleBarStyle: "hidden",
-    titleBarOverlay: { color: "#060b11", symbolColor: "#d9e7ef", height: 46 },
+    autoHideMenuBar: true,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -161,15 +200,17 @@ function createWindow() {
     show: false,
     backgroundColor: "#060b11",
     title: "天鉴·索舆",
+    // 只留无框窗口：不设 titleBarOverlay，右上角不会再有原生按钮压在功能区上
     titleBarStyle: "hidden",
-    titleBarOverlay: { color: "#060b11", symbolColor: "#d9e7ef", height: 46 },
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      preload: path.join(__dirname, "preload.js"),
       spellcheck: false,
     },
   });
+  trackMaximized(win);
 
   const showWindow = (why) => {
     if (!win || win.isDestroyed() || win.isVisible()) return;

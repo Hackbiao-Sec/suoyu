@@ -5,6 +5,7 @@ import { NAV } from '@/router'
 import { useAuthStore, useUiStore } from '@/stores'
 import { activeTasks } from '@/api/endpoints'
 import Icon from '@/components/Icon.vue'
+import WindowControls from '@/components/WindowControls.vue'
 
 const auth = useAuthStore()
 const ui = useUiStore()
@@ -145,6 +146,7 @@ onBeforeUnmount(() => timer && clearInterval(timer))
             </button>
           </div>
         </div>
+        <WindowControls />
       </header>
 
       <main ref="contentEl" class="content">

@@ -239,6 +239,47 @@ a:hover { text-decoration: underline; }
 }
 .page-sub { font-size: 11.5px; color: var(--muted); }
 
+/* ---------------------------------------------------------------- 窗口按钮（Electron 外壳自绘） */
+
+.winctl {
+  display: flex; align-items: stretch; align-self: stretch;
+  margin-left: 4px;
+  -webkit-app-region: no-drag;
+}
+.winctl.floating {
+  position: fixed; top: 0; right: 0; height: var(--header-h);
+  margin: 0; z-index: 60;
+}
+.wc-btn {
+  width: 46px; height: 100%;
+  display: grid; place-items: center;
+  padding: 0; border: 0; background: transparent;
+  color: var(--muted); cursor: default;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.wc-btn svg { fill: none; stroke: currentColor; stroke-width: 1.15; stroke-linecap: round; stroke-linejoin: round; }
+.wc-btn:hover { background: rgba(120, 220, 235, 0.1); color: #eafaff; }
+.wc-btn:active { background: rgba(120, 220, 235, 0.2); }
+.wc-btn.close:hover { background: #c23a3f; color: #fff; }
+.wc-btn.close:active { background: #a92c31; color: #fff; }
+
+html[data-theme="light"] .wc-btn { color: #516b78; }
+html[data-theme="light"] .wc-btn:hover { background: rgba(20, 120, 130, 0.12); color: #102028; }
+html[data-theme="light"] .wc-btn.close:hover { background: #c23a3f; color: #fff; }
+
+/* 无系统标题栏时，顶栏和侧栏品牌区自己当拖动区；里面的控件必须退出拖动区才能点 */
+html.is-desktop .topbar,
+html.is-desktop .sidebar-brand { -webkit-app-region: drag; }
+html.is-desktop .topbar button,
+html.is-desktop .topbar a,
+html.is-desktop .topbar input,
+html.is-desktop .topbar select,
+html.is-desktop .topbar .winctl { -webkit-app-region: no-drag; }
+html.is-desktop .topbar { padding-right: 0; }
+/* 登录页没有顶栏：整块背景可拖，卡片本身留在非拖动区，否则输入框点不进去 */
+html.is-desktop .login-wrap { -webkit-app-region: drag; }
+html.is-desktop .login-card { -webkit-app-region: no-drag; }
+
 .content {
   flex: 1 1 auto; overflow-y: auto; overflow-x: hidden;
   padding: 16px 18px 22px;

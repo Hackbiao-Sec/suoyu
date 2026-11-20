@@ -3,6 +3,7 @@ import { reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores'
 import Icon from '@/components/Icon.vue'
+import WindowControls from '@/components/WindowControls.vue'
 
 const auth = useAuthStore()
 const router = useRouter()
@@ -32,6 +33,7 @@ async function submit() {
 
 <template>
   <div class="login-wrap">
+    <WindowControls class="floating" />
     <div class="login-card">
       <div class="brand-mark"><Icon name="radar" :size="21" /></div>
       <h1 class="login-title">天鉴 · 索舆</h1>

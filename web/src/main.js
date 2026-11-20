@@ -9,6 +9,10 @@ import App from './App.vue'
 import router from './router'
 import { useUiStore } from './stores'
 
+// 桌面外壳（preload 注入 window.suoyu）里窗口是没有系统标题栏的，
+// 顶栏要自己当拖动区、右侧要留出自绘按钮的位置，先在根节点打个标记。
+if (window.suoyu) document.documentElement.classList.add('is-desktop')
+
 // 重新构建会换掉 chunk 文件名并删掉旧文件，浏览器缓存的入口再去 import 就会 404。
 // 这里整页重载一次去拿新构建；只重试一次，避免真正缺文件时反复刷新。
 const CHUNK_RELOAD_KEY = 'suoyu.chunkReload'
