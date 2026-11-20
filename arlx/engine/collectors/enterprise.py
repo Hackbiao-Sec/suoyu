@@ -88,6 +88,12 @@ _PLATFORM_ROOTS = (
     "qcc.com", "tianyancha.com", "qichacha.com", "aiqicha.baidu.com", "qixin.com",
     "dianping.com", "meituan.com", "pinduoduo.com", "taobao.com", "tmall.com", "jd.com",
     "1688.com", "alibaba.com", "made-in-china.com", "hc360.com", "china.cn", "b2b168.com",
+    # B2B 黄页 / 供求信息 / 招标 / 行业门户：这些站收录了哪家企业，标题里就写哪家的名字，
+    # 首页标题永远只写平台自己的口号。漏掉一个的代价不是少一条资产，而是整条流水线拿
+    # 平台根域去跑被动子域 —— 顺企网一个根域就能灌回七百多条黄页子域。
+    "11467.com", "huangye88.com", "51sole.com", "likuso.com", "zk71.com", "qianlima.com",
+    "gongchang.com", "ebdoor.com", "makepolo.com", "qjy168.com", "herostart.com",
+    "sooshong.com", "zhaoshang.net", "chinabgao.com", "b2b.cn", "cnlinxi.com",
     "gov.cn", "edu.cn", "org.cn", "ac.cn", "mil.cn", "wikipedia.org", "baike.com",
     "boss.com", "chinaz.com", "wjx.cn", "docin.com", "doc88.com", "book118.com",
     # 内容平台 / 聚合站：标题写企业名是「谁报道了它」，不是「这是它的站」
@@ -953,6 +959,10 @@ _SEARCH_NOISE = (
     "zj.gov.cn", "zjol.com.cn", "zjnews.com.cn", "ces.cn", "roboind.com",
     "domain.cn", "ename.net", "4.cn", "west.cn", "22.cn", "yumi.com", "sedo.com",
     "zhanhui.com", "expo.com", "cantonfair.org.cn", "hktdc.com", "ccpit.org",
+    # B2B 黄页 / 供求 / 招标 / 行业门户：候选池阶段就丢掉，连打分表都不进
+    "11467.com", "huangye88.com", "51sole.com", "likuso.com", "zk71.com", "qianlima.com",
+    "gongchang.com", "ebdoor.com", "makepolo.com", "qjy168.com", "herostart.com",
+    "sooshong.com", "zhaoshang.net", "chinabgao.com", "b2b.cn", "cnlinxi.com",
 )
 
 # 一次打分最多探多少个根域（按命中条数取前 N）。不是候选上限：
@@ -1006,6 +1016,27 @@ def _is_platform(domain: str, name: str = "") -> bool:
         return True
     # 品牌自有主域（品牌名就是根域主体）不可能是平台站：`huawei.com` 被误列进平台名单就会把官网扣死。
     return any(d.endswith("." + s) for s in _PLATFORM_ROOTS) and not _is_own_brand_root(d, name)
+
+
+# 首页拿得到标题、但标题与目标毫无关系时用的权重。这条守的是长尾：平台名单只能挡点名的站，
+# 行业门户（锅炉之家这类）每天都在换，靠名单补永远漏下一个。
+W_SITE_UNRELATED = -50
+# 目录 / 黄页 / 供求 / 行业门户的标题特征：`锅炉之家 - 锅炉厂家大全_锅炉在线报价`
+_DIRECTORY_TITLE_HINT = ("黄页", "名录", "大全", "供求", "供应", "求购", "招标", "采购",
+                         "分类信息", "发布平台", "信息平台", "企业库", "行业门户", "导航",
+                         "报价", "厂家", "市场", "展会", "论坛", "贴吧", "百科", "网店")
+# 通用首页标题：不携带任何「我们是谁」的信息，不能拿来判「首页自述与目标无关」
+_GENERIC_TITLE_RE = re.compile(
+    r"^(首页|主页|网站首页|默认首页|欢迎光临|欢迎访问|加载中|无标题|未命名|"
+    r"home|homepage|index|welcome|loading|untitled|default)$", re.I)
+
+
+def _is_generic_title(title: str) -> bool:
+    """标题里没有「我们是谁」的任何内容：`首页`、`Home`、`欢迎光临` 这类不能当反面证据。"""
+    t = re.sub(r"[\s\-_|/·]+", "", title or "")
+    if len(t) <= 2:
+        return True
+    return bool(_GENERIC_TITLE_RE.match(t))
 
 
 # 品牌自家运营的产品根域：搜索里它就是这家公司的业务面，不是通用平台转载。
@@ -2300,6 +2331,15 @@ def _score_domain(domain: str, hits: list[web.Hit], name: str, *, declared: bool
     if dest_hit is not None:
         ev.reasons.append(f"检索「{ent_q[0]}」第 {dest_hit.rank + 1} 位指向该域（空标题，单凭检索位不成立）")
     score, why = _domain_brand_score(domain, name, site_title)
+    # 首页自述与目标无关（结构闸）：首页拿得到标题，但标题既没自称品牌/全称，也没有自报
+    # 主体、备案、站内声明、已知主域任一项支撑，域名写法也对不上品牌 —— 说明这条候选的
+    # 分数全部来自「引擎把黄页/行业门户的收录条目排在了前面」。黄页站收录了这家企业，
+    # 标题里当然写着这个名字，以前这种标题会被当成强证据直接越过确认线（顺企网、锅炉之家
+    # 都是这么进来的），确认后再按根域跑被动子域，几百条平台子域就灌进了资产池。
+    # 空标题的 SPA 官网不触发：那种站只能靠检索位与备案认。
+    site_unrelated = bool(site_title) and not _is_generic_title(site_title) and score < 14 and not (
+        own_root or declared or self_icp or icp_hit or rev_icp or site_subject
+        or title_says_brand or title_fullname or title_institutional)
     # 域名写法证据：字面品牌名（25/18），或拼音写法 + 站点标题交叉（18/14）。
     # 单纯拼音巧合（9/6）只当弱证据，防止抢注域靠拼写硬闯。
     domain_identity = score >= 14
@@ -2332,13 +2372,19 @@ def _score_domain(domain: str, hits: list[web.Hit], name: str, *, declared: bool
         best = min(title_hit, key=lambda h: h.rank)
         if best.rank <= TOP_RANK:
             ev.add(W_TITLE, f"搜索第 {best.rank + 1} 位标题就是企业名：{best.title[:40]}")
-            strong += 1          # 引擎把这条排在最前，且标题写着品牌名：与官网声明同级
+            if site_unrelated:
+                # 黄页 / 行业门户收录了这家企业，标题当然写企业名：这条只说明「库里收录过」，
+                # 不能升级成强证据，否则下面的弱证据封顶会被它一个人绕开。
+                ev.reasons.append("首页自述与目标无关，这条只是收录条目，不算归属证据")
+            else:
+                strong += 1      # 引擎把这条排在最前，且标题写着品牌名：与官网声明同级
         else:
             ev.add(W_LATE, f"排在搜索第 {best.rank + 1} 位（偏远），仅作参考")
     elif brand_hit and min(brand_hit, key=lambda h: h.rank).rank <= TOP_RANK:
         best = min(brand_hit, key=lambda h: h.rank)
         ev.add(W_TITLE, f"搜索第 {best.rank + 1} 位标题是品牌名：{best.title[:40]}")
-        strong += 1
+        if not site_unrelated:
+            strong += 1
     if snip_hit and not short_brand:
         ev.add(W_SNIPPET, "搜索摘要命中企业名")
     elif any(k in h.text for h in hits for k in keys) and not title_hit and not brand_hit:
@@ -2352,6 +2398,11 @@ def _score_domain(domain: str, hits: list[web.Hit], name: str, *, declared: bool
         ev.add(W_PUBLIC_TLD, "公共主体后缀（政府/教育/组织），不属于企业自有资产")
     if _is_platform(domain, name):
         ev.add(W_PLATFORM, "地图/黄页/论坛/招聘/媒体平台站：标题出现企业名是检索结果，不是自有资产")
+    if site_unrelated:
+        ev.add(W_SITE_UNRELATED,
+               f"首页自述「{site_title[:30]}」与目标无关，得分只来自检索排名，不是这家企业的站")
+        if any(w in site_title for w in _DIRECTORY_TITLE_HINT):
+            ev.add(W_PLATFORM, "首页标题是目录/黄页/供求/行业门户写法：它收录了这家企业，不是它的站")
     if subjects and not site_subject:
         # 站点写了自己的主体，但和目标对不上：加盟招商、山寨官网的典型形态——页面满屏品牌名，
         # 页脚版权却属于另一家公司（`瑞幸咖啡加盟官网` 的版权方是别的茶饮公司）。
@@ -2374,6 +2425,11 @@ def _score_domain(domain: str, hits: list[web.Hit], name: str, *, declared: bool
         # 文案本身可被仿冒站随意书写，所以不给确认
         ev.status = "pending" if ev.score >= PENDING_SCORE else "rejected"
         ev.reasons.append("站点自报主体与目标无关，需人工核验")
+    elif site_unrelated:
+        # 首页自己都说了它是谁（黄页 / 行业门户），剩下的分数全是检索排名叠出来的：
+        # 这类最多当候选，绝不允许进采集链再按根域跑被动子域。
+        ev.status = "pending" if ev.score >= PENDING_SCORE else "rejected"
+        ev.reasons.append("首页自述与目标无关，需人工核验")
     elif ev.score >= CONFIRM_SCORE:
         ev.status = "confirmed"
     elif ev.score >= PENDING_SCORE:
@@ -3211,6 +3267,15 @@ async def collect_entity(target: str, *, mobile: bool = True,
     # 只从 `info.domains` 里反筛的话这一列恒为空 —— 界面就只剩「确认 1 个」，
     # 看起来像整轮只搜到一个域，其实另外几个是被证据闸挡下来的（有分数和原因）。
     domains_maybe = sorted(pend_roots | {d for d in domains_all if d not in domains_ok})
+    # 最后一道网：平台 / 黄页根域从别的分支（先验收到的子域、AI 猜测、股权域名）混进来时，
+    # 也不许进采集链。按本主体名判，目标是平台自己时 `_is_platform` 会放行。
+    platform_drop = [d for d in domains_ok
+                     if _is_platform(d, info.name) or _is_noise(d, info.name)]
+    if platform_drop:
+        domains_ok = [d for d in domains_ok if d not in platform_drop]
+        domains_maybe = sorted(set(domains_maybe) | set(platform_drop))
+        notes.append(f"{len(platform_drop)} 个平台/黄页根域已拦下（不当自家根扩线）："
+                     f"{'、'.join(platform_drop[:6])}")
     if domains_maybe:
         notes.append(f"{len(domains_maybe)} 个待核验域没有并入主域清单（不当自家根扩线）："
                      f"{'、'.join(domains_maybe[:8])}")
