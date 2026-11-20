@@ -16,7 +16,7 @@ const emit = defineEmits(['detail'])
 
 const k = (key) => props.kindLabel[key] || key || '-'
 
-const WEB_KINDS = new Set(['site', 'domain', 'api', 'service', 'ip', 'sibling', 'url', 'js',
+const WEB_KINDS = new Set(['site', 'domain', 'api', 'service', 'port', 'ip', 'sibling', 'url', 'js',
   'leak', 'leakfile', 'git', 'component', 'subdomain', 'netblock', 'cidr', 'takeover', 'bucket'])
 const webShare = computed(() => {
   if (!props.items.length) return true

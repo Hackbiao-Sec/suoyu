@@ -16,7 +16,8 @@ let expiredAt = 0
 let slowAt = 0
 
 http.interceptors.response.use(
-  (res) => (res.config?.responseType === 'blob' ? res : res.data),
+  // blob 也统一返回 res.data：下载调用点要的是 Blob 本身，返回整个 AxiosResponse 会被串成 [object Object]
+  (res) => res.data,
   (err) => {
     const status = err?.response?.status
     const detail = err?.response?.data?.detail

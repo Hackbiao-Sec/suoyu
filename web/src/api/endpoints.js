@@ -26,13 +26,17 @@ export const taskAssets = (id, params) => http.get(`/api/assets`, { params: { ta
 export const taskSummary = (id) => http.get(`/api/tasks/${id}/summary`)
 // 阶段逐条明细：每阶段耗时、日志样本、这一阶段收进来的资产
 export const taskStages = (id) => http.get(`/api/tasks/${id}/stages`)
+// 阶段 → 可单独重测的细分项（被动源、测绘引擎按注册表现取）
+export const rerunStages = () => http.get('/api/stages/rerun')
 // 股权穿透树：chain 已拍平成 parent → children，可直接喂树图
 export const taskEquity = (id) => http.get(`/api/tasks/${id}/equity`)
 // 数据渠道：这趟调了哪些外部来源、哪些失效 / 额度尽 / 没配凭据，采集时逐条留痕
 export const taskSources = (id) => http.get(`/api/tasks/${id}/sources`)
 export const stopTask = (id) => http.post(`/api/tasks/${id}/stop`)
 export const deleteTask = (id) => http.delete(`/api/tasks/${id}`)
-export const rerunTask = (id, stage = '') => http.post(`/api/tasks/${id}/rerun`, stage ? { stage } : {})
+// modules: ['deep:nuclei'] 只重测阶段内的某几项；targets: ['a.com'] 只重测这几个 host / IP
+export const rerunTask = (id, stage = '', extra = {}) =>
+  http.post(`/api/tasks/${id}/rerun`, stage ? { stage, ...extra } : {})
 
 // 一键收集全
 export const oneClick = (payload) => http.post('/api/oneclick', payload)

@@ -25,6 +25,55 @@ MODULES: list[dict] = [
      "stages": ["crawl", "leak", "vhost", "takeover", "sibling", "deep"]},
 ]
 
+# 阶段里的细分项：重测时不必整段重跑，可以只挑其中几项。
+# 编码是「阶段:子项」，写进 options["only_modules"]；某段一个子项都没写 = 整段照跑。
+# 被动源与测绘引擎不进这张静态表，按各自注册表现取（见 stage_submodules）。
+SUBMODULES: dict[str, list[dict]] = {
+    "port": [
+        {"key": "scan", "label": "开放端口", "hint": "按端口组扫每个 IP 的开放端口"},
+        {"key": "service", "label": "协议指纹", "hint": "对已开端口握手认服务（Redis/Mongo/JDWP…）"},
+    ],
+    "leak": [
+        {"key": "file", "label": "敏感文件", "hint": "按字典探备份、配置、swagger 这类路径"},
+        {"key": "git", "label": "Git 泄露", "hint": "探 .git 目录可读与仓库泄露"},
+    ],
+    "sibling": [
+        {"key": "ptr", "label": "PTR 反查", "hint": "落点 IP 反查主机名"},
+        {"key": "cseg", "label": "同 C 段旁站", "hint": "扫同段 80/443 找关联业务页"},
+        {"key": "asn", "label": "ASN 网段", "hint": "归集 ASN 与小网段并补扫"},
+        {"key": "bucket", "label": "存储桶", "hint": "按根域猜云存储桶是否公开"},
+    ],
+    "deep": [
+        {"key": "codeleak", "label": "代码泄露", "hint": "搜索代码托管上的本目标仓库"},
+        {"key": "email", "label": "邮箱收集", "hint": "从页面与仓库里收邮箱"},
+        {"key": "git", "label": "Git 仓库", "hint": "GitHub / Gitee 上的本目标仓库"},
+        {"key": "component", "label": "组件识别", "hint": "FineReport / Shiro / 泛微 / xxl-job 等指纹"},
+        {"key": "component_probe", "label": "组件未授权", "hint": "Actuator / Druid / Nacos / ES 等未授权探测"},
+        {"key": "screenshot", "label": "站点截图", "hint": "给每个站点留一张图"},
+        {"key": "nuclei", "label": "nuclei 复核", "hint": "对站点跑已知漏洞模板"},
+    ],
+}
+
+
+def stage_submodules() -> dict[str, list[dict]]:
+    """阶段 → 可单独重测的细分项。被动源、测绘引擎按注册表现取，不另抄名单。"""
+    out = {k: [dict(x) for x in v] for k, v in SUBMODULES.items()}
+    try:
+        from . import space as space_mod
+        out["space"] = [{"key": n, "label": space_mod.ENGINE_LABEL.get(n, n)}
+                        for n in space_mod.QUERY_FUNCS]
+    except Exception:
+        pass
+    try:
+        from .sources import passive as passive_mod
+        from . import source_health
+        out["passive"] = [{"key": n, "label": source_health.label_source(n)}
+                          for n in passive_mod.DOMAIN_SOURCES]
+    except Exception:
+        pass
+    return out
+
+
 MODULE_KEYS = [m["key"] for m in MODULES]
 MODULE_LABEL = {m["key"]: m["label"] for m in MODULES}
 MODULE_HINT = {m["key"]: m["hint"] for m in MODULES}
@@ -49,6 +98,7 @@ KIND_MODULE: dict[str, str] = {
     "domain": "domain", "api": "domain", "subdomain": "domain",
     # 裸 IP 服务是测绘直接落的；站点和 IP 解析结果是探测阶段落的
     "service": "space",
+    "port": "probe",
     "site": "probe", "ip": "probe",
     "leak": "deep", "leakfile": "deep", "js": "deep", "component": "deep", "git": "deep",
     "sibling": "deep", "url": "deep",
@@ -61,7 +111,7 @@ KIND_LABEL: dict[str, str] = {
     "applet_hint": "小程序线索", "mobileapp": "APP", "mobile": "移动应用",
     "wxmp": "公众号", "wechatoa": "公众号", "weibo": "微博", "email": "邮箱",
     "mailinfo": "邮件信息", "domain": "域名", "api": "接口", "site": "站点",
-    "service": "服务", "ip": "IP", "leak": "泄露", "leakfile": "泄露文件",
+    "service": "服务", "port": "端口", "ip": "IP", "leak": "泄露", "leakfile": "泄露文件",
     "js": "JS 文件", "component": "组件", "git": "代码仓库", "sibling": "旁站",
 }
 

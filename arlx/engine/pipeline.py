@@ -28,6 +28,7 @@ from __future__ import annotations
 oneclick_expand = None
 
 import asyncio
+import ipaddress
 import time
 import uuid
 import traceback
@@ -468,6 +469,68 @@ class TaskRunner(StagesMixin):
             picked = [picked]
         return key in {str(p) for p in picked}
 
+    def sub_on(self, stage: str, key: str) -> bool:
+        """阶段内的细分项要不要跑。
+
+        ``options["only_modules"]`` 用「阶段:子项」编码（如 ``deep:nuclei``）。
+        这一段一个子项都没写就整段照跑，保证老调用与「重跑整段」行为不变。
+        """
+        picked = self.options.get("only_modules") or []
+        if isinstance(picked, str):
+            picked = [picked]
+        picked = {str(p).strip() for p in picked if str(p).strip()}
+        marker = stage + ":"
+        if not any(p.startswith(marker) for p in picked):
+            return True
+        return marker + key in picked
+
+    def scope_targets(self) -> list[str]:
+        """本次只重测哪些 host / IP；空 = 不设范围。"""
+        raw = self.options.get("scope_targets") or []
+        if isinstance(raw, str):
+            raw = raw.replace(",", " ").replace("，", " ").split()
+        out: list[str] = []
+        for item in raw:
+            v = str(item or "").strip().lower()
+            v = v.split("://")[-1].split("/")[0].split(":")[0].strip(".")
+            if v and v not in out:
+                out.append(v)
+        return out
+
+    def in_scope(self, value: str) -> bool:
+        """这个 host / IP 在不在本次重测范围里。没设范围时一律算在。"""
+        cached = getattr(self, "_scope_cache", None)
+        if cached is None:
+            cached = self.scope_targets()
+            self._scope_cache = cached
+            nets = []
+            for t in cached:
+                if "/" in t:
+                    try:
+                        nets.append(ipaddress.ip_network(t, strict=False))
+                    except ValueError:
+                        pass
+            self._scope_nets = nets
+        if not cached:
+            return True
+        v = str(value or "").strip().lower().strip(".")
+        v = v.split("://")[-1].split("/")[0].split(":")[0].strip(".")
+        if not v:
+            return False
+        if v in cached:
+            return True
+        if is_ip(v):
+            for net in getattr(self, "_scope_nets", []):
+                try:
+                    if ipaddress.ip_address(v) in net:
+                        return True
+                except ValueError:
+                    pass
+        for t in cached:
+            if not is_ip(t) and not is_ip(v) and v.endswith("." + t):
+                return True
+        return False
+
     def absorb_targets(self, items: list[str]) -> int:
         """把扩展阶段新捞到的域名 / IP 并进本轮目标，返回真正新增的条数。"""
         from ..utils import is_ip, is_valid_domain
@@ -510,6 +573,7 @@ class TaskRunner(StagesMixin):
         rows = store.query_assets(task_id=seed_id, limit=200000)
         ips: set[str] = set(parsed.setdefault("ips", []))
         dropped: set[str] = set()
+        out_scope = 0
         for r in rows:
             kind = str(r.get("kind") or "")
             host = str(r.get("host") or "").strip().lower()
@@ -524,6 +588,10 @@ class TaskRunner(StagesMixin):
                 if not is_valid_domain(name):
                     dropped.add(name)
                     name = ""
+            # 只重测指定 host / IP 时，回填也得圈住：不然范围外的一起被扫一遍
+            if not self.in_scope(name or ip or host):
+                out_scope += 1
+                continue
             if name and name not in self.domains and self.keep_domain(name):
                 self.domains.add(name)
                 root = str(r.get("root_domain") or "").strip().lower() or self._root(name)
@@ -537,7 +605,7 @@ class TaskRunner(StagesMixin):
                 ips.add(host)
                 self.ips.setdefault(host, set()).add(host)
             for i in ([ip] if ip and is_ip(ip) else []) + col_ips:
-                if kind in ("ip", "site", "service", "cidr") and is_ip(i):
+                if kind in ("ip", "site", "service", "port", "cidr") and is_ip(i):
                     ips.add(i)
         base = set(parsed.get("ips") or [])
         parsed["ips"] = sorted(ips)
@@ -549,6 +617,8 @@ class TaskRunner(StagesMixin):
         if dropped:
             self.log("task", f"{len(dropped)} 个历史 host 不是可查域名已跳过："
                              f"{'、'.join(sorted(dropped)[:4])}", "warn")
+        if out_scope:
+            self.log("task", f"按本次选定的重测范围过滤掉 {out_scope} 条范围外资产")
 
     async def _run_only(self, parsed: dict) -> None:
         """只跑选中的阶段，顺序仍按 PHASES，跳过的阶段不推进整体进度。"""

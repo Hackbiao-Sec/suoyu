@@ -518,8 +518,12 @@ function exportCsv() {
   const el = document.createElement('a')
   el.href = url
   el.download = `资产_${props.taskId}_${new Date().toISOString().slice(0, 10)}.csv`
+  el.style.display = 'none'
+  document.body.appendChild(el)
   el.click()
-  URL.revokeObjectURL(url)
+  el.remove()
+  // 立刻回收会让部分浏览器把还没写完的下载掐掉，等两秒再释放
+  setTimeout(() => URL.revokeObjectURL(url), 2000)
 }
 
 function detailPairs(a) {

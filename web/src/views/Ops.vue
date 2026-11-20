@@ -524,8 +524,12 @@ async function exportTask(taskId, tag) {
     const a = document.createElement('a')
     a.href = url
     a.download = `suoyu_${tag || 'task'}_${taskId}.csv`
+    a.style.display = 'none'
+    document.body.appendChild(a)
     a.click()
-    URL.revokeObjectURL(url)
+    a.remove()
+    // 立刻回收会让部分浏览器把还没写完的下载掐掉，等两秒再释放
+    setTimeout(() => URL.revokeObjectURL(url), 2000)
   } catch (e) {
     loadErr.value = pickErr(e)
   }

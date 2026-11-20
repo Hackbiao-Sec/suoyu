@@ -8,7 +8,7 @@ import EquityPanel from '@/components/task/EquityPanel.vue'
 import OverviewCharts from '@/components/task/OverviewCharts.vue'
 import {
   getTask, listModules, stopTask, subscribeTask, taskEquity, taskLogs,
-  taskStages, taskSources, taskSummary, rerunTask,
+  taskStages, taskSources, taskSummary, rerunTask, rerunStages,
 } from '@/api/endpoints'
 
 const route = useRoute()
@@ -186,6 +186,7 @@ const stageGroups = computed(() => {
 })
 function openStage(row) {
   stageKey.value = row.key
+  initRerunForm()
 }
 function closeStage() {
   stageKey.value = ''
@@ -493,13 +494,45 @@ async function doRerun() {
 }
 const rerunStageBusy = ref('')
 const RERUN_OFF = ['target_parse']
+// 阶段内的细分项：勾中的才重测；全勾 = 整段照跑
+const submodules = ref({})
+const pickedSubs = ref([])
+const rerunTargets = ref('')
+const stageSubs = computed(() => submodules.value[stageKey.value] || [])
+function initRerunForm() {
+  pickedSubs.value = (submodules.value[stageKey.value] || []).map((s) => s.key)
+  rerunTargets.value = ''
+  if (!Object.keys(submodules.value).length) {
+    rerunStages().then((res) => {
+      submodules.value = res?.submodules || {}
+      pickedSubs.value = (submodules.value[stageKey.value] || []).map((s) => s.key)
+    }).catch(() => {})
+  }
+}
+function toggleSub(key) {
+  pickedSubs.value = pickedSubs.value.includes(key)
+    ? pickedSubs.value.filter((k) => k !== key)
+    : [...pickedSubs.value, key]
+}
+function toggleAllSubs(on) {
+  pickedSubs.value = on ? stageSubs.value.map((s) => s.key) : []
+}
 async function rerunStage() {
   const key = stageKey.value
   if (!key || RERUN_OFF.includes(key))
     return
   rerunStageBusy.value = key
   try {
-    const res = await rerunTask(id.value, key)
+    const subs = stageSubs.value.map((s) => s.key)
+    const partial = subs.length && pickedSubs.value.length < subs.length
+    const extra = {}
+    // 一项都没勾 = 整段；全勾也发整段，只勾一部分才限定
+    if (partial)
+      extra.modules = pickedSubs.value.map((k) => `${key}:${k}`)
+    const targets = rerunTargets.value.replace(/[,，\s]+/g, ' ').trim()
+    if (targets)
+      extra.targets = targets.split(' ')
+    const res = await rerunTask(id.value, key, extra)
     if (res?.task_id)
       router.push(`/tasks/${res.task_id}`)
   } finally {
@@ -528,8 +561,12 @@ async function exportCsv() {
   const a = document.createElement('a')
   a.href = url
   a.download = `suoyu_task_${id.value}.xlsx`
+  a.style.display = 'none'
+  document.body.appendChild(a)
   a.click()
-  URL.revokeObjectURL(url)
+  a.remove()
+  // 立刻回收会让部分浏览器把还没写完的下载掐掉，等两秒再释放
+  setTimeout(() => URL.revokeObjectURL(url), 2000)
 }
 
 onMounted(async () => {
@@ -955,15 +992,46 @@ onBeforeUnmount(() => {
           <span class="mono muted" style="font-size: 11px">
             {{ stageDetail?.duration ? '耗时 ' + stageDetail.duration + 's' : '无耗时记录' }}
           </span>
-          <button
-            v-if="stageKey && !RERUN_OFF.includes(stageKey)"
-            class="btn ghost sm" :disabled="!!rerunStageBusy"
-            :title="'只重跑「' + stageTitle + '」这一阶段，资产池按本任务已入库的域名和 IP 回填'"
-            @click="rerunStage"
-          ><Icon name="refresh" :size="12" />{{ rerunStageBusy ? '提交中' : '重跑此阶段' }}</button>
           <button class="btn ghost sm" @click="closeStage"><Icon name="close" :size="13" /></button>
         </div>
         <div class="modal-body stack" style="gap: 12px">
+          <!-- 重测范围：只勾阶段内的某几项 / 只对几个 host，比整段重跑省得多 -->
+          <div v-if="stageKey && !RERUN_OFF.includes(stageKey)" class="rerun-box">
+            <div class="flex" style="align-items: center; justify-content: space-between; gap: 8px">
+              <div class="sub-title" style="margin: 0">
+                重测范围
+                <span class="muted" style="font-size: 11px; font-weight: 400">全勾 = 整段重跑；只留想重来的那几项就只跑它们</span>
+              </div>
+              <div v-if="stageSubs.length" class="flex" style="align-items: center; gap: 6px">
+                <button class="btn xs ghost" @click="toggleAllSubs(true)">全选</button>
+                <button class="btn xs ghost" @click="toggleAllSubs(false)">清空</button>
+                <span class="mono muted" style="font-size: 10.5px">{{ pickedSubs.length }} / {{ stageSubs.length }}</span>
+              </div>
+            </div>
+            <div v-if="stageSubs.length" class="subgrid">
+              <label
+                v-for="s in stageSubs" :key="'rs-' + s.key" class="subitem"
+                :class="{ on: pickedSubs.includes(s.key) }" :title="s.hint || s.label"
+              >
+                <input type="checkbox" :checked="pickedSubs.includes(s.key)" @change="toggleSub(s.key)" />
+                <span class="ellipsis">{{ s.label }}</span>
+              </label>
+            </div>
+            <div v-else class="muted" style="font-size: 12px">这一阶段没有更细的拆分，重测就是整段。</div>
+            <div class="flex" style="align-items: center; gap: 8px">
+              <input
+                v-model="rerunTargets" class="input flex-1"
+                placeholder="只重测这几个 host / IP（逗号或空格分隔，留空 = 本任务全部）"
+              />
+              <button class="btn primary sm" :disabled="!!rerunStageBusy" @click="rerunStage">
+                <Icon name="refresh" :size="12" />{{ rerunStageBusy ? '提交中' : '按此范围重跑' }}
+              </button>
+            </div>
+            <div class="muted" style="font-size: 11px; line-height: 1.65">
+              目标留空就吃本任务已入库的全部域名和 IP；填了只在填的这几个上重跑，结果仍并回本任务。
+              细分项一项都不勾也按整段算。
+            </div>
+          </div>
           <div v-if="!stageDetail" class="empty" style="padding: 26px 8px">
             <Icon name="alert" :size="20" />
             <div style="margin-top: 6px">这一阶段本次运行没有留下执行记录</div>
@@ -1090,6 +1158,37 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .td { display: flex; flex-direction: column; gap: 12px; }
+
+/* ── 阶段重测范围 ── */
+.rerun-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 11px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-2, rgba(255, 255, 255, 0.02));
+}
+.subgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 5px;
+}
+.subitem {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 7px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  font-size: 11.5px;
+  cursor: pointer;
+  min-width: 0;
+  color: var(--muted);
+}
+.subitem:hover { border-color: var(--line-2, var(--line)); color: var(--text-2); }
+.subitem.on { color: var(--text); border-color: rgba(52, 229, 200, 0.38); background: rgba(52, 229, 200, 0.06); }
+.subitem input { accent-color: var(--cyan); margin: 0; }
 
 /* ── 状态条 ── */
 .hero {

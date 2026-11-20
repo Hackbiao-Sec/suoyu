@@ -56,7 +56,7 @@ class Utf8JSONResponse(JSONResponse):
                           separators=(",", ":"), default=str).encode("utf-8")
 
 
-app = FastAPI(title=APP_TITLE, version="2.7.0", default_response_class=Utf8JSONResponse)
+app = FastAPI(title=APP_TITLE, version="2.8.0", default_response_class=Utf8JSONResponse)
 STATIC_DIR = BUILD_DIR
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -158,7 +158,7 @@ async def logout(request: Request) -> dict:
 
 @app.get("/api/me")
 async def me(request: Request) -> dict:
-    return {"username": current_user(request), "version": "2.7.0"}
+    return {"username": current_user(request), "version": "2.8.0"}
 
 
 # ─────────────── 配置 ───────────────
@@ -567,9 +567,33 @@ async def rerun_task(request: Request, task_id: str, stage: str = "") -> dict:
         # 新任务本身没有资产，回填要从被重跑的那个任务读
         options["seed_task"] = task_id
         suffix = "重跑" + str(pipeline.PHASE_LABEL.get(key) or key)
+        # 阶段内细分项：写成「阶段:子项」，只重测勾中的那几项
+        raw_mods = (body or {}).get("modules") or []
+        if isinstance(raw_mods, str):
+            raw_mods = raw_mods.replace(",", " ").replace("，", " ").split()
+        mods = [str(m).strip() for m in raw_mods if str(m).strip()]
+        allowed = {f"{key}:{x['key']}" for x in modules_mod.stage_submodules().get(key, [])}
+        mods = [m for m in mods if m in allowed]
+        if mods:
+            options["only_modules"] = mods
+            suffix += "(" + "、".join(m.split(":", 1)[1] for m in mods) + ")"
+        else:
+            options.pop("only_modules", None)
+        # 只重测指定的 host / IP：留空 = 整段全跑
+        raw_hosts = (body or {}).get("targets") or []
+        if isinstance(raw_hosts, str):
+            raw_hosts = raw_hosts.replace(",", " ").replace("，", " ").split()
+        hosts = [str(h).strip() for h in raw_hosts if str(h).strip()]
+        if hosts:
+            options["scope_targets"] = hosts
+            suffix += "·" + (hosts[0] if len(hosts) == 1 else f"{len(hosts)}个目标")
+        else:
+            options.pop("scope_targets", None)
     else:
         options.pop("only_stages", None)
         options.pop("seed_task", None)
+        options.pop("only_modules", None)
+        options.pop("scope_targets", None)
     # 重跑的重跑不要再叠一层同名后缀
     base_name = str(task.get("name") or "")
     tail = "-" + suffix
@@ -582,10 +606,11 @@ async def rerun_task(request: Request, task_id: str, stage: str = "") -> dict:
 
 @app.get("/api/stages/rerun")
 def rerun_stages(request: Request) -> dict:
-    """可单独重跑的阶段，给前端阶段弹窗按名字开关按钮"""
+    """可单独重跑的阶段，给前端阶段弹窗做勾选：整段、阶段内的细分项、限定目标"""
     current_user(request)
     return {"ok": True, "stages": pipeline.RERUN_STAGES,
-            "labels": {k: pipeline.PHASE_LABEL.get(k, k) for k in pipeline.RERUN_STAGES}}
+            "labels": {k: pipeline.PHASE_LABEL.get(k, k) for k in pipeline.RERUN_STAGES},
+            "submodules": modules_mod.stage_submodules()}
 
 
 # ─────────────── 功能单项执行 ───────────────
@@ -1165,6 +1190,11 @@ EXPORT_SHEETS: dict[str, dict] = {
     "space": {"label": "空间测绘", "kinds": ["service"],
               "cols": ["ID", "URL", "IP", "端口", "存活", "协议", "标题", "指纹", "应用",
                        "Whois", "ICP备案", "ISP", "OS", "地区", "更新时间", "来源"]},
+    # 端口扫描真连上的开放端口单独一张表：跟测绘收录的「服务」不是一回事，
+    # 前者是现网确认开着，后者只是索引里出现过。
+    "port": {"label": "端口", "kinds": ["port"],
+             "cols": ["ID", "IP", "端口", "服务", "Banner", "Web", "存活", "来源",
+                      "首次发现", "最后发现"]},
     # ── 主资产类型各占一张表：站点 / 域名 / IP / 接口 / JS / 组件 / 泄露 / VHost / 仓库 / 邮箱 ──
     # 之前只有测绘和 C 段分表，domain / site / api 这些量最大的类型全挤在「全量资产」里，
     # 交接时要在几万行里手工筛。按 kind 拆开后每张表列也按该类型的口径给。
@@ -1330,7 +1360,7 @@ def _app_of(extra: dict, fp: Any, kind: str) -> str:
     name = _first_of(extra.get("product"))
     if name:
         return name
-    if kind in ("", "domain", "service", "site"):
+    if kind in ("", "domain", "service", "port", "site"):
         name = str(extra.get("app") or "").strip()
         if name:
             return name
@@ -1718,12 +1748,12 @@ async def search(request: Request, body: dict = Body(...)) -> dict:
 # ─────────────── 总览 / 资产组 / 分面 ───────────────
 @app.get("/api/health")
 def health() -> dict:
-    return {"ok": True, "app": "suoyu", "version": "2.7.0", "ts": time.time()}
+    return {"ok": True, "app": "suoyu", "version": "2.8.0", "ts": time.time()}
 
 
 @app.get("/api/version")
 def version() -> dict:
-    return {"ok": True, "app": "天鉴·索舆", "version": "2.7.0", "build": "2026.11"}
+    return {"ok": True, "app": "天鉴·索舆", "version": "2.8.0", "build": "2026.11"}
 
 
 @app.get("/api/throttle")
@@ -2832,7 +2862,7 @@ async def listener_callback(token: str, request: Request) -> Response:
 @app.get("/api/status")
 def app_status(request: Request) -> dict:
     """套壳（Electron）轮询用的就绪探针，不需要登录。"""
-    return {"ok": True, "app": "天鉴·索舆", "version": "2.7.0", "build": _build_id()}
+    return {"ok": True, "app": "天鉴·索舆", "version": "2.8.0", "build": _build_id()}
 
 
 @app.get("/api/dashboard/stats")

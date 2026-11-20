@@ -29,6 +29,10 @@ const scan = reactive({
   port_concurrent: 300,
   port_qps: 0,
   port_resume: false,
+  port_ip_concurrent: 0,
+  port_ip_gap: 0,
+  domain_brute_concurrent: 800,
+  domain_brute_gap: 0,
   service_detect: true,
   site_spider: true,
   file_leak: true,
@@ -41,6 +45,9 @@ const scan = reactive({
   equity_depth: 2,
   equity_budget: 40,
   equity_sleep: 1.5,
+  enterprise_concurrent: 1,
+  enterprise_gap: 0,
+  icp_gap: 0,
   equity_ubo_threshold: 25,
   equity_ubo_levels: 1,
   equity_ubo_branches: 3,
@@ -69,6 +76,22 @@ const httpOpt = reactive({
   follow_redirects: true,
   user_agent: '',
 })
+// 要登录态的工商 / 备案 / 测绘站点：同一来源连着打就会被判风控，这里统一控节奏
+const throttle = reactive({
+  enabled: true,
+  min_interval: 1.5,
+  max_interval: 4.0,
+  concurrent: 1,
+  risk_threshold: 3,
+  cooldown: 60,
+  cooldown_max: 900,
+})
+const perSource = reactive({
+  aiqicha: { min_interval: 2.5, max_interval: 6.0 },
+  tianyancha: { min_interval: 2.5, max_interval: 6.0 },
+  qichacha: { min_interval: 3.0, max_interval: 7.0 },
+  miit: { min_interval: 6.0, max_interval: 9.0 },
+})
 
 const dicts = ref([])
 const PORT_TYPES = [
@@ -84,10 +107,17 @@ const POLICIES = [
   { v: 'all', label: '全部数据源' },
   { v: 'arl13', label: 'ARL 原生 13 源' },
 ]
+const SOURCES = [
+  { k: 'aiqicha', label: '爱企查' },
+  { k: 'tianyancha', label: '天眼查' },
+  { k: 'qichacha', label: '企查查' },
+  { k: 'miit', label: '备案（MIIT）' },
+]
 
 const SECTIONS = [
   { k: 'policy', label: '范围策略', icon: 'shield' },
   { k: 'scan', label: '采集强度', icon: 'control' },
+  { k: 'throttle', label: '风控节流', icon: 'clock' },
   { k: 'deep', label: '深度挖掘', icon: 'route' },
   { k: 'http', label: '网络参数', icon: 'server' },
 ]
@@ -109,6 +139,24 @@ async function load() {
     Object.assign(scan, cfg.scan || {})
     Object.assign(deep, cfg.deep || {})
     Object.assign(httpOpt, cfg.http || {})
+    const th = cfg.throttle || {}
+    Object.assign(throttle, {
+      enabled: th.enabled !== false,
+      min_interval: th.min_interval ?? 1.5,
+      max_interval: th.max_interval ?? 4.0,
+      concurrent: th.concurrent ?? 1,
+      risk_threshold: th.risk_threshold ?? 3,
+      cooldown: th.cooldown ?? 60,
+      cooldown_max: th.cooldown_max ?? 900,
+    })
+    const ps = th.per_source || {}
+    for (const k of Object.keys(perSource)) {
+      const item = ps[k] || {}
+      perSource[k] = {
+        min_interval: item.min_interval ?? perSource[k].min_interval,
+        max_interval: item.max_interval ?? perSource[k].max_interval,
+      }
+    }
     kwText.value = (policy.scope_keywords || []).join('\n')
     exText.value = (policy.exclude_domains || []).join('\n')
   } finally {
@@ -125,6 +173,12 @@ async function save() {
     await saveConfig({
       policy: { ...policy },
       scan: { ...scan },
+      throttle: {
+        ...throttle,
+        per_source: Object.fromEntries(
+          Object.entries(perSource).map(([k, v]) => [k, { ...v }]),
+        ),
+      },
       deep: { ...deep },
       http: { ...httpOpt },
     })
@@ -254,6 +308,29 @@ onMounted(async () => {
           </div>
           <div class="row">
             <div class="field flex-1">
+              <span class="field-label">同时扫几台 IP（0 = 不限）</span>
+              <input v-model.number="scan.port_ip_concurrent" class="input mono" type="number" min="0" />
+              <span class="field-hint">端口级并发由「端口并发」管；这里是 IP 级线程数，调小可避开对端扫描告警。</span>
+            </div>
+            <div class="field flex-1">
+              <span class="field-label">每台 IP 错开（秒）</span>
+              <input v-model.number="scan.port_ip_gap" class="input mono" type="number" min="0" step="0.1" />
+              <span class="field-hint">第 n 台 IP 延迟 n×该值起扫，几千个 IP 不会同一毫秒砸过去；0 = 不错开。</span>
+            </div>
+          </div>
+          <div class="row">
+            <div class="field flex-1">
+              <span class="field-label">字典爆破并发</span>
+              <input v-model.number="scan.domain_brute_concurrent" class="input mono" type="number" min="1" />
+            </div>
+            <div class="field flex-1">
+              <span class="field-label">根域间等待（秒）</span>
+              <input v-model.number="scan.domain_brute_gap" class="input mono" type="number" min="0" step="0.5" />
+              <span class="field-hint">一轮两万字典跑完一个根域后歇一下再打下一个；0 = 不等。</span>
+            </div>
+          </div>
+          <div class="row">
+            <div class="field flex-1">
               <span class="field-label">子域字典</span>
               <select v-model="scan.domain_dict" class="select">
                 <option v-for="d in dicts.filter((x) => x.includes('domain'))" :key="d" :value="d">{{ d }}</option>
@@ -336,6 +413,115 @@ onMounted(async () => {
             <span class="field-label">每层展开机构数</span>
             <input v-model.number="scan.equity_ubo_branches" class="input mono" type="number" min="0" max="20" />
             <span class="field-hint">每层最多展开几家机构股东，遇到风控或额度用尽会自行停下。</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="section === 'throttle'" class="cards two">
+      <div class="panel">
+        <div class="panel-head"><span><Icon name="clock" :size="13" />全局限速</span></div>
+        <div class="panel-body stack" style="gap: 12px">
+          <label class="opt"><span class="switch" :class="{ on: throttle.enabled }" @click="throttle.enabled = !throttle.enabled" />启用风控节流</label>
+          <span class="field-hint">工商 / 备案 / 测绘这类要登录态的站点，同一出口连着打很快被风控。这里控的是「同来源两次请求之间歇多久、同时能发几个」，关掉则全速发。</span>
+          <div class="row">
+            <div class="field flex-1">
+              <span class="field-label">最小间隔（秒）</span>
+              <input v-model.number="throttle.min_interval" class="input mono" type="number" min="0" step="0.1" />
+            </div>
+            <div class="field flex-1">
+              <span class="field-label">最大间隔（秒）</span>
+              <input v-model.number="throttle.max_interval" class="input mono" type="number" min="0" step="0.1" />
+              <span class="field-hint">实际间隔在两者之间随机，行为更像人；只认最小间隔时填成同一个值。</span>
+            </div>
+          </div>
+          <div class="row">
+            <div class="field flex-1">
+              <span class="field-label">同来源并发</span>
+              <input v-model.number="throttle.concurrent" class="input mono" type="number" min="1" />
+            </div>
+            <div class="field flex-1">
+              <span class="field-label">连续风控几次熔断</span>
+              <input v-model.number="throttle.risk_threshold" class="input mono" type="number" min="1" />
+            </div>
+          </div>
+          <div class="row">
+            <div class="field flex-1">
+              <span class="field-label">首次冷却（秒）</span>
+              <input v-model.number="throttle.cooldown" class="input mono" type="number" min="1" />
+            </div>
+            <div class="field flex-1">
+              <span class="field-label">冷却封顶（秒）</span>
+              <input v-model.number="throttle.cooldown_max" class="input mono" type="number" min="1" />
+              <span class="field-hint">熔断后停这么久，再犯逐次翻倍，到封顶为止；冷却期间该来源直接跳过，不会硬打。</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><span><Icon name="server" :size="13" />站点级间隔</span></div>
+        <div class="panel-body stack" style="gap: 12px">
+          <span class="field-hint">单个站点没写就用上面的全局值；账号额度小、已经被盯上的站，把这里调大。</span>
+          <div v-for="s in SOURCES" :key="s.k" class="row">
+            <div class="field flex-1">
+              <span class="field-label">{{ s.label }} 最小（秒）</span>
+              <input v-model.number="perSource[s.k].min_interval" class="input mono" type="number" min="0" step="0.5" />
+            </div>
+            <div class="field flex-1">
+              <span class="field-label">{{ s.label }} 最大（秒）</span>
+              <input v-model.number="perSource[s.k].max_interval" class="input mono" type="number" min="0" step="0.5" />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><span><Icon name="tasks" :size="13" />主体收集节奏</span></div>
+        <div class="panel-body stack" style="gap: 12px">
+          <span class="field-hint">企业主体（备案 / 工商 / 反查）是按根域逐个查的，几十个根域连着打最容易触发风控。取数和入库分开：取数按这里限并发、拉间隔，入库仍逐条写，不会写乱。</span>
+          <div class="row">
+            <div class="field flex-1">
+              <span class="field-label">同时补几个根域</span>
+              <input v-model.number="scan.enterprise_concurrent" class="input mono" type="number" min="1" />
+              <span class="field-hint">1 = 串行，最稳；调大只提升速度，风控风险同步上升。</span>
+            </div>
+            <div class="field flex-1">
+              <span class="field-label">根域间等待（秒）</span>
+              <input v-model.number="scan.enterprise_gap" class="input mono" type="number" min="0" step="0.5" />
+            </div>
+          </div>
+          <div class="field">
+            <span class="field-label">每次备案查询前额外等待（秒 · 0 = 用备案默认 6~9 秒）</span>
+            <input v-model.number="scan.icp_gap" class="input mono" type="number" min="0" step="1" />
+            <span class="field-hint">叠加在备案自身节流之上。填 0 走站点级间隔；填 10 就是每次备案至少歇 10 秒。</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><span><Icon name="control" :size="13" />其它阶段的节奏</span></div>
+        <div class="panel-body stack" style="gap: 12px">
+          <span class="field-hint">端口扫描和字典爆破的并发 / 间隔在上面的「采集强度」里；这三项在这里也能直接改。</span>
+          <div class="row">
+            <div class="field flex-1">
+              <span class="field-label">同时扫几台 IP（0 = 不限）</span>
+              <input v-model.number="scan.port_ip_concurrent" class="input mono" type="number" min="0" />
+            </div>
+            <div class="field flex-1">
+              <span class="field-label">每台 IP 错开（秒）</span>
+              <input v-model.number="scan.port_ip_gap" class="input mono" type="number" min="0" step="0.1" />
+            </div>
+          </div>
+          <div class="row">
+            <div class="field flex-1">
+              <span class="field-label">爆破并发</span>
+              <input v-model.number="scan.domain_brute_concurrent" class="input mono" type="number" min="1" />
+            </div>
+            <div class="field flex-1">
+              <span class="field-label">根域间等待（秒）</span>
+              <input v-model.number="scan.domain_brute_gap" class="input mono" type="number" min="0" step="0.5" />
+            </div>
           </div>
         </div>
       </div>

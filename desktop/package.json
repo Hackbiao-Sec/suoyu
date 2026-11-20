@@ -1,6 +1,6 @@
 {
   "name": "suoyu-console",
-  "version": "2.7.0",
+  "version": "2.8.0",
   "private": true,
   "description": "天鉴·索舆 — 资产侦察与信息收集作战台（内置本地引擎，单文件运行）",
   "main": "main.js",

@@ -35,7 +35,7 @@ const PHASE_LABEL = {
   report: '汇总',
 }
 const KIND_LABEL = {
-  site: '站点', domain: '域名', ip: 'IP', service: '服务', cidr: 'C段', email: '邮箱',
+  site: '站点', domain: '域名', ip: 'IP', service: '服务', port: '端口', cidr: 'C段', email: '邮箱',
   leak: '泄露', equity: '股权', app: 'APP', applet: '小程序', wxmp: '公众号',
   enterprise: '企业', mailinfo: '邮箱信息', url: 'URL', takeover: '子域接管',
   mobile: 'APP安装包', api: '接口', component: '组件', js: 'JS', leakfile: '敏感文件',

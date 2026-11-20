@@ -127,6 +127,8 @@ DEFAULTS: dict = {
         "domain_brute": True,
         "domain_dict": "domain_2w.txt",
         "domain_brute_concurrent": 800,
+        # 根域与根域之间的等待（秒）：字典爆破按根域串行，0 = 不等
+        "domain_brute_gap": 0.0,
         "alt_dns": True,
         "alt_dns_concurrent": 1500,
         "port_scan": True,
@@ -141,6 +143,10 @@ DEFAULTS: dict = {
         "port_qps": 0,
         # 断点续扫：中断后重跑跳过已扫组合，适合全端口 / 大网段
         "port_resume": False,
+        # 同时扫几台 IP（0 = 不限，只靠 port_concurrent 控端口级并发）
+        "port_ip_concurrent": 0,
+        # 每台 IP 起扫前额外等待（秒），给对端防火墙和链路留喘息；0 = 不等
+        "port_ip_gap": 0.0,
         "service_detect": True,
         "site_spider": True,
         "file_leak": True,
@@ -171,6 +177,12 @@ DEFAULTS: dict = {
         # 每一次工商请求之前额外等待的秒数（穿透防封）。慢节奏拉取是数据完整的前提：
         # 30 秒级（每分钟 2 次）能稳稳跑完几百次请求；调大只会更慢、不会更快。
         "equity_sleep": 1.5,
+        # 主体收集（备案 / 工商 / 反查）：同时补几个根域的主体，1 = 串行（最稳）
+        "enterprise_concurrent": 1,
+        # 根域与根域之间额外等待（秒）；备案自身还有 miit 的 6~9 秒间隔
+        "enterprise_gap": 0.0,
+        # 每次备案查询前额外等待（秒），0 = 用 throttle.per_source.miit 的 6~9 秒
+        "icp_gap": 0.0,
         # 本机微信缓存的小程序包：离线解包抽接口/域名/硬编码钥匙，需先在本机微信打开过
         "scan_local_mini": True,
         "scan_local_mini_limit": 20,   # 最多解多少个包

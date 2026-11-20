@@ -532,37 +532,53 @@ class StagesMixin:
                                    f"只补前 {limit} 个（其余照常进扫描根域）", "warn")
             todo = todo[:limit]
         root_timeout = float(self.opt("enterprise_root_timeout", 90) or 90)
-        for i, root in enumerate(todo, 1):
-            try:
-                # 根域不是品牌名：它去查应用商店只会命中「以域名命名的山寨应用」，
-                # 每条要等商店 + 搜索好几跳。移动端面由 P1b 用品牌词单独做。
-                got: dict = {}
-                ent = await self._bounded(
-                    enterprise.collect_entity(
-                        root, mobile=False,
-                        equity_sources=self.opt("equity_sources", None) or None,
-                        icp_kinds=self._icp_kinds(),
-                        icp_pages=int(self.opt("icp_pages", 2) or 2),
-                        icp_size=int(self.opt("icp_size", 40) or 40),
-                        icp_retry=int(self.opt("icp_retry", 0) or 0) or None,
-                        icp_gap=float(self.opt("icp_gap", 0) or 0) or None,
-                        icp_alias=bool(self.opt("icp_alias", True)),
-                        icp_force=bool(self.opt("icp_force", False)),
-                        icp_api=str(self.opt("enterprise_icp_api", "") or ""),
-                        on_log=self._ent_log(),
-                        on_partial=self._entity_part_taker(root, got),
-                        budget_s=max(20.0, root_timeout - 10)),
-                    root_timeout, tag=f"根域主体 {root}", log_mod="enterprise",
-                    stage="enterprise",
-                    partial=lambda: dict(getattr(enterprise, "LAST_STATUS", {}) or {}))
-                if not isinstance(ent, dict):
-                    ent = got or None
-                    if not isinstance(ent, dict):
-                        continue
-                    self.log("enterprise", f"{root} 按快照入库：备案 "
-                                           f"{len(ent.get('icp') or [])} 条", "warn")
-            except Exception as e:
-                self.log("enterprise", f"{root}: {e}", "warn")
+        # 主体这一路是逐个根域去查备案 / 工商 / 反查的，同一个出口 IP 连着打会被判风控。
+        # 取数和入库分开：取数按 enterprise_concurrent 限并发、按 enterprise_gap 拉开间隔，
+        # 入库仍然串行，实体表 / 资产表不会被并发写乱。
+        ent_concurrent = max(1, int(self.opt("enterprise_concurrent", 1) or 1))
+        ent_gap = max(0.0, float(self.opt("enterprise_gap", 0) or 0))
+        if ent_concurrent > 1 or ent_gap > 0:
+            self.log("enterprise", f"按根域补主体：并发 {ent_concurrent}，"
+                                   f"相邻根域间隔 {ent_gap:g}s")
+        ent_sem = asyncio.Semaphore(ent_concurrent)
+
+        async def _collect_root(root: str) -> dict:
+            # 根域不是品牌名：它去查应用商店只会命中「以域名命名的山寨应用」，
+            # 每条要等商店 + 搜索好几跳。移动端面由 P1b 用品牌词单独做。
+            got: dict = {}
+            async with ent_sem:
+                if ent_gap:
+                    await asyncio.sleep(ent_gap)
+                try:
+                    ent = await self._bounded(
+                        enterprise.collect_entity(
+                            root, mobile=False,
+                            equity_sources=self.opt("equity_sources", None) or None,
+                            icp_kinds=self._icp_kinds(),
+                            icp_pages=int(self.opt("icp_pages", 2) or 2),
+                            icp_size=int(self.opt("icp_size", 40) or 40),
+                            icp_retry=int(self.opt("icp_retry", 0) or 0) or None,
+                            icp_gap=float(self.opt("icp_gap", 0) or 0) or None,
+                            icp_alias=bool(self.opt("icp_alias", True)),
+                            icp_force=bool(self.opt("icp_force", False)),
+                            icp_api=str(self.opt("enterprise_icp_api", "") or ""),
+                            on_log=self._ent_log(),
+                            on_partial=self._entity_part_taker(root, got),
+                            budget_s=max(20.0, root_timeout - 10)),
+                        root_timeout, tag=f"根域主体 {root}", log_mod="enterprise",
+                        stage="enterprise",
+                        partial=lambda: dict(getattr(enterprise, "LAST_STATUS", {}) or {}))
+                except Exception as e:
+                    return {"root": root, "ent": None, "got": got, "err": str(e)}
+            return {"root": root, "ent": ent if isinstance(ent, dict) else None,
+                    "got": got, "err": None}
+
+        results = list(await asyncio.gather(*[_collect_root(r) for r in todo]))
+        for i, hit in enumerate(results, 1):
+            root, ent, got = hit["root"], hit["ent"], hit["got"]
+            if hit["err"]:
+                self.log("enterprise", f"{root}: {hit['err']}", "warn")
+            if not isinstance(ent, dict):
                 ent = got or None
                 if not isinstance(ent, dict):
                     continue
@@ -1639,6 +1655,14 @@ class StagesMixin:
     async def p2_passive(self, domains: list[str]) -> None:
         roots = await self._scoped_roots(domains, "passive")
         enabled, skipped = passive.gate_sources(self.opt("sources") or None)
+        # 只重测勾了的那几路被动源；一段都没勾就整段照跑（老行为不变）
+        narrowed = [n for n in enabled if not self.sub_on("passive", n)]
+        if narrowed:
+            for name in narrowed:
+                source_health.record(store, self.task_id, "passive", name, "skip",
+                                     "本次只重测勾选的数据源，这一路没跑", 0)
+            enabled = [n for n in enabled if self.sub_on("passive", n)]
+            self.log("passive", f"本次只重测 {len(enabled)} 路被动源，其余 {len(narrowed)} 路跳过")
         if skipped:
             # 停用的源也记一行 skip，面板上能看出「没跑」和「跑了失败」的区别
             for name in skipped:
@@ -1892,6 +1916,13 @@ class StagesMixin:
             self.log("space", "空间测绘阶段已关闭，跳过")
             return
         engines = self._space_engines()
+        picked = [n for n in engines if self.sub_on("space", n)]
+        if picked != engines:
+            self.log("space", "本次只重测选定引擎：" + ("、".join(picked) or "无"))
+            if not picked:
+                self.progress("space", 100, "勾选的测绘引擎都不可用")
+                return
+            engines = picked
         # 渠道面板：没参与本轮测绘的引擎也记一行「未启用」，看得出是没 key 还是被关了
         for n in space_mod.QUERY_FUNCS:
             if n not in engines:
@@ -1990,9 +2021,13 @@ class StagesMixin:
         roots = await self._scoped_roots(domains, "brute")
         dict_name = self.opt("domain_dict", "") or ""
         concurrent = int(self.opt("domain_brute_concurrent", 800) or 800)
+        # 根域之间留间隔：一轮两万字典 × 几十个根域连着打，目标侧 DNS 和本机出口都容易被限
+        gap = max(0.0, float(self.opt("domain_brute_gap", 0) or 0))
         for i, root in enumerate(roots, 1):
             if self.stop_event.is_set():
                 return
+            if gap and i > 1:
+                await asyncio.sleep(gap)
             self.log("brute", f"字典爆破 {root}（{dict_name}）")
             try:
                 found, wildcard = await active.brute_subdomains(root, dict_name, concurrent, self.dns)
@@ -2122,6 +2157,26 @@ class StagesMixin:
 
     # ───────── P5 端口扫描 ─────────
     async def p5_port(self, parsed: dict) -> None:
+        want_svc = self.opt("service_probe", True) is not False and self.sub_on("port", "service")
+        if not self.sub_on("port", "scan"):
+            # 只重测协议指纹：不重扫端口，拿已入库的开放端口重新握手
+            rows = store.query_assets(kinds="service,port", task_id=self.task_id, limit=50000)
+            probes: list[tuple[str, int]] = []
+            for r in rows:
+                ip = str(r.get("ip") or "")
+                try:
+                    port = int(r.get("port") or 0)
+                except (TypeError, ValueError):
+                    port = 0
+                if ip and port in TCP_PROBE_PORTS and self.in_scope(ip):
+                    pair = (ip, port)
+                    if pair not in probes:
+                        probes.append(pair)
+            self.log("port", f"只重测协议指纹：跳过端口扫描，用已入库的 {len(probes)} 个端口重新握手")
+            if want_svc:
+                await self._tcp_probe_services(probes)
+            self.progress("port", 100, "协议指纹重测完成")
+            return
         if not self.opt("port_scan", True):
             self.progress("port", 100, "端口扫描已跳过（80/443 默认探测）")
             return
@@ -2136,6 +2191,11 @@ class StagesMixin:
         # IP 反查带出的共用主机：先扫，它是旁站与同服漏洞的落点
         all_ips |= {ip for ip in (self.ips_candidates or ()) if is_public_ip(ip)}
         all_ips = {ip for ip in all_ips if is_ip(ip)}
+        # 只重测指定 IP / 网段时，其余落点本轮不扫
+        scoped_ips = {ip for ip in all_ips if self.in_scope(ip)}
+        if len(scoped_ips) != len(all_ips):
+            self.log("port", f"按本次选定的范围只扫 {len(scoped_ips)} 个 IP（共 {len(all_ips)} 个）")
+            all_ips = scoped_ips
         if not all_ips:
             self.progress("port", 100, "无 IP 可扫描")
             return
@@ -2222,7 +2282,25 @@ class StagesMixin:
             port_map[ip] = [p for p in ports if not (ip in mail_ips and p in MAIL_PROTO_PORTS)]
         if mail_ips & all_ips:
             self.log("port", f"{len(mail_ips & all_ips)} 个 IP 是邮件主机，跳过邮件协议端口")
-        tasks = [asyncio.create_task(one(ip)) for ip in targets]
+        # 起扫节奏：port_ip_concurrent 控同时扫几台，port_ip_gap 让每台错开一点起步，
+        # 免得几千个 IP 在同一毫秒把对端防火墙打到判定为扫描
+        ip_concurrent = max(0, int(self.opt("port_ip_concurrent", 0) or 0))
+        ip_gap = max(0.0, float(self.opt("port_ip_gap", 0) or 0))
+        ip_sem = asyncio.Semaphore(ip_concurrent) if ip_concurrent else None
+        if ip_concurrent or ip_gap:
+            self.log("port", f"起扫节奏：同时扫 {ip_concurrent or '不限'} 台，"
+                             f"每台错开 {ip_gap:g}s")
+
+        async def paced(ip: str, delay: float):
+            if delay:
+                await asyncio.sleep(delay)
+            if ip_sem is None:
+                return await one(ip)
+            async with ip_sem:
+                return await one(ip)
+
+        tasks = [asyncio.create_task(paced(ip, idx * ip_gap))
+                 for idx, ip in enumerate(targets)]
         probes: list[tuple[str, int]] = []
         gateways: list[str] = []
         for fut in asyncio.as_completed(tasks):
@@ -2239,7 +2317,7 @@ class StagesMixin:
                     # 空壳行只会让资产表显得「有一堆服务」
                     continue
                 self.save_asset({
-                    "kind": "service", "url": f"service:{r.ip}:{r.port}", "ip": r.ip, "port": r.port,
+                    "kind": "port", "url": f"service:{r.ip}:{r.port}", "ip": r.ip, "port": r.port,
                     "extra": {"service": r.service, "banner": r.banner, "is_web": r.is_web},
                     "sources": "portscan",
                 })
@@ -2263,7 +2341,7 @@ class StagesMixin:
             self._save_port_checkpoint(checkpoint)
 
         # 端口探完立刻按协议握手认服务（Redis/Mongo/ZooKeeper/JDWP/Dubbo 等非 HTTP 面）
-        if self.opt("service_probe", True) is not False:
+        if want_svc:
             await self._tcp_probe_services(probes)
 
     def _port_ckpt_path(self):
@@ -2588,6 +2666,9 @@ class StagesMixin:
             h = host_of(u) or ""
             # 同 C 段扫出来的 IP、以及别人的域不在这里爬：爬虫只看自家站的页面和 JS
             if is_ip(h) or self._root(h) in own:
+                # 只重测指定 host 时，爬取 / 漏扫 / 深度这些下游阶段也跟着收窄
+                if not self.in_scope(h):
+                    continue
                 out.append(u)
         return out
 
@@ -2615,7 +2696,7 @@ class StagesMixin:
         if not bad:
             return
         n = sum(store.unlink_task_assets(self.task_id, kind=k, host=ip)
-                for ip in bad for k in ("service", "site"))
+                for ip in bad for k in ("service", "port", "site"))
         self.log("port", f"{len(bad)} 个 IP 对任意端口都回握手（链路占位），"
                          f"从本任务资产里删掉 {n} 条：{', '.join(sorted(bad)[:5])}", "warn")
 
@@ -2861,8 +2942,14 @@ class StagesMixin:
             seen.add(b)
             picks.append(u)
         urls = picks[:80]
+        # 只重测勾选的子项；一段都没勾就整段照跑
+        want_file = self.sub_on("leak", "file")
+        want_git = self.sub_on("leak", "git")
+        file_urls = urls if want_file else []
         dict_name = self.opt("file_leak_dict", "file_top_200.txt") or "file_top_200.txt"
-        self.log("leak", f"敏感文件探测 {len(urls)} 个站点（{dict_name}）")
+        if not want_file:
+            self.log("leak", "本次没勾敏感文件，跳过字典探测")
+        self.log("leak", f"敏感文件探测 {len(file_urls)} 个站点（{dict_name}）")
         sem = asyncio.Semaphore(8)
         done = 0
 
@@ -2870,7 +2957,7 @@ class StagesMixin:
             async with sem:
                 return u, await active.file_leak(u, dict_name, 20)
 
-        tasks = [asyncio.create_task(one(u)) for u in urls]
+        tasks = [asyncio.create_task(one(u)) for u in file_urls]
         for fut in asyncio.as_completed(tasks):
             try:
                 u, hits = await fut
@@ -2884,9 +2971,10 @@ class StagesMixin:
                                  "status_code": h["status"], "length": h["length"],
                                  "root_domain": self._root(host) if not is_ip(host) else "",
                                  "extra": h, "sources": "fileleak"})
-            self.progress("leak", int(done * 100 / max(len(urls), 1)), f"敏感文件 {done}/{len(urls)}")
+            self.progress("leak", int(done * 100 / max(len(file_urls), 1)),
+                          f"敏感文件 {done}/{len(file_urls)}")
         # Git 泄露
-        if config.get("deep", "code_leak"):
+        if want_git and config.get("deep", "code_leak"):
             git_hits = await asyncio.gather(*[deep.git_leak(u) for u in urls[:60]],
                                             return_exceptions=True)
             for g in git_hits:
@@ -2902,9 +2990,12 @@ class StagesMixin:
         rows = store.query_assets(kind="domain", task_id=self.task_id,
                                   limit=max(1, int(self.opt("vhost_max_domains", 5000) or 5000)))
         domains = [r["host"] for r in rows if r.get("host") and not is_ip(r["host"])]
-        ip_rows = store.query_assets(kind="service", task_id=self.task_id, limit=500)
+        ip_rows = store.query_assets(kinds="service,port", task_id=self.task_id, limit=500)
         ip_cap = max(1, int(self.opt("vhost_max_ips", 20) or 20))
-        ips = sorted({r["ip"] for r in ip_rows if r.get("ip")})[:ip_cap]
+        # 只重测指定 host / IP 时，碰撞集合跟着收窄
+        domains = [d for d in domains if self.in_scope(d)]
+        ips = sorted({r["ip"] for r in ip_rows
+                      if r.get("ip") and self.in_scope(str(r["ip"]))})[:ip_cap]
         if not ips or not domains:
             self.progress("vhost", 100, "无可用 IP/域名，跳过 VHost")
             return
@@ -2996,7 +3087,12 @@ class StagesMixin:
     async def p10_sibling(self, parsed: dict) -> None:
         if self.stop_event.is_set():
             return
-        ip_rows = store.query_assets(kind="service", task_id=self.task_id, limit=800)
+        # 只重测勾选的子项；一段都没勾就整段照跑
+        want_ptr = self.sub_on("sibling", "ptr")
+        want_cseg = self.sub_on("sibling", "cseg")
+        want_asn = self.sub_on("sibling", "asn")
+        want_bucket = self.sub_on("sibling", "bucket")
+        ip_rows = store.query_assets(kinds="service,port", task_id=self.task_id, limit=800)
         # 只拿本任务自己的落点做旁站：service 表里可能有第三方主机（别的根域解析出来的
         # 或其他阶段顺带写的），拿它们做 C 段会扩到与我们无关的机房
         own = self._own_roots()
@@ -3007,6 +3103,8 @@ class StagesMixin:
         own_addrs |= {ip for ip in (self.ips_candidates or ()) if is_ip(ip)}
         ips = sorted({r["ip"] for r in ip_rows
                       if r.get("ip") and (r["ip"] in own_addrs)})[:15] or parsed["ips"][:15]
+        # 只重测指定 IP 时旁站也只就着这几个落点做
+        ips = [ip for ip in ips if self.in_scope(ip)]
         cdn_net = CdnDetector()
         if ips:
             clean = [ip for ip in ips if not cdn_net.detect_by_ip(ip)]
@@ -3017,12 +3115,12 @@ class StagesMixin:
             self.log("sibling", f"旁站/C 段 {len(ips)} 个 IP")
             done = 0
             for ip in ips:
-                ptrs = await self.dns.resolve_ptr(ip)
+                ptrs = await self.dns.resolve_ptr(ip) if want_ptr else []
                 for name in ptrs:
                     self.save_asset({"kind": "domain", "url": f"domain:{name}", "host": name,
                                      "ip": ip, "root_domain": self._root(name), "sources": "ptr"})
                 # 同 C 段 80/443：只收真正有业务页的，端口开着但套壳/盾页的不算旁站
-                if self.opt("sibling", True):
+                if want_cseg and self.opt("sibling", True):
                     found = await active.c_segment_scan(ip, 255, (80, 443), 100, want_title=True)
                     found, dropped = self._sibling_related(found)
                     if dropped:
@@ -3043,7 +3141,7 @@ class StagesMixin:
                 self.progress("sibling", int(done * 100 / len(ips)), f"旁站 {done}/{len(ips)}")
         # ASN 归集：落点 IP 归到持有者 ASN，网段落成资产；成本可控的小段再扫一遍。
         # 同一家单位常把服务摊在同 ASN 的几个 /24 上，只扫落点那一个 C 段会漏掉邻居段。
-        if ips and self.opt("asn_expand", True):
+        if want_asn and ips and self.opt("asn_expand", True):
             try:
                 rows = await asnmap.collect(ips[:15], max_prefixes=40)
             except Exception as e:
@@ -3096,7 +3194,7 @@ class StagesMixin:
                                   f"ASN 网段 {n}/{len(targets)}")
         # 存储桶枚举：属主动探测第三方云（推测桶名），默认关，配置 deep.bucket_enum 打开
         roots = sorted({self._root(h) for h in self.domains if h and not is_ip(h)})
-        if roots and self._deep_flag("bucket_enum", False):
+        if want_bucket and roots and self._deep_flag("bucket_enum", False):
             buckets = await deep.bucket_enum(roots[:20])
             for b in buckets:
                 self.save_asset({"kind": "bucket", "url": b["url"], "host": b["bucket"],
@@ -3107,6 +3205,14 @@ class StagesMixin:
 
     # ───────── P11 深度挖掘 ─────────
     async def p11_deep(self) -> None:
+        # 只重测勾选的子项；一段都没勾就整段照跑
+        want_code = self.sub_on("deep", "codeleak")
+        want_mail = self.sub_on("deep", "email")
+        want_git = self.sub_on("deep", "git")
+        want_comp = self.sub_on("deep", "component")
+        want_cprobe = self.sub_on("deep", "component_probe")
+        want_shot = self.sub_on("deep", "screenshot")
+        want_nuclei = self.sub_on("deep", "nuclei")
         sites = self._site_urls(500)
         roots = sorted({self._root(h) for h in self.domains if h and not is_ip(h)})
         self.log("deep", f"深度挖掘：{len(sites)} 站点 / {len(roots)} 根域")
@@ -3114,17 +3220,19 @@ class StagesMixin:
         deep_opts = dict(config.section("deep"))
         for _k in ("code_leak", "bucket_enum", "credential_lists"):
             deep_opts[_k] = bool(self._deep_flag(_k, deep_opts.get(_k, False)))
-        try:
-            data = await deep.deep_collect(sites, self.dns, deep_opts)
-        except Exception as e:
-            self.log("deep", f"深度挖掘异常: {e}", "warn")
-            data = {}
+        data = {}
+        if want_code or want_mail or want_git:
+            try:
+                data = await deep.deep_collect(sites, self.dns, deep_opts)
+            except Exception as e:
+                self.log("deep", f"深度挖掘异常: {e}", "warn")
+                data = {}
         host_keys = []
-        for item in (data.get("code_leak") or [])[:200]:
+        for item in ((data.get("code_leak") or [])[:200] if want_code else []):
             self.save_asset({"kind": "codeleak",
                              "url": f"codeleak:{item.get('engine')}:{item.get('repo') or item.get('url')}",
                              "host": None, "extra": item, "sources": item.get("engine")})
-        for item in (data.get("emails") or [])[:500]:
+        for item in ((data.get("emails") or [])[:500] if want_mail else []):
             mail_host = item["email"].split("@")[-1].lower()
             if not self.keep_domain(mail_host):
                 # 邮件托管在第三方（企业邮 / 云邮）时不进自家域清单，邮件本身仍留档
@@ -3135,11 +3243,11 @@ class StagesMixin:
                              "host": mail_host,
                              "root_domain": self._root(mail_host),
                              "extra": item, "sources": "email"})
-        for item in (data.get("mail_dns") or []):
+        for item in ((data.get("mail_dns") or []) if want_mail else []):
             self.save_asset({"kind": "mailinfo", "url": f"mail:{item.get('root')}",
                              "host": item.get("root"), "root_domain": item.get("root"),
                              "extra": item, "sources": "maildns"})
-        for item in (data.get("git") or []):
+        for item in ((data.get("git") or []) if want_git else []):
             self.save_asset({"kind": "git", "url": item["url"], "host": host_of(item["url"]),
                              "extra": item, "sources": "git"})
         self.log("deep", f"  代码泄露 {len(data.get('code_leak') or [])} / "
@@ -3147,13 +3255,13 @@ class StagesMixin:
                          f"Git {len(data.get('git') or [])}")
         # 组件识别（FineReport / Shiro / 泛微 / xxl-job…）
         self.sites_identified = {}
-        if self.opt("component_identify", True):
+        if self.opt("component_identify", True) and (want_comp or want_cprobe):
             self.sites_identified = await self._identify_components(sites)
         # 组件未授权访问（Actuator / Druid / Nacos / ES / etcd / Docker…）
-        if self.opt("component_probe", True):
+        if want_cprobe and self.opt("component_probe", True):
             await self._http_component_probes(sites, self.sites_identified)
         # 截图
-        if self._deep_flag("screenshot", False) and sites:
+        if want_shot and self._deep_flag("screenshot", False) and sites:
             shot_dir = DATA_DIR / "shots" / self.task_id
             picks = [u for u in sites if u.startswith("http")][:30]
             for u in picks:
@@ -3163,7 +3271,7 @@ class StagesMixin:
                                      "extra": {"file": fp}, "sources": "playwright"})
             self.log("deep", f"  截图 {len(picks)} 个（存 {shot_dir}）")
         # nuclei
-        if self._deep_flag("nuclei", False) and sites:
+        if want_nuclei and self._deep_flag("nuclei", False) and sites:
             self.log("deep", "  nuclei 复核中…")
             hits = await deep.run_nuclei(
                 sites[:200],

@@ -99,7 +99,7 @@ def live_state(row: dict[str, Any]) -> tuple[str, str]:
     if kind == "domain":
         has_ip = bool(str(row.get("ip") or "").strip() or str(row.get("ips") or "").strip())
         return ("dns", "已解析") if has_ip else ("dead", "不解析")
-    if kind in ("ip", "service"):
+    if kind in ("ip", "service", "port"):
         # 端口扫描阶段落的行 = 当时真的连上了；测绘引擎来的只是索引里有过
         if any(k in src for k in ("portscan", "masscan", "nmap", "probe")):
             return "open", "端口开放"
@@ -360,6 +360,22 @@ class Store:
                       " ON logs(task_id, module)")
             c.commit()
         self.repair_assets()
+        self.relabel_port_assets()
+
+    def relabel_port_assets(self) -> None:
+        """把端口扫描落的历史行从「服务」改成「端口」。
+
+        以前 p5_port 和空间测绘都写 kind=service，资产页只能按「服务」筛，
+        看不出哪条是现网真连上的开放端口。url 不变，只改类型，重跑也不会重复。
+        """
+        with self._write_lock:
+            c = self.conn()
+            cur = c.execute(
+                "UPDATE assets SET kind='port' WHERE kind='service'"
+                " AND sources LIKE '%portscan%'"
+            )
+            if cur.rowcount:
+                c.commit()
 
     def repair_assets(self) -> None:
         """把历史脏 host / 假根域就地修一遍，库升级后资产组立即干净。"""

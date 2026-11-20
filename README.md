@@ -125,7 +125,7 @@ deepseek / openai（AI 扩展关键词）。
 | 打包命令 | `cd desktop; npx electron-builder --win portable --x64` |
 | 前端构建 | `cd web; .\node_modules\.bin\vite.cmd build`（先建前端，再建 exe，最后打外壳） |
 | 引擎打包 | `python -m PyInstaller --noconfirm --clean suoyu-server.spec` |
-| 产物 | `desktop/release/SuoyuConsole-2.7.0-portable.exe` |
+| 产物 | `desktop/release/SuoyuConsole-2.8.0-portable.exe` |
 | 端口策略 | 从 5113 起找空闲端口；探活必须命中 `/api/status` 且 `app` 含「索舆」，避免误把本机其它服务当引擎 |
 | 数据目录 | `%APPDATA%\suoyu-console\data`（与源码调试库相互独立） |
 | 日志 | `%APPDATA%\suoyu-console\logs\shell.log`、`engine.log` |

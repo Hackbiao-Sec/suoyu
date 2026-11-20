@@ -203,8 +203,17 @@ function createWindow() {
 
 function stopServer() {
   if (!server) return;
+  const pid = server.pid;
+  // Windows 上只 kill 父进程会留下引擎子进程占着端口，下次启动又起一个；
+  // 用 taskkill /T 连整棵树一起收，退出后不留孤儿。
   try {
-    server.kill();
+    if (process.platform === "win32" && pid) {
+      require("node:child_process").spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
+        windowsHide: true,
+      });
+    } else {
+      server.kill();
+    }
   } catch {
     /* 已经退出了 */
   }

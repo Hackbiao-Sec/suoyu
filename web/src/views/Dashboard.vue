@@ -19,7 +19,7 @@ const portEl = ref(null)
 const fpEl = ref(null)
 let charts = []
 const KIND_LABEL = {
-  site: '站点', domain: '域名', ip: 'IP', service: '服务', cidr: 'C 段',  email: '邮箱', leak: '泄露', vuln: '漏洞', cert: '证书',  applet: '小程序', wxmp: '公众号', mobile: 'App', takeover: '子域接管',
+  site: '站点', domain: '域名', ip: 'IP', service: '服务', port: '端口', cidr: 'C 段',  email: '邮箱', leak: '泄露', vuln: '漏洞', cert: '证书',  applet: '小程序', wxmp: '公众号', mobile: 'App', takeover: '子域接管',
   icp: '备案', enterprise: '企业', equity: '股权', branch: '分支机构', holds: '控股企业', invest: '对外投资', partner: '股东', copyright: '软著',
 }
 const metrics = computed(() => {
