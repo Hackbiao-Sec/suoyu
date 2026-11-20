@@ -20,6 +20,11 @@ DATA_DIR = Path(os.environ.get("ARLX_DATA") or (ROOT / "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_PATH = DATA_DIR / "config.yaml"
 
+# 打包进 exe 的凭据种子：首次启动把它填进空配置项，省得用户逐项手填。
+# 由 scripts/build_seed.py 从本机 data/config.yaml 生成，产物在 build/ 不进仓库。
+SEED_PATH = Path(__file__).resolve().parent / "seed_config.yaml"
+SEED_FALLBACK = ROOT / "build" / "seed_config.yaml"
+
 SECRET_PATH = ("key", "secret", "token", "cookie", "password", "sk", "ak", "api_key", "apikey")
 
 
@@ -257,6 +262,8 @@ DEFAULTS: dict = {
     # 与 sources.<名>.enabled 并存 —— 任一为关就不发请求；这里是「整类渠道」的
     # 显式停用表，采集流程读到它就给这一路记一行「未启用」。
     "channels": {"off": []},
+    # 打包种子版本号：内部字段，记录本机配置被预填到哪一版，不对外展示。
+    "seed": {"rev": 0},
 }
 
 
@@ -268,6 +275,60 @@ def _deep_merge(base: dict, patch: dict) -> dict:
         else:
             out[k] = v
     return out
+
+
+def _is_blank(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, dict)):
+        return not value
+    return False
+
+
+def _fill_empty(target: dict, patch: dict, skip: tuple = ()) -> bool:
+    """只往空格里填：已有值一律不动，避免覆盖用户自己改过的配置。"""
+    changed = False
+    for key, value in (patch or {}).items():
+        if key in skip:
+            continue
+        current = target.get(key)
+        if isinstance(value, dict):
+            if isinstance(current, dict):
+                changed = _fill_empty(current, value) or changed
+            else:
+                target[key] = copy.deepcopy(value)
+                changed = True
+            continue
+        if _is_blank(value) or not _is_blank(current):
+            continue
+        target[key] = copy.deepcopy(value)
+        changed = True
+    return changed
+
+
+def _seed_fill(data: dict) -> bool:
+    """把打包种子里的凭据填进空配置，返回是否要立即落盘。
+
+    带版本号：种子 rev 比配置里记的新才跑一次。用户之后在设置页清空的项
+    不会被下次启动又填回来，想重新预置就删掉 config.yaml 里的 seed.rev。
+    """
+    seed_file = SEED_PATH if SEED_PATH.exists() else SEED_FALLBACK
+    if not seed_file.exists():
+        return False
+    try:
+        seed = yaml.safe_load(seed_file.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return False
+    if not isinstance(seed, dict):
+        return False
+    rev = int((seed.get("seed") or {}).get("rev") or 0)
+    if rev <= 0 or rev <= int((data.get("seed") or {}).get("rev") or 0):
+        return False
+    _fill_empty(data, seed, skip=("seed",))
+    data.setdefault("seed", {})["rev"] = rev
+    return True
 
 
 class ConfigStore:
@@ -288,12 +349,18 @@ class ConfigStore:
                         data = _deep_merge(data, raw)
                 except Exception:
                     pass
+            seeded = _seed_fill(data)
             data = self._env_override(data)
             if not data["server"].get("secret_key"):
                 import secrets
 
                 data["server"]["secret_key"] = secrets.token_hex(32)
             self._data = data
+            if seeded:
+                # 预置值落盘一次，设置页里能看到、也能直接改
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self.path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
+                                     encoding="utf-8")
 
     def _env_override(self, data: dict) -> dict:
         mapping = {
@@ -438,7 +505,10 @@ class ConfigStore:
                 return "*" * min(len(node), 8)
             return node
 
-        return walk(self.all())
+        out = walk(self.all())
+        # seed 是预置种子的内部版本号，不进前端、也不会被设置页回写
+        out.pop("seed", None)
+        return out
 
     def source_enabled(self, name: str) -> bool:
         sec = self.get("sources", name) or {}

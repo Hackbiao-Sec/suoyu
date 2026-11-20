@@ -23,6 +23,12 @@ datas = [
     (str(Path(_tldextract.__file__).parent / ".tld_set_snapshot"), "tldextract"),
 ]
 
+# 本机已填配置的种子（AI 模型、爱企查/天眼查等登录态）：由 scripts/build_seed.py
+# 生成到 build/，打完首次启动自动填空，省得用户重新填一遍。
+_seed = ROOT / "build" / "seed_config.yaml"
+if _seed.exists():
+    datas.append((str(_seed), "arlx"))
+
 # uvicorn / fastapi 的部分协议实现是运行时按字符串导入的，必须显式收集
 hiddenimports = (
     collect_submodules("uvicorn")
