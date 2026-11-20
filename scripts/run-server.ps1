@@ -38,7 +38,10 @@ function Write-Log([string]$msg) {
 
 function Test-Health {
     try {
-        $code = & curl.exe --noproxy '*' -s -o NUL -m 5 -w '%{http_code}' $healthUrl 2>$null
+        # 10s: during a port scan the loop can legitimately stall for a few
+        # seconds; a 5s probe turns that into a "dead" verdict and kills a
+        # running task mid-flight.
+        $code = & curl.exe --noproxy '*' -s -o NUL -m 10 -w '%{http_code}' $healthUrl 2>$null
         return ("$code".Trim() -eq '200')
     } catch {
         return $false
@@ -85,8 +88,11 @@ while ($true) {
 
     $fail++
     Write-Log ('health check failed ({0} in a row): {1}' -f $fail, $healthUrl)
-    if ($fail -ge 3) {
-        Write-Log ('3 misses in a row -> force restart, kill pid={0}' -f $proc.Id)
+    # 5 misses: a busy scan can be unresponsive for a minute or two. Killing at
+    # 3 used to abort a healthy long-running task (task stuck at "service
+    # restarted, task interrupted"). Only a genuinely wedged loop reaches 5.
+    if ($fail -ge 5) {
+        Write-Log ('5 misses in a row -> force restart, kill pid={0}' -f $proc.Id)
         & taskkill.exe /T /F /PID $proc.Id 2>&1 | Out-Null
         Start-Sleep -Seconds 3
         $proc = $null

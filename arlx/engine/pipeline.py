@@ -28,6 +28,7 @@ from __future__ import annotations
 oneclick_expand = None
 
 import asyncio
+import contextvars
 import ipaddress
 import time
 import uuid
@@ -38,6 +39,11 @@ from ..config import config
 from ..db import normalize_asset, store
 from ..utils import host_of, idn_ascii, is_ip, is_valid_domain, root_domain
 from .collectors import ownership
+
+# 后台阶段（目前是股权穿透）资产归属用的阶段键。contextvar 是按协程任务各存一份的，
+# 后台股权边穿边落资产时前台正在跑被动收集，用 self.current_phase 会把两边记成同一个阶段。
+ASSET_PHASE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "asset_phase", default=None)
 from .dns_engine import DnsEngine
 from .pipeline_stages import StagesMixin
 
@@ -233,6 +239,9 @@ class TaskRunner(StagesMixin):
         self._phase_recorded = ""
         self._phase_ts = 0.0
         self._last_pct: dict[str, int] = {}
+        # 阶段并发后百分比会来回跳：旁站（权重靠后）报到 82 时端口（权重靠前）还在跑，
+        # 端口再报就是 47，界面上看着像从头重跑。整体百分比只许涨不许跌。
+        self._max_overall = 0
         # 直接开合的阶段：进入 / 退出各落一次时间戳，资产归属和阶段时长都按它算
         self._open_stage = ""
         self._stage_start = 0.0
@@ -243,8 +252,25 @@ class TaskRunner(StagesMixin):
         # options["with_deps"] 为真时连同上游一起补跑（单独测「爬虫」得先把站点探活）
         self.only_stages = expand_stages(self.options.get("only_stages") or [],
                                          bool(self.options.get("with_deps")))
+        # 一键流程里「前置实体展开」已经跑过的企业：结果按企业名存这里，P0 再遇到
+        # 同一个主体就直接复用，不再跑第二遍。以前 300 秒的两次超时就是同一主体
+        # 先后被前置展开和 P0 各掐一次，域名一个都没落地。
+        self.expand_entities: dict[str, dict] = {}
 
     # ───────── 基础能力 ─────────
+    def _entity_timeout(self) -> float:
+        """单个企业主体扩线的总时限。
+
+        默认从 300 秒提到 1800 秒：一个省公司级主体要先搜域名、过取证闸，再挂股权
+        穿透（一次 30 秒延时，一百多次就是大半个小时）。300 秒只够跑完股权、来不及
+        出域名，现场表现是「主体收集做完了，域名 0 个、端口 0 个、web 资产全空」。
+        """
+        try:
+            val = float(self.opt("enterprise_timeout", 1800) or 1800)
+        except Exception:
+            val = 1800.0
+        return max(60.0, val)
+
     def log(self, module: str, msg: str, level: str = "info") -> None:
         store.add_log(self.task_id, module, msg, level)
 
@@ -282,10 +308,21 @@ class TaskRunner(StagesMixin):
         target_parse 完全重叠，两个阶段各显示同一段 179 秒。
         """
         idx = PHASE_WEIGHT.get(phase_key, 0)
+        # 股权穿透在后台边穿边报进度，前台这时候已经在跑被动子域 / 端口扫描。
+        # 分组更靠前的阶段不能把界面标签和整体百分比拉回去，只更新它自己的百分比。
+        if PHASE_WEIGHT.get(self.current_phase, -1) > idx:
+            self._last_pct[phase_key] = pct
+            try:
+                store.update_task(self.task_id, stats=dict(self.stats))
+            except Exception:
+                pass
+            return
         total = len(PHASES)
         base = int((idx / total) * 100)
         span = int(100 / total)
         overall = min(99, base + int(span * max(0, min(100, pct)) / 100))
+        overall = max(overall, self._max_overall)
+        self._max_overall = overall
         self.current_phase = phase_key
         self._last_pct[phase_key] = pct
         now = time.time()
@@ -376,7 +413,7 @@ class TaskRunner(StagesMixin):
         """
         try:
             aid = store.upsert_asset(item)
-            store.link_task_asset(self.task_id, aid, self.current_phase)
+            store.link_task_asset(self.task_id, aid, ASSET_PHASE.get() or self.current_phase)
             kind = item.get("kind", "asset")
             self._asset_kinds.add(kind)
             if count:
@@ -648,54 +685,176 @@ class TaskRunner(StagesMixin):
             self.log("task", f"本次只跑 {len(picked)} 步，跳过：{'、'.join(skipped)}")
         do = set(picked)
 
-        if "p1" in do:
-            if getattr(self, "expand_plan", None):
-                await self._guard("enterprise", self._run_expand(), "主体扩线")
-                # 扩线后重跑一次目标归一：按 target_parse 开窗，新主体的资产别落到扩线上
-                self._stage_enter("target_parse")
+        equity_task: asyncio.Task | None = None
+        roots_before: set[str] = set()
+        try:
+            if "p1" in do:
+                if getattr(self, "expand_plan", None):
+                    await self._guard("enterprise", self._run_expand(), "主体扩线")
+                    # 扩线后重跑一次目标归一：按 target_parse 开窗，新主体的资产别落到扩线上
+                    self._stage_enter("target_parse")
+                    try:
+                        parsed = await self.p0_parse()
+                    finally:
+                        self._stage_exit("target_parse")
+                if parsed["domains"] and self.opt("enterprise", True):
+                    await self._guard("enterprise", self.p1_enterprise(parsed["domains"]), "主体穿透")
+                # 股权穿透按 30 秒一次往下穿，一个省公司级主体要穿一个多小时。以前它串在
+                # 被动收集前面，域名 / 端口 / web 全被堵在身后，现场就是「主体收集完就没了」。
+                # 现在放后台并发：p2/p3/p4 立刻用已认根域开工，收尾前再等它并补跑新根域。
+                if self.opt("equity_expand", True) or self.options.get("equity"):
+                    roots_before = {self._root(d) for d in self.domains if not is_ip(d)}
+                    equity_task = asyncio.create_task(self._equity_async(parsed))
+                    self.log("equity", "股权穿透转后台并发：被动子域 / 端口 / 网页先用已认根域开工，"
+                                       "穿出来的全资子公司收尾时补跑")
+                if self.opt("mobile", True):
+                    await self._guard("mobile", self.p1b_mobile(parsed), "移动端扩线")
+            # 股权穿透与移动端扩线都会往 self.domains 里加新根域，被动收集吃合并后的全集
+            seeds = list(parsed["domains"]) + [d for d in self.domains if d not in parsed["domains"]]
+            if not seeds:
+                # 没有根域时后面几步都是空转：日志里只有「阶段完成」，资产一行不出。
+                # 这里点名原因，省得把「主体没出域名」当成「端口 / web 采集坏了」去查。
+                self.log("task", "没有任何可收集的根域：主体扩线 / 备案 / 股权三路都没出域名，"
+                                 "被动子域、字典爆破、DNS / 端口 / 网页无从开始；"
+                                 "请核对主体全称、渠道登录态，或调大「单主体时限」", "error")
+            if seeds:
+                if "p2" in do:
+                    await self._guard("passive", self.p2_passive(seeds), "被动收集")
+                    if self.opt("domain_brute", True):
+                        await self._guard("brute", self.p3_brute(seeds), "字典爆破")
+                    else:
+                        # 关掉爆破是个合法选择，但界面上少了一整个阶段且一条日志都没有，
+                        # 复盘时看不出「域名少」是被自己的开关砍的。
+                        self.log("brute", "字典爆破未启用（domain_brute=false），本轮不做子域爆破", "warn")
+                if "p3" in do:
+                    # 测绘吃上游已确认根域（p2 新收的也在 seeds 里），口径见 p2a_space
+                    await self._guard("space", self.p2a_space(seeds), "空间测绘")
+            if "p4" in do:
+                await self._guard("dns", self.p4_dns(parsed), "DNS 解析")
+                await self._guard("port", self.p5_port(parsed), "端口扫描")
+                await self._guard("web", self.p6_web(parsed), "存活探测")
+            if "p5" in do:
+                if self.opt("site_spider", True):
+                    await self._guard("crawl", self.p7_crawl(), "站点爬虫")
+                if self.opt("file_leak", True):
+                    await self._guard("leak", self.p8_leak(), "敏感文件")
+                if self.opt("vhost_collision", False):
+                    await self._guard("vhost", self.p9_vhost(), "VHost 碰撞")
+                if self.opt("takeover", True):
+                    await self._guard("takeover", self.p9a_takeover(), "子域接管")
+                if self.opt("sibling", True):
+                    await self._guard("sibling", self.p10_sibling(parsed), "旁站/C 段")
+                if self.opt("deep", True):
+                    await self._guard("deep", self.p11_deep(), "深度挖掘")
+            # 收尾前等股权穿透收口：它并进来的根域没赶上前面几轮被动 / 解析 / 探测，这里补齐
+            if equity_task is not None:
+                await self._join_equity(equity_task)
+                await self._backfill_late(parsed, roots_before, do)
+            await self._guard("assetdiff", self.p12_assetdiff(parsed), "资产变更对比")
+            await self._guard("report", self.p13_report(), "汇总报告")
+        finally:
+            if equity_task is not None and not equity_task.done():
+                equity_task.cancel()
+                # 停止 / 异常路径上等它落地再收尾：不然它会在任务已标结束之后继续写资产
                 try:
-                    parsed = await self.p0_parse()
-                finally:
-                    self._stage_exit("target_parse")
-            if parsed["domains"] and self.opt("enterprise", True):
-                await self._guard("enterprise", self.p1_enterprise(parsed["domains"]), "主体穿透")
-            # 股权穿透要在被动收集之前：全资子公司并进 self.domains 才轮到 P2 扩它
-            await self._guard("equity", self.p1c_equity(parsed), "股权穿透")
-            if self.opt("mobile", True):
-                await self._guard("mobile", self.p1b_mobile(parsed), "移动端扩线")
-        # 股权穿透与移动端扩线都会往 self.domains 里加新根域，被动收集吃合并后的全集
-        seeds = list(parsed["domains"]) + [d for d in self.domains if d not in parsed["domains"]]
-        if seeds:
-            if "p2" in do:
-                await self._guard("passive", self.p2_passive(seeds), "被动收集")
-                if self.opt("domain_brute", True):
-                    await self._guard("brute", self.p3_brute(seeds), "字典爆破")
-                else:
-                    # 关掉爆破是个合法选择，但界面上少了一整个阶段且一条日志都没有，
-                    # 复盘时看不出「域名少」是被自己的开关砍的。
-                    self.log("brute", "字典爆破未启用（domain_brute=false），本轮不做子域爆破", "warn")
-            if "p3" in do:
-                # 测绘吃上游已确认根域（p2 新收的也在 seeds 里），口径见 p2a_space
-                await self._guard("space", self.p2a_space(seeds), "空间测绘")
+                    await asyncio.wait({equity_task}, timeout=10)
+                except Exception:
+                    pass
+
+    async def _equity_async(self, parsed: dict) -> None:
+        """后台跑股权穿透。
+
+        不借 `_guard`：那条路要切 `current_phase`，前台正在跑被动收集 / 端口扫描，
+        切过去会把前台资产的阶段归属改掉。阶段时间窗单独落两条，资产归属走
+        `ASSET_PHASE`（contextvar 按任务隔离）。
+        """
+        token = ASSET_PHASE.set("equity")
+        try:
+            store.record_phase(self.task_id, "equity", time.time())
+        except Exception:
+            pass
+        try:
+            await self.p1c_equity(parsed)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            msg = f"股权穿透 异常：{type(e).__name__}: {e}"
+            self.stage_errors.append(msg)
+            self.stats["stage_errors"] = len(self.stage_errors)
+            self.log("equity", msg + "（已跳过该阶段，后续阶段继续跑）", "error")
+            try:
+                store.update_task(self.task_id, stats=dict(self.stats))
+            except Exception:
+                pass
+        finally:
+            try:
+                store.record_phase(self.task_id, "equity", time.time())
+            except Exception:
+                pass
+            ASSET_PHASE.reset(token)
+
+    async def _join_equity(self, task: asyncio.Task) -> None:
+        """收尾前等后台股权穿透跑完，等的时候每分钟说一句，别让界面像卡死。"""
+        if task.done():
+            task.result()
+            return
+        try:
+            wait_cap = float(self.opt("equity_join_wait", 0) or 0)
+        except (TypeError, ValueError):
+            wait_cap = 0.0
+        self.log("task", "等待后台股权穿透收口（延时照旧；域名 / 端口 / 网页已先出）")
+        started = time.time()
+        minutes = 0
+        while not task.done():
+            await asyncio.wait({task}, timeout=60)
+            if task.done():
+                break
+            minutes += 1
+            self.log("equity", f"股权穿透仍在后台穿子公司（约 {minutes} 分钟），"
+                               f"当前已并进 {len(self.domains)} 个域")
+            if wait_cap > 0 and time.time() - started >= wait_cap:
+                # 到点截断必须说清是被「等时上限」砍的，而不是渠道耗尽或这家没子公司，
+                # 否则下一次看到的只是「股权穿透比上次少」，排查方向全错。
+                task.cancel()
+                try:
+                    await asyncio.wait({task}, timeout=10)
+                except Exception:
+                    pass
+                msg = (f"股权穿透等待已达上限 {int(wait_cap)} 秒，本轮收口"
+                       f"（已并进 {len(self.domains)} 个域）；要穿完请调大 equity_join_wait"
+                       f" 或单阶段重跑股权穿透")
+                self.log("equity", msg, "warn")
+                self.stage_errors.append(msg)
+                self.stats["stage_errors"] = len(self.stage_errors)
+                try:
+                    from .. import source_health as _health
+                    _health.record(store, self.task_id, "equity", "cap:join", "partial",
+                                   note=msg[:300], items=0)
+                except Exception:
+                    pass
+                return
+        task.result()
+
+    async def _backfill_late(self, parsed: dict, roots_before: set[str], do: set[str]) -> None:
+        """股权穿透后台新并进来的根域，补跑一遍域名收集与探测。
+
+        p2 / p4 开跑时这些全资子公司还没穿出来，不补这一段，任务页上就会是
+        「股权穿透画得挺满、域名 / 端口 / web 资产只有母公司那几条」。
+        """
+        now_roots = {self._root(d) for d in self.domains if not is_ip(d)}
+        late = sorted(r for r in now_roots - roots_before if r)
+        if not late:
+            return
+        head = "、".join(late[:8]) + (" 等" if len(late) > 8 else "")
+        self.log("task", f"股权穿透新并进 {len(late)} 个根域，补跑域名 / 端口 / 网页：{head}")
+        if "p2" in do:
+            await self._guard("passive", self.p2_passive(late), "补跑被动收集")
+            if self.opt("domain_brute", True):
+                await self._guard("brute", self.p3_brute(late), "补跑字典爆破")
         if "p4" in do:
-            await self._guard("dns", self.p4_dns(parsed), "DNS 解析")
-            await self._guard("port", self.p5_port(parsed), "端口扫描")
-            await self._guard("web", self.p6_web(parsed), "存活探测")
-        if "p5" in do:
-            if self.opt("site_spider", True):
-                await self._guard("crawl", self.p7_crawl(), "站点爬虫")
-            if self.opt("file_leak", True):
-                await self._guard("leak", self.p8_leak(), "敏感文件")
-            if self.opt("vhost_collision", False):
-                await self._guard("vhost", self.p9_vhost(), "VHost 碰撞")
-            if self.opt("takeover", True):
-                await self._guard("takeover", self.p9a_takeover(), "子域接管")
-            if self.opt("sibling", True):
-                await self._guard("sibling", self.p10_sibling(parsed), "旁站/C 段")
-            if self.opt("deep", True):
-                await self._guard("deep", self.p11_deep(), "深度挖掘")
-        await self._guard("assetdiff", self.p12_assetdiff(parsed), "资产变更对比")
-        await self._guard("report", self.p13_report(), "汇总报告")
+            await self._guard("dns", self.p4_dns(parsed), "补跑 DNS 解析")
+            await self._guard("port", self.p5_port(parsed), "补跑端口扫描")
+            await self._guard("web", self.p6_web(parsed), "补跑存活探测")
 
     # ───────── 主流程 ─────────
     async def run(self) -> None:

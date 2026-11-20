@@ -108,6 +108,25 @@ class HttpInfo:
     alt_exit: bool = False  # 来自备用出口（代理）的探测结果
 
 
+# httpx 的 verify=True 会为每个客户端新建上下文，Windows 上加载系统证书库要 650ms，
+# 而 web 存活探测是每 URL 一个客户端、全在事件循环线程里建，几百个 URL 就把健康检查
+# 饿死（看门狗判死重启，任务停在 web 阶段）。上下文与客户端无关，按开关缓存一份即可。
+_SSL_CTX: dict[bool, ssl.SSLContext] = {}
+
+
+def _ssl_ctx(verify: bool) -> ssl.SSLContext:
+    ctx = _SSL_CTX.get(verify)
+    if ctx is None:
+        if verify:
+            ctx = ssl.create_default_context()
+        else:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        _SSL_CTX[verify] = ctx
+    return ctx
+
+
 def _client(*, via_proxy: bool | None = None, timeout: float | None = None,
             headers: dict | None = None, follow: bool = True) -> httpx.AsyncClient:
     use_proxy = config.get("proxy", "scan_via_proxy") if via_proxy is None else via_proxy
@@ -119,7 +138,7 @@ def _client(*, via_proxy: bool | None = None, timeout: float | None = None,
         h.update(headers)
     # trust_env=False：不读系统 HTTP_PROXY，否则配置的显式代理会和环境代理叠加成 502
     return httpx.AsyncClient(timeout=t, proxy=proxy or None, trust_env=False,
-                             verify=bool(config.get("http", "verify")),
+                             verify=_ssl_ctx(bool(config.get("http", "verify"))),
                              follow_redirects=follow, headers=h)
 
 

@@ -345,12 +345,27 @@ async def _banner(ip: str, port: int, timeout: float) -> str:
 CONTROL_PORT = 59993
 
 
+# create_default_context() 在 Windows 上要读一遍系统证书库（实测 86ms），而这段是同步的，
+# 一跑就在事件循环线程里堵住。端口阶段每个 Web/TLS 端口问一次，几千个端口就是几分钟的
+# 硬阻塞：健康检查发不出去，看门狗判死重启，任务停在半路。握手探测不需要校验证书，
+# 所以只建一次裸上下文复用。
+_TLS_PROBE_CTX: ssl.SSLContext | None = None
+
+
+def _tls_probe_ctx() -> ssl.SSLContext:
+    global _TLS_PROBE_CTX
+    if _TLS_PROBE_CTX is None:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        _TLS_PROBE_CTX = ctx
+    return _TLS_PROBE_CTX
+
+
 async def _tls_ok(ip: str, port: int, timeout: float) -> bool:
     """TLS 端口：完成握手才算开放（SYN-ACK 假开放在握手阶段一定失败）。"""
     try:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        ctx = _tls_probe_ctx()
         _, writer = await asyncio.wait_for(
             asyncio.open_connection(ip, port, ssl=ctx, server_hostname=ip), timeout=timeout)
         writer.close()
@@ -363,7 +378,9 @@ async def _http_alive(ip: str, port: int, tls: bool, timeout: float) -> bool:
     """HTTP 端点：必须回出状态行 / 响应头。空连接或立刻断开不算。"""
     path = f"{'https' if tls else 'http'}://{ip}:{port}/"
     try:
-        async with httpx.AsyncClient(timeout=timeout, verify=False, trust_env=False,
+        # verify=是共享的 CERT_NONE 上下文：verify=False 时 httpx 每个客户端都要
+        # 自己建上下文，一个 IP 几十个 Web 端口累计起来同样是秒级的同步开销。
+        async with httpx.AsyncClient(timeout=timeout, verify=_tls_probe_ctx(), trust_env=False,
                                      follow_redirects=False) as cli:
             r = await cli.get(path)
         return 100 <= r.status_code < 600 and (r.status_code != 502 or bool(r.headers.get("server")))
@@ -467,17 +484,32 @@ async def scan_port(ip: str, port: int, host: str | None = None, timeout: float 
     return res
 
 
+# 控件端口同一个 IP 每个端口都要问一次，一次 IP×99 端口就是 99 次多余握手。
+# 结论按 IP 缓存一小段时间（缓存的是「这台机器对任意端口都回握手」这个主机属性）。
+_CONTROL_CACHE: dict[str, tuple[float, bool]] = {}
+_CONTROL_TTL = 60.0
+
+
 async def _control_open(ip: str, timeout: float) -> bool:
+    now = time.monotonic()
+    hit = _CONTROL_CACHE.get(ip)
+    if hit is not None and now - hit[0] < _CONTROL_TTL:
+        return hit[1]
     try:
         _, writer = await asyncio.wait_for(asyncio.open_connection(ip, CONTROL_PORT),
                                            timeout=timeout)
     except Exception:
-        return False
-    try:
-        writer.close()
-    except Exception:
-        pass
-    return True
+        ok = False
+    else:
+        try:
+            writer.close()
+        except Exception:
+            pass
+        ok = True
+    if len(_CONTROL_CACHE) > 4096:
+        _CONTROL_CACHE.clear()
+    _CONTROL_CACHE[ip] = (now, ok)
+    return ok
 
 
 async def scan_ip(ip: str, ports: list[int], *, host: str | None = None, timeout: float = 2.0,

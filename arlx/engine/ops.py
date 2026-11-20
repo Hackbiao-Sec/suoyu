@@ -277,6 +277,10 @@ def _stage_params(key: str) -> list[dict]:
                     "调大只快一点，被风控的概率跟着涨"),
             _p("enterprise_gap", "根域之间等待(秒)", "number", 0, min=0, max=300, adv=True,
                help="一个根域查完歇几秒再查下一个；备案自身还有 6~9 秒的站点级间隔"),
+            _p("enterprise_timeout", "单主体时限(秒)", "number", 1800, min=60,
+               max=14400, adv=True,
+               help="一个企业主体查检索 / 域名取证 / 备案的总时限。集团级主体要几分钟到几十分钟，"
+                    "调小会把还没走到域名的那一轮掐断，任务里只剩主体行"),
             _p("equity_ratio", "控股门槛(%)", "number", 100, min=1, max=100),
             _p("equity_sources", "工商来源", "multi", _equity_source_defaults(),
                options=_equity_source_options(),
@@ -296,21 +300,24 @@ def _stage_params(key: str) -> list[dict]:
                help="持股比例达到这个数才算「自家子公司」；100 = 只认全资，调低会多出参股公司"),
             _p("equity_branch", "查分支机构", "bool", True,
                help="关掉就少一次分支机构请求、少耗一次额度"),
-            _p("equity_budget", "最多查多少次", "number", 40, min=0, max=2000,
+            _p("equity_budget", "最多查多少次", "number", 0, min=0, max=2000,
                help="整趟允许发出的工商请求次数；翻对外投资、查上层股东、逐层子公司共用这一份额度。"
-                    "集团子公司多的时候会不够用，找不全先加这里。填 0 = 不限次数"),
+                    "填 0 = 不限次数（默认），集团子公司多的时候才不会穿到第二层就断"),
             _p("equity_gap", "每次请求等待(秒)", "number", 0, min=0, max=300,
-               help="每一次工商请求前多等几秒；0 = 跟随「策略配置 → 查询间隔」（当前 1.5 秒）。"
-                    "填 30 大约每两分钟 1 次请求，慢但不容易被风控"),
-            _p("equity_max_names", "主体上限", "number", 6, min=1, max=30, adv=True,
+               help="每一次工商请求前多等几秒；0 = 跟随「策略配置 → 查询间隔」（当前 30 秒）。"
+                    "慢节奏是数据完整的前提，调小只会更容易被风控"),
+            _p("equity_max_names", "主体上限", "number", 10, min=1, max=30, adv=True,
                help="一次最多穿透几个主体；候选比这个多时，面板会单列一行「主体上限截断」"),
-            _p("equity_subs", "子公司并线上限", "number", 24, min=0, max=200, adv=True,
+            _p("equity_subs", "子公司并线上限", "number", 40, min=0, max=200, adv=True,
                help="达标的子公司最多并多少个回目标池；被砍掉的会记进「子公司上限截断」"),
             _p("equity_ubo_threshold", "受益所有人阈值(%)", "number", 25, min=1, max=100, adv=True),
             _p("equity_ubo_levels", "受益所有人层数", "number", 1, min=0, max=6, adv=True),
             _p("equity_stage_deadline", "整段总时限(秒)", "number", 900, min=60, max=7200, adv=True,
                help="股权穿透整段的总闸；跑不完的子公司会记进「总时限截断」，"
                     "单阶段重跑可以续"),
+            _p("equity_join_wait", "收尾等穿透(秒)", "number", 0, min=0, max=7200, adv=True,
+               help="股权是转后台并发跑的，域名 / 端口 / 网页会先出；这里只决定临收尾时"
+                    "最多再等几分钟让子公司并进池。0 = 不额外设限，交给上面的整段总时限收口"),
             _p("equity_timeout", "单主体超时(秒)", "number", 240, min=30, max=1800, adv=True),
             _p("equity_sub_timeout", "单子公司超时(秒)", "number", 100, min=20, max=900, adv=True),
             _p("equity_sub_workers", "子公司并发", "number", 3, min=1, max=6, adv=True,
@@ -473,7 +480,10 @@ def _subject_params() -> list[dict]:
            help="往下穿几层子公司；层数越多请求越多"),
         _p("equity_budget", "工商请求额度(次)", "number", 40, min=5, max=200, adv=True,
            help="整趟允许的工商请求次数；集团主体找不全先加这里"),
-        _p("equity_max_names", "主体名上限", "number", 6, min=1, max=40, adv=True),
+        _p("equity_join_wait", "收尾等穿透(秒)", "number", 0, min=0, max=7200, adv=True,
+           help="股权转后台并发跑，域名 / 端口 / 网页先出；这里只决定临收尾时最多再等几分钟。"
+                "0 = 不额外设限"),
+        _p("equity_max_names", "主体名上限", "number", 10, min=1, max=40, adv=True),
         _p("icp_retry", "备案重试次数", "number", 4, min=1, max=10, adv=True),
         _p("mail_dns", "查邮箱记录", "bool", False, adv=True,
            help="按 MX/TXT 找邮箱服务商，带出邮件主机"),

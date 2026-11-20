@@ -780,7 +780,10 @@ def _expand_budget() -> int:
 
     这个额度是「翻对外投资页 + 往上穿股东 + 逐层穿子公司」三件事共用的，
     所以不能只按「够翻两页」给：12 次在一家人数十家的集团上会被第一层吃光，
-    深层子公司就整片漏掉，看着像没找到。默认给到 40，单次执行可覆盖。
+    深层子公司就整片漏掉，看着像没找到。
+
+    默认不限额（0）：40 次看着多，碰上国网 / 集团这类主体第 2 层就没了，
+    链路断在半截，现场表现是「股权穿透被截断」。真要收着花再显式填数字。
 
     填 0 表示不限额：翻页一直翻到没有下一页为止，只受「每层 30 页 / 400 家」和
     执行时限约束。慢节奏（每次等几十秒）要拉得全，靠的就是这一档。
@@ -789,9 +792,9 @@ def _expand_budget() -> int:
     if override is not None:
         return _BUDGET_UNLIMITED if int(override) <= 0 else max(1, int(override))
     try:
-        val = int(config.get("scan", "equity_budget", default=40))
+        val = int(config.get("scan", "equity_budget", default=0) or 0)
     except Exception:
-        return 40
+        return _BUDGET_UNLIMITED
     return _BUDGET_UNLIMITED if val <= 0 else max(1, val)
 
 
@@ -2436,6 +2439,89 @@ async def _tyc_fill_gap(name: str, eq, *, depth: int, ratio: float) -> int:
     return added
 
 
+async def _aqc_fill_gap(name: str, eq, *, depth: int, ratio: float) -> int:
+    """天眼查那一路这轮没跑全时，反过来用爱企查把对方留下的空位补穿。
+
+    `_tyc_fill_gap` 只覆盖「爱企查停摆、天眼查还在」一个方向；反过来（天眼查额度尽 /
+    被风控 / 没检索到 / 只回半截）以前完全没人接，链路就停在对方给出的那一层。
+    补法与前一个方向同一套：只挑一级节点里不是本路给的、还没往下穿的，逐家查 pid
+    再展开；请求照走 ``scan.equity_sleep``，节点数与次数跟着 ``scan.equity_budget``。
+    """
+    if depth <= 1:
+        return 0
+    cookie = _aqc_ready()
+    if not cookie:
+        return 0
+    have = {str(c.get("name") or "") for c in eq.chain}
+    todo: list[dict] = []
+    for c in eq.chain:
+        if int(c.get("depth") or 1) != 1:
+            continue
+        if str(c.get("src") or "") == "aiqicha":
+            continue
+        nm = str(c.get("name") or "")
+        if not nm or float(c.get("acc_ratio") or 0) <= 0:
+            continue
+        todo.append(c)
+    if not todo:
+        return 0
+    todo.sort(key=lambda c: -float(c.get("acc_ratio") or 0))
+    eq_budget = max(5, _expand_budget())
+    unlimited = eq_budget >= _BUDGET_UNLIMITED
+    cap_nodes = min(len(todo), 40) if unlimited else max(4, min(10, eq_budget // 6))
+    dropped = max(0, len(todo) - cap_nodes)
+    todo = todo[:cap_nodes]
+    if dropped:
+        eq.cap_notes.setdefault(
+            "gap", f"跨来源补穿这轮只补 {cap_nodes} 个一级节点，另有 {dropped} 家没往下穿")
+    budget = {"left": max(12, min(30, eq_budget // 3))} if not unlimited else \
+        {"left": min(400, max(30, cap_nodes * 4))}
+    added = 0
+    try:
+        async with _client(referer=INVEST_API) as cli:
+            cli.headers.update({"Cookie": cookie})
+            for i, node in enumerate(todo):
+                if int(budget.get("left", 0)) <= 0:
+                    eq.cap_notes.setdefault(
+                        "gap", f"跨来源补穿请求次数用尽，只补了 {i} 个一级节点就停了")
+                    break
+                nm = str(node.get("name") or "")
+                found = await _aqc_get(cli, "/s/advanceFilterAjax",
+                                       {"q": nm, "p": 1, "s": 10, "o": 0,
+                                        "f": "{}", "t": 0})
+                pid, _hit = _aqc_pick(found, nm, first=True)
+                if pid and isinstance(found, dict):
+                    pid = _aqc_pid_decode(pid, found.get("ddw"))
+                if not pid:
+                    sug = await _aqc_post(cli, "/index/suggest", {"q": nm, "t": 0})
+                    pid, _hit = _aqc_pick(sug, nm, first=True)
+                    if pid and isinstance(sug, dict):
+                        pid = _aqc_pid_decode(pid, sug.get("ddw"))
+                if not pid:
+                    continue
+                synth = [{"name": nm, "parent": str(node.get("parent") or name),
+                          "ratio": node.get("ratio") or node.get("acc_ratio") or 0,
+                          "acc_ratio": float(node.get("acc_ratio") or 0), "depth": 1,
+                          "pid": pid, "src": "aiqicha",
+                          "capital": node.get("capital") or "",
+                          "status": node.get("status") or ""}]
+                await _aqc_expand(cli, nm, synth, depth=depth, ratio=ratio,
+                                  budget=budget)
+                for c in synth[1:]:
+                    cn = str(c.get("name") or "")
+                    if cn and cn not in have:
+                        eq.chain.append(c)
+                        have.add(cn)
+                        added += 1
+                if added:
+                    _beat(eq)
+    except Exception:
+        return added
+    if added:
+        eq.notes.append(f"有一路工商这轮没跑全，已用另一路补穿出 {added} 个下游主体")
+    return added
+
+
 async def from_tianyancha(name: str, depth: int = 2, ratio: float | None = None,
                           branches: bool = True) -> Equities:
     """工商画像主来源之一（天眼查）：股东 + 对外投资 + 逐层穿透 + 分支/备案。
@@ -2751,19 +2837,27 @@ async def collect(name: str, *, depth: int = 2, ratio: float = 100.0,
 
     async def _track(key: str, skey: str, coro):
         """哪一路先回来就先把状态写进 LAST_STATUS，被外层超时掐断时还能交代进度。"""
+        _prog(f"股权穿透：{EQUITY_SOURCES.get(key, key).split('（')[0]} 开查「{name}」"
+              f"（每请求间隔 {effective_gap():.0f} 秒）")
         try:
             res = await coro
         except Exception:
             LAST_STATUS[key] = "error"
+            _prog(f"股权穿透：{EQUITY_SOURCES.get(key, key).split('（')[0]} 异常")
             raise
         st = ""
         if isinstance(res, Equities):
             st = str(res.source_status.get(skey) or "")
         LAST_STATUS[key] = st or ("ok" if res else "empty")
+        # 逐路报回：一次穿透几分钟起步，只在开始时说一句，界面看着还是卡住。
+        _prog(f"股权穿透：{EQUITY_SOURCES.get(key, key).split('（')[0]} 返回 "
+              f"{LAST_STATUS[key]}（链路 {len(getattr(res, 'chain', []) or [])} 节点）")
         return res
 
     # 主源（两家工商站 + 备案兜底）先并发打满；辅助源只在主源一条数据都没取到时
     # 才补位，主源已经出数就不再白耗它的额度与等待时间。
+    _prog(f"股权穿透：{name} 开跑（{'、'.join(EQUITY_SOURCES.get(k, k).split('（')[0] for k in sorted(use))}"
+          f"；每次请求间隔 {effective_gap():.0f} 秒，深度 {depth} 层）")
     aqc, tyc, icp = await asyncio.gather(
         _track("aiqicha", "aiqicha",
                from_aiqicha(name, depth, ratio=ratio, branches=branches)
@@ -2786,7 +2880,9 @@ async def collect(name: str, *, depth: int = 2, ratio: float = 100.0,
     xlb = bak = None
     aux_note = ""
     if aux_wanted:
-        if any(_has_data(r) for r in (aqc, tyc, icp)):
+        # 备案那一路只给备案行，链路主体仍要靠工商：只有备案出数、两家工商都空的时候
+        # 辅助源照样要补位，不能因为「有一路非空」就把辅助源整段跳过。
+        if _has_data(aqc) or _has_data(tyc):
             aux_skipped = list(aux_wanted)
             aux_note = ("主源已取到数据，辅助工商源（"
                         + "、".join(EQUITY_SOURCES.get(k, k).split("（")[0]
@@ -2902,21 +2998,33 @@ async def collect(name: str, *, depth: int = 2, ratio: float = 100.0,
                 continue
             eq.cap_notes.setdefault(ck, cv)
 
-    # 一路额度用尽、另一路还健康时，让它把对方停下的那一层接下去穿。
-    # 只在拿到过链路时补，主体都没对齐就没有可补的节点。
-    if "tianyancha" in use and eq.chain:
-        if (str(eq.source_status.get("aiqicha") or "") in ("quota", "blocked")
-                and str(eq.source_status.get("tianyancha") or "") == "ok"):
-            try:
-                await _tyc_fill_gap(name, eq, depth=depth, ratio=ratio)
-            except Exception as e:
-                eq.notes.append(f"跨来源补穿失败：{type(e).__name__}")
-            # 主源停摆时面板上只剩「这一路取到 0 家」，看着像整趟没拉到。
-            # 这里必须补一句「谁在接续、最后拿到多少」，否则用户只能猜是不是没权限。
-            if eq.invests or eq.chain:
-                eq.notes.append(
-                    f"另一路工商来源已接续主来源，本轮对外投资共取到 "
-                    f"{len(eq.invests)} 家、链路 {len(eq.chain)} 个节点")
+    # 两路工商互相补位：任一路这轮没跑全（额度用尽 / 被风控 / 没检索到 / 只回半截），
+    # 就让还健康的那一路把对方停下的那一层接下去穿。两个方向都补 —— 以前只有
+    # 「爱企查停摆、天眼查还在」一个方向，反过来天眼查停了没人接，现场表现就是
+    # 「天眼查这次是不是没用上」：用了，但停在半截没人续。
+    _GAP_STATES = ("quota", "blocked", "not_found", "empty", "partial", "error", "timeout")
+    _st_aqc = str(eq.source_status.get("aiqicha") or "")
+    _st_tyc = str(eq.source_status.get("tianyancha") or "")
+    if "tianyancha" in use and eq.chain and _st_tyc == "ok" and _st_aqc in _GAP_STATES:
+        try:
+            await _tyc_fill_gap(name, eq, depth=depth, ratio=ratio)
+        except Exception as e:
+            eq.notes.append(f"跨来源补穿失败：{type(e).__name__}")
+        # 主源停摆时面板上只剩「这一路取到 0 家」，看着像整趟没拉到。
+        # 这里必须补一句「谁在接续、最后拿到多少」，否则用户只能猜是不是没权限。
+        if eq.invests or eq.chain:
+            eq.notes.append(
+                f"另一路工商来源已接续主来源，本轮对外投资共取到 "
+                f"{len(eq.invests)} 家、链路 {len(eq.chain)} 个节点")
+    if "aiqicha" in use and eq.chain and _st_aqc == "ok" and _st_tyc in _GAP_STATES:
+        try:
+            await _aqc_fill_gap(name, eq, depth=depth, ratio=ratio)
+        except Exception as e:
+            eq.notes.append(f"跨来源补穿失败：{type(e).__name__}")
+        if eq.invests or eq.chain:
+            eq.notes.append(
+                f"另一路工商来源已接续主来源，本轮对外投资共取到 "
+                f"{len(eq.invests)} 家、链路 {len(eq.chain)} 个节点")
 
     if "icp" in use:
         # 备案这一路原来只往里塞数据、从不写状态，界面上永远看不到它跑没跑。

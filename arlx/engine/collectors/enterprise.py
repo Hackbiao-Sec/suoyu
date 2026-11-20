@@ -2443,7 +2443,8 @@ async def domain_evidence(name: str, candidates: list[str], *,
                           extra_icp: set[str] | None = None,
                           icp_units: dict[str, str] | None = None,
                           icp_rels: dict[str, str] | None = None,
-                          hits: list["web.Hit"] | None = None) -> list[DomainEvidence]:
+                          hits: list["web.Hit"] | None = None,
+                          pin: set[str] | None = None) -> list[DomainEvidence]:
     """给一批候选域打归属分。候选来自 ICP / 搜索 / AI 猜测，统一走这里。
 
     `hits` 由调用方传入已经搜到的结果，省掉一次重复检索；不传就自己搜。
@@ -2451,7 +2452,8 @@ async def domain_evidence(name: str, candidates: list[str], *,
     （瑞幸的 lkcoffee.com）只会在命中里出现一次，不会同时出现在调用方给的 ICP 名单里。
     `icp_units` 是「候选根域 → 备案主办单位全称」，只有备案这一路确认过的主体会带。
     有它就不必对同一个域再反查一次备案，也让判定理由能写出登记的那家公司全称。
-    `icp_rels` 是同一个根域对应的关系档（self / family），兄弟主体不能给确认级结论。"""
+    `icp_rels` 是同一个根域对应的关系档（self / family），兄弟主体不能给确认级结论。
+    `pin` 是按品牌表钉进来的产品根域：检索常常一条都不命中，不能让它被条数排序截掉。"""
     icp_set = extra_icp or set()
     icp_units = icp_units or {}
     icp_rels = icp_rels or {}
@@ -2536,7 +2538,17 @@ async def domain_evidence(name: str, candidates: list[str], *,
     # 逐个打分之前先按结果条数排序并截断：一次企业名检索能召回几百个无关根域，
     # 全跑首页探测 + 证书查询要几分钟，而高分根域基本都落在命中次数最多的前一批里。
     roots.sort(key=lambda r: (-len(by_root.get(r, [])), len(r)))
-    roots = roots[:_SCORE_TOP]
+    # 品牌已知产品根域（`sgcc.com.cn`、`qq.com`）与中文品牌名、拼音都对不上，检索里
+    # 往往一条命中都没有，按条数排序必然落到最末，被下面这把刀整片切掉 —— 现场表现是
+    # 「候选池里明明预置了官网根域，最后确认域名 0 个」。钉住的这几个保底进池，
+    # 截断只作用在其余候选上。
+    pin_set = {root_domain(p) or p for p in (pin or ()) if p}
+    pinned = [r for r in roots if r in pin_set]
+    if pinned:
+        kept = [r for r in roots if r not in pin_set]
+        roots = pinned + kept[: max(0, _SCORE_TOP - len(pinned))]
+    else:
+        roots = roots[:_SCORE_TOP]
     probed = await asyncio.gather(*(_probe(r) for r in roots), return_exceptions=True)
     flags: dict[str, tuple[str, set, bool, bool, str, str]] = {}
     for r in probed:
@@ -2656,7 +2668,8 @@ async def collect_entity(target: str, *, mobile: bool = True,
                          icp_kinds=("site",), icp_pages: int = 2, icp_size: int = 40,
                          icp_retry: int | None = None, icp_gap: float | None = None,
                          icp_alias: bool = True, icp_force: bool = False,
-                         icp_api: str = "", on_log=None, on_partial=None,
+                         icp_api: str = "", equity: bool = True,
+                         on_log=None, on_partial=None,
                          budget_s: float | None = None) -> dict:
     """把用户输入的"公司名/域名"扩成实体信息（含逐域归属证据）
 
@@ -2664,6 +2677,8 @@ async def collect_entity(target: str, *, mobile: bool = True,
     既慢又多半没有结果（商店按名字登记，不按域名）。
     `equity_ratio` 覆盖配置里的控股门槛，给单个任务按需放宽或收紧。
     `equity_sources` 只跑点名的工商来源（aiqicha / tianyancha / icp / backup），留空全开。
+    `equity=False` 不跑股权那一路：股权穿透一次就是几十次串行请求，调用方如果后面还会
+    单独跑一遍（p1c 阶段、子公司并线），这里再穿一次就是同一份链路跑两三遍。
     `icp_*` 一路透传给备案查询：查哪几类、翻几页、每页多少条、重试、间隔、是否补全称。
     `budget_s` 是本段自己的时间预算：调用方给了硬时限就把它传进来，收尾那几步（兄弟主体
     反查、逐域取证、AI 复核）按剩余时间决定做不做，省得外层到点把协程掐掉、拿到的东西全丢。
@@ -2676,6 +2691,9 @@ async def collect_entity(target: str, *, mobile: bool = True,
             return 1e9
         return (t0 + float(budget_s)) - time.monotonic()
     info = EntityInfo(name=target, brand=_brand(target))
+    # 品牌已知产品主域（`sgcc.com.cn`、`qq.com`）：检索常常一条都不命中，按命中条数排序
+    # 会被截掉。这里先取出来，既进候选池，也让中途快照能直接把它当自家域交出去。
+    own_known = _own_roots_of(target)
     notes: list[str] = []
 
     def _say(msg: str, level: str = "info") -> None:
@@ -2705,6 +2723,8 @@ async def collect_entity(target: str, *, mobile: bool = True,
         try:
             own = {d for d in domains if icp_rels.get(d) == "self"}
             own |= set(snap.get("domains") or ())
+            # 品牌表钉住的主域不必等取证闸：它们不是检索召回的结果，含金量本来就由表决定。
+            own |= own_known
             rest = sorted(d for d in info.domains if is_valid_domain(d))
             pend = [d for d in rest if d not in own]
             pend += [d for d in (snap.get("domains_pending") or ()) if d not in own
@@ -2731,6 +2751,8 @@ async def collect_entity(target: str, *, mobile: bool = True,
             pass
 
     domains: set[str] = set()
+    # 候选根域池先摆好：备案那一路一回来就要往里加，不能等 `await side` 之后才建。
+    cands: set[str] = set()
     icp_set: set[str] = set()
     # 候选根域 → 备案主办单位全称：备案那一路查到的主体名要跟着域一起进打分，
     # 不然机构类目标看不出「这个域就是登记在它自己名下」。
@@ -2788,14 +2810,80 @@ async def collect_entity(target: str, *, mobile: bool = True,
         except Exception as e:
             return "icp_company", e
 
+    icp_merged = [False]
+
+    def _apply_icp(rows: list) -> None:
+        """把备案结果并进主体：候选根域、自家根域标记、兄弟/外部主体留档。
+
+        这段原来只写在 `await side` 之后。股权一路按 30 秒间隔穿子公司要跑几十分钟，
+        备案十几秒就回来了也得在原地等着，快照里就始终没有域名；外层时限一落在股权段
+        上，任务页看到的就只有主体行。现在备案一回来就并、就交快照。
+        """
+        icp_merged[0] = True
+        if not rows:
+            why = _icp_empty_reason(target)
+            if why:
+                notes.append(why)
+            return
+        # 企业名这条线查到的每一条备案都要留在 `info.icp` 里。以前这里只把合法域名
+        # 拆成候选域，公益域、APP/小程序类备案（它们的 domain 不是合法域名）直接被丢掉，
+        # 结果就是用了备案号的主体反而「一条 ICP 都没有」。
+        seen = {(_icp_key(x)) for x in info.icp}
+        for item in rows:
+            k = _icp_key(item)
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            info.icp.append(dict(item))
+        foreign_icp: list[dict] = []
+        family_icp: list[dict] = []
+        for item in rows:
+            if item.get("owner_match") is False:
+                # 主办单位不是目标主体：留档展示，但不进候选域 / 扩展链
+                foreign_icp.append(dict(item))
+                continue
+            if str(item.get("relation") or "self") == "family":
+                family_icp.append(dict(item))
+            dom = item.get("domain", "")
+            if is_valid_domain(dom):
+                r = root_domain(dom) or dom
+                domains.add(r)
+                icp_set.add(r)
+                icp_units.setdefault(r, item.get("unit") or "")
+                icp_rels.setdefault(r, str(item.get("relation") or "self"))
+                cands.add(r)
+                info.domains.add(dom)
+                info.domains.add(r)
+        if family_icp:
+            # 兄弟主体名下的备案不是本主体的行政登记结论，但也绝不是第三方：
+            # 集团官网就登记在区域公司名下。列档 + 进候选池，打分按线索档给。
+            host = "、".join(sorted({(x.get("domain") or x.get("app") or "") for x in family_icp})[:4])
+            unit = next((x.get("unit") for x in family_icp if x.get("unit")), "")
+            notes.append(f"同品牌兄弟主体「{unit}」名下有 {len(family_icp)} 条备案（{host} 等），"
+                         f"按集团内线索进候选池")
+        if foreign_icp:
+            host = "、".join(sorted({(x.get("domain") or x.get("app") or "") for x in foreign_icp})[:4])
+            unit = next((x.get("unit") for x in foreign_icp if x.get("unit")), "")
+            notes.append(f"备案主办单位非本主体的 {len(foreign_icp)} 条（{host} 登记在「{unit}」）"
+                         f"只列档，未当候选域扩展")
+        if "icp_company" not in info.sources:
+            info.sources.append("icp_company")
+
     async def _watch_icp():
         tag, rows = await _icp_rows()
-        if not isinstance(rows, BaseException):
-            rows = rows or []
-            own = sum(1 for x in rows if isinstance(x, dict) and x.get("owner_match") is not False)
-            _say(f"备案：{len(rows)} 条（主办单位对得上 {own} 条）")
-        else:
+        if isinstance(rows, BaseException):
             _say(f"备案查询失败：{str(rows)[:60]}", "warn")
+            return tag, rows
+        rows = rows or []
+        own = sum(1 for x in rows if isinstance(x, dict) and x.get("owner_match") is not False)
+        _say(f"备案：{len(rows)} 条（主办单位对得上 {own} 条）")
+        try:
+            _apply_icp(rows)
+        except Exception as e:
+            notes.append(f"备案合并异常：{str(e)[:60]}")
+        else:
+            # 备案一批就交一批：域名、自家根域标记都在快照里了，后面的被动收集能开工。
+            _publish()
         return tag, rows
 
     async def _watch_equity():
@@ -2857,19 +2945,28 @@ async def collect_entity(target: str, *, mobile: bool = True,
         _say(f"股权穿透：{n} 家达到控股门槛 / 链路 {chain_n} 条（一起入资产）")
         return tag, res
 
-    side = asyncio.gather(_watch_icp(), _watch_equity(), return_exceptions=True)
+    # 先把已知的自家主域交出去。股权那一路一次穿透就是几十分钟，而域名要等第 7 步
+    # 取证闸走完才写进快照；外层时限一到，快照里就只剩主体行，任务页看到的是
+    # 「主体收集做完了，域名 0 个」。品牌表钉住的主域不依赖检索命中，这里先落一份，
+    # 后面的被动收集 / 爆破 / 端口至少有一批根可以开工。
+    if own_known:
+        # 品牌表钉住的主域不依赖检索命中：既进候选池，也立刻交一份快照，
+        # 后面的被动收集 / 爆破 / 端口至少有一批根可以开工。
+        cands |= own_known
+        _say(f"按品牌已知主域预置候选：{'、'.join(sorted(own_known))}")
+        _publish()
+
+    side_tasks = [_watch_icp()]
+    if equity:
+        side_tasks.append(_watch_equity())
+    side = asyncio.gather(*side_tasks, return_exceptions=True)
     # 移动端线索也跟着一起开：应用商店 / 小程序的开发者主体名只有这条线拿得到
     mob_task = asyncio.create_task(mobile_leads([info.brand or target, target])) if mobile else None
 
     # 2) 搜索候选（无论 ICP 有没有结果都跑：ICP 只给备案域，搜索引擎能带出品牌域）
     #    查询词用品牌简称打头：带括号的全称会让引擎按单字切词，召回一堆字典站。
-    cands: set[str] = set(domains)
-    # 已知品牌主域直接进候选池：这类官网根域与中文品牌名、拼音都对不上（`qq.com`、`sgcc.com.cn`），
-    # 只靠搜索引擎召不回来就整轮没有可扩的根。它们照样过取证闸，只是不再依赖检索是否命中。
-    own_known = _own_roots_of(target)
-    if own_known:
-        cands |= own_known
-        _say(f"按品牌已知主域预置候选：{'、'.join(sorted(own_known))}")
+    #    已知品牌主域已在上面并进 `cands`：这类官网根域与中文品牌名、拼音都对不上
+    #    （`qq.com`、`sgcc.com.cn`），只靠搜索引擎召不回来就整轮没有可扩的根。
     hits: list = []
     # 搜索与 ICP/工商同时开：三路互不依赖，串行会让首屏多等十几秒。
     searches = asyncio.create_task(_search_roots(target))
@@ -2895,11 +2992,14 @@ async def collect_entity(target: str, *, mobile: bool = True,
         if isinstance(rows, BaseException):
             notes.append(f"{tag} 异常：{str(rows)[:60]}")
             continue
+        if tag == "icp_company":
+            # 备案在 `_watch_icp` 里已经并进主体并交过快照（含空结果原因），这里只做兜底：
+            # 那一路若在合并前异常退出，用已拿到的行补一次。
+            if rows and not icp_merged[0]:
+                _apply_icp(rows)
+                _publish()
+            continue
         if not rows:
-            if tag == "icp_company":
-                why = _icp_empty_reason(target)
-                if why:
-                    notes.append(why)
             continue
         if tag == "equity":
             # 股权链路给的是主体名（达到控股门槛的子公司），一个也不是域名，不能进上面按 domain 取值的分支
@@ -2915,49 +3015,6 @@ async def collect_entity(target: str, *, mobile: bool = True,
             if isinstance(owned_rel, dict):
                 info.equity_relation = {k: v for k, v in owned_rel.items() if k in owned_subs[:12]}
             continue
-        if tag == "icp_company":
-            # 企业名这条线查到的每一条备案都要留在 `info.icp` 里。以前这里只把合法域名
-            # 拆成候选域，公益域、APP/小程序类备案（它们的 domain 不是合法域名）直接被丢掉，
-            # 结果就是用了备案号的主体反而「一条 ICP 都没有」。
-            seen = {(_icp_key(x)) for x in info.icp}
-            for item in rows:
-                k = _icp_key(item)
-                if not k or k in seen:
-                    continue
-                seen.add(k)
-                info.icp.append(dict(item))
-        foreign_icp: list[dict] = []
-        family_icp: list[dict] = []
-        for item in rows:
-            if item.get("owner_match") is False:
-                # 主办单位不是目标主体：留档展示，但不进候选域 / 扩展链
-                foreign_icp.append(dict(item))
-                continue
-            if str(item.get("relation") or "self") == "family":
-                family_icp.append(dict(item))
-            dom = item.get("domain", "")
-            if is_valid_domain(dom):
-                r = root_domain(dom) or dom
-                domains.add(r)
-                icp_set.add(r)
-                icp_units.setdefault(r, item.get("unit") or "")
-                icp_rels.setdefault(r, str(item.get("relation") or "self"))
-                cands.add(r)
-                info.domains.add(dom)
-                info.domains.add(r)
-        if family_icp:
-            # 兄弟主体名下的备案不是本主体的行政登记结论，但也绝不是第三方：
-            # 集团官网就登记在区域公司名下。列档 + 进候选池，打分按线索档给。
-            host = "、".join(sorted({(x.get("domain") or x.get("app") or "") for x in family_icp})[:4])
-            unit = next((x.get("unit") for x in family_icp if x.get("unit")), "")
-            notes.append(f"同品牌兄弟主体「{unit}」名下有 {len(family_icp)} 条备案（{host} 等），"
-                         f"按集团内线索进候选池")
-        if foreign_icp:
-            host = "、".join(sorted({(x.get("domain") or x.get("app") or "") for x in foreign_icp})[:4])
-            unit = next((x.get("unit") for x in foreign_icp if x.get("unit")), "")
-            notes.append(f"备案主办单位非本主体的 {len(foreign_icp)} 条（{host} 登记在「{unit}」）"
-                         f"只列档，未当候选域扩展")
-        info.sources.append(tag)
 
     notes.extend(_equity_note(owned_subs))
     # 备案 + 工商股权这两路都回来了：这是整段流程最贵的一段，先交一份快照。
@@ -3195,7 +3252,8 @@ async def collect_entity(target: str, *, mobile: bool = True,
             try:
                 evs.extend(await asyncio.wait_for(
                     domain_evidence(target, rest, extra_icp=icp_set,
-                                    icp_units=icp_units, icp_rels=icp_rels, hits=hits), cap_ev))
+                                    icp_units=icp_units, icp_rels=icp_rels, hits=hits,
+                                    pin=own_known), cap_ev))
             except asyncio.TimeoutError:
                 notes.append(f"逐域取证超过 {int(cap_ev)}s 未跑完，{len(rest)} 个弱线索候选按待核验下发")
                 evs.extend(DomainEvidence(domain=d, score=PENDING_SCORE, status="pending",

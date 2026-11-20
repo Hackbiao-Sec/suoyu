@@ -422,25 +422,35 @@ class StagesMixin:
                 # 已经查到的备案 / 控股子公司 / 移动端主体都在它的局部变量里，
                 # 不接这份快照就等于白跑几分钟（现场表现：日志里命中一堆，任务最后 0 资产）。
                 got: dict = {}
-                ent = await self._bounded(
-                    enterprise.collect_entity(
-                        company, equity_ratio=ratio,
-                        mobile=bool(self.opt("enterprise_mobile", True)),
-                        equity_sources=self.opt("equity_sources", None) or None,
-                        icp_kinds=self._icp_kinds(),
-                        icp_pages=int(self.opt("icp_pages", 2) or 2),
-                        icp_size=int(self.opt("icp_size", 40) or 40),
-                        icp_retry=int(self.opt("icp_retry", 0) or 0) or None,
-                        icp_gap=float(self.opt("icp_gap", 0) or 0) or None,
-                        icp_alias=bool(self.opt("icp_alias", True)),
-                        icp_force=bool(self.opt("icp_force", False)),
-                        icp_api=str(self.opt("enterprise_icp_api", "") or ""),
-                        on_log=self._ent_log(),
-                        on_partial=self._entity_part_taker(company, got),
-                        budget_s=max(30.0, float(self.opt("enterprise_timeout", 300) or 300) - 20)),
-                    float(self.opt("enterprise_timeout", 300) or 300),
-                    tag=f"主体扩线 {company}", log_mod="enterprise", stage="enterprise",
-                    partial=lambda: dict(getattr(enterprise, "LAST_STATUS", {}) or {}))
+                cached = (getattr(self, "expand_entities", None) or {}).get(company)
+                if isinstance(cached, dict) and cached:
+                    # 一键流程的前置展开已经把这家查过一遍了。再跑第二遍，等于把同一份
+                    # 工商额度再烧一次；第二遍还常常被硬时限掐在中途，最后落地的东西
+                    # 比第一遍更少（现场表现：主体收集像做完了，域名 / 端口 / web 全空）。
+                    self.log("enterprise", f"{company} 复用前置展开结果："
+                                           f"域名 {len(cached.get('domains') or [])} 个 / "
+                                           f"备案 {len(cached.get('icp') or [])} 条")
+                    ent = cached
+                else:
+                    ent = await self._bounded(
+                        enterprise.collect_entity(
+                            company, equity_ratio=ratio, equity=False,
+                            mobile=bool(self.opt("enterprise_mobile", True)),
+                            equity_sources=self.opt("equity_sources", None) or None,
+                            icp_kinds=self._icp_kinds(),
+                            icp_pages=int(self.opt("icp_pages", 2) or 2),
+                            icp_size=int(self.opt("icp_size", 40) or 40),
+                            icp_retry=int(self.opt("icp_retry", 0) or 0) or None,
+                            icp_gap=float(self.opt("icp_gap", 0) or 0) or None,
+                            icp_alias=bool(self.opt("icp_alias", True)),
+                            icp_force=bool(self.opt("icp_force", False)),
+                            icp_api=str(self.opt("enterprise_icp_api", "") or ""),
+                            on_log=self._ent_log(),
+                            on_partial=self._entity_part_taker(company, got),
+                            budget_s=max(30.0, self._entity_timeout() - 20)),
+                        self._entity_timeout(),
+                        tag=f"主体扩线 {company}", log_mod="enterprise", stage="enterprise",
+                        partial=lambda: dict(getattr(enterprise, "LAST_STATUS", {}) or {}))
                 if not isinstance(ent, dict):
                     # 超时 / 报错：把快照里已经过完证据闸的部分接着用，别整段丢掉。
                     ent = got or None
@@ -746,7 +756,7 @@ class StagesMixin:
         ubo_levels = int(self.opt("equity_ubo_levels", 1) or 0)
         # 只跑勾选的工商来源：不勾的那一路连请求都不发，额度留给要用的那条
         eq_sources = [str(s) for s in (self.opt("equity_sources", None) or [])] or None
-        cap = max(1, int(self.opt("equity_max_names", 6) or 6))
+        cap = max(1, int(self.opt("equity_max_names", 10) or 10))
         # 0 = 额度不限：翻页一直翻到没有下一页，只受每层页上限与下面这个总时限约束
         budget_opt = int(self.opt("equity_budget", 40) or 0)
         # 整段股权穿透的总时限：下面每个主体、每家子公司的工商查询都是外部串行活，
@@ -770,13 +780,22 @@ class StagesMixin:
                                    f"放宽到 {est / 60:.0f} 分钟")
             stage_cap = max(stage_cap, est)
             eq_cap = max(eq_cap, stage_cap)
-            sub_cap = max(sub_cap, min(stage_cap, est / 2))
+            # 单个子公司只做浅层（检索 + 股东 + 投资 + 取证），大约十次请求；按这个量级
+            # 放大，别拿整段的 ``est / 2`` 当单子超时——那样一家子就敢占一小时。
+            sub_cap = max(sub_cap, min(stage_cap, 10 * (gap_s + 2.0) * 2))
         stage_deadline = time.monotonic() + stage_cap
+        # 并线段（全资子公司扩域）必须留一份时间：主穿透一个 163 节点的大主体在
+        # 30 秒延时下就要八十多分钟，把总闸吃满之后 `_left()` 归零，子公司一家都并不进来。
+        # 现场表现就是「穿透图画得挺全，域名却一个没多」。这里给并线段留三成。
+        main_deadline = time.monotonic() + stage_cap * 0.7
         eq_timeout = eq_cap
         sub_timeout = sub_cap
 
         def _left() -> float:
             return stage_deadline - time.monotonic()
+
+        def _left_main() -> float:
+            return min(_left(), main_deadline - time.monotonic())
 
         async def _one(name: str, i: int, total: int) -> str:
             """跑一个候选主体：落股权资产、记渠道，返回工商对齐到的全称。"""
@@ -797,7 +816,7 @@ class StagesMixin:
                                    # 已经有东西，不用等最后一刻才一次性出现。
                                    on_partial=lambda snap: self._save_equity_detail(
                                        name, snap)),
-                    min(eq_timeout, max(20.0, _left())), tag=f"股权穿透 {name}",
+                    min(eq_timeout, max(20.0, _left_main())), tag=f"股权穿透 {name}",
                     log_mod="equity", stage="equity",
                     partial=lambda: dict(getattr(equity, "LAST_STATUS", {}) or {}))
             except Exception as e:
@@ -885,7 +904,9 @@ class StagesMixin:
         owned = [n for n in dict.fromkeys(owned) if n and n not in names]
         if not owned:
             return
-        subs_cap = max(0, int(self.opt("equity_subs", 24) or 0))
+        # 默认 40 家并线：配置里这一项留空（None）时以前会算成 0，
+        # 整段「全资主体并线」直接被自己的缺省值关掉，看着就像股权穿透只穿不并。
+        subs_cap = max(0, int(self.opt("equity_subs", 40) or 40))
         subs = owned[:subs_cap]
         if len(owned) > len(subs):
             rest = "、".join(owned[len(subs):len(subs) + 4])
@@ -923,7 +944,8 @@ class StagesMixin:
                     got: dict = {}
                     ent = await self._bounded(
                         enterprise.collect_entity(
-                            sub, mobile=False, equity_sources=eq_sources,
+                            sub, mobile=False, equity=False,
+                            equity_sources=eq_sources,
                             icp_retry=int(self.opt("icp_retry", 0) or 0) or None,
                             icp_gap=float(self.opt("icp_gap", 0) or 0) or None,
                             icp_api=str(self.opt("enterprise_icp_api", "") or ""),

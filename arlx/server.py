@@ -2321,18 +2321,23 @@ async def applet_local(request: Request, appid: str = "", limit: int = 20,
 
 
 # ─────────────── 一键收集全 ───────────────
+# 预设把这几项都写全：前端拿预设套开关时，缺键会落成 undefined，
+# 提交时就变成 false（现场表现：标着「深度侦察」，日志却写「字典爆破未启用」，
+# 26 个被动源只跑在母公司一个域上）。写全了，谁读都不会漏。
+_ONECLICK_COMMON = {"domain_dict": "domain_2w.txt", "domain_brute": True,
+                    "site_spider": True, "asn_expand": True}
 ONECLICK_PRESETS = {
     "quick": {"label": "快速侦察", "desc": "15 分钟内出结果：免费被动源 + 字典爆破 1 万 + TOP100 端口",
-              "options": {"domain_dict": "domain_2w.txt", "port_type": "top100", "site_spider": True,
+              "options": {**_ONECLICK_COMMON, "port_type": "top100",
                           "file_leak": False, "sibling": False, "deep": False, "vhost_collision": False}},
     "standard": {"label": "标准侦察", "desc": "被动全源 + 全字典 + TOP100 端口 + 爬虫 + 敏感文件 + 旁站",
-                 "options": {"domain_dict": "domain_2w.txt", "port_type": "top100", "site_spider": True,
+                 "options": {**_ONECLICK_COMMON, "port_type": "top100",
                              "file_leak": True, "sibling": True, "deep": True, "vhost_collision": False}},
     "deep": {"label": "深度侦察", "desc": "标准 + TOP1000 端口 + VHost 碰撞 + 代码泄露 + 邮箱 + 存储桶",
-             "options": {"domain_dict": "domain_2w.txt", "port_type": "top1000", "site_spider": True,
+             "options": {**_ONECLICK_COMMON, "port_type": "top1000",
                          "file_leak": True, "sibling": True, "deep": True, "vhost_collision": True}},
     "hunt": {"label": "资产监控", "desc": "只挖新增：浅端口 + 爬虫 + 变更对比，适合周期跑",
-             "options": {"domain_dict": "domain_2w.txt", "port_type": "top10", "site_spider": True,
+             "options": {**_ONECLICK_COMMON, "port_type": "top10",
                          "file_leak": False, "sibling": False, "deep": False, "vhost_collision": False}},
 }
 
@@ -2484,15 +2489,48 @@ async def _oneclick_expand(task_id: str, runner, plan: dict) -> None:
                 continue
             if not _usable_subject_name(s):
                 continue
+            # 超时被掐时只剩这份快照：已经过证据闸的域名 / 备案 / 控股子公司先收下。
+            # 以前这里超时直接 continue，一整轮主体扩线查到的东西跟着协程一起消失，
+            # 任务里就只剩「主体收集」几行日志，域名 / 端口 / 网页全空。
+            snap: dict = {}
+
+            def on_partial(part, _snap=snap):
+                if isinstance(part, dict) and part:
+                    _snap.update(part)
+
+            truncated = False
             try:
-                info = await enterprise.collect_entity(s, equity_ratio=runner.opt_equity_ratio())
+                # 这一遍只做主体识别 + 域名取证，股权穿透交给后面的 P1c 专用阶段跑一次：
+                # 两处都穿等于把同一份工商额度烧两遍，碰上需要 30 秒延时的大主体，
+                # 第二遍必定被时限掐断，最后落地的东西比第一遍还少。
+                info = await asyncio.wait_for(
+                    enterprise.collect_entity(
+                        s, equity_ratio=runner.opt_equity_ratio(), equity=False,
+                        on_log=lambda mod, msg, lvl="info": log(mod, msg, lvl),
+                        on_partial=on_partial,
+                        budget_s=max(60.0, runner._entity_timeout() - 30)),
+                    timeout=runner._entity_timeout())
             except Exception as e:
-                log("enterprise", f"主体扩线失败 {s}: {str(e)[:120]}", "warn")
+                info = dict(snap) if snap else None
+                truncated = bool(info)
+                if truncated:
+                    log("enterprise", f"主体扩线到时限（{str(e)[:60]}），改用途中快照："
+                                      f"{s} 域名 {len(info.get('domains') or [])} 个",
+                        "warn")
+                else:
+                    log("enterprise", f"主体扩线失败 {s}: {str(e)[:120]}", "warn")
+            if not isinstance(info, dict) or not info:
                 continue
+            if not truncated:
+                # 留给 P0 复用：同一个任务里这个主体已经查过了，别再查第二遍。
+                try:
+                    runner.expand_entities[s] = info
+                except Exception:
+                    pass
             doms = info.get("domains") or []
             extra.extend(doms)
-            log("enterprise", f"{s} → 域名 {len(doms)} 个"
-                              f"（来源 {'/'.join(info.get('sources') or []) or '无'}）")
+            src_note = "/".join(info.get("sources") or []) or ("途中快照" if truncated else "无")
+            log("enterprise", f"{s} → 域名 {len(doms)} 个（来源 {src_note}）")
             for leaf in (info.get("equity") or [])[:60] if isinstance(info.get("equity"), list) else []:
                 nm = leaf.get("name") if isinstance(leaf, dict) else None
                 if nm:
