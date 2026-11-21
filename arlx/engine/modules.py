@@ -25,6 +25,36 @@ MODULES: list[dict] = [
      "stages": ["crawl", "leak", "vhost", "takeover", "sibling", "deep"]},
 ]
 
+# 一键收集的五步勾选 → 阶段。执行侧读 options["steps"]，从 MODULES 派生一份，
+# 免得两处各抄一套阶段表。
+STEP_OF_MODULE: dict[str, str] = {"subject": "p1", "domain": "p2", "space": "p3",
+                                  "probe": "p4", "deep": "p5"}
+STEP_STAGES: dict[str, list[str]] = {STEP_OF_MODULE[m["key"]]: list(m["stages"])
+                                     for m in MODULES}
+
+
+def stages_of_options(options: dict | None) -> list[str]:
+    """这个任务实际会跑的阶段：显式 only_stages 优先，其次把一键收集的 steps 折算过来。
+
+    以前展示侧只认 only_stages：一键收集里没勾的段，执行侧跳过、展示侧却当成
+    「已选且跑完」，卡片一律写「100% 已完成 · 无产出」，和真跑了却空手而归
+    分辨不出来。
+    """
+    options = options or {}
+    picked = [str(s) for s in (options.get("only_stages") or []) if str(s) in STAGE_ORDER]
+    if picked:
+        return picked
+    raw = options.get("steps")
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    steps = {str(s) for s in raw if str(s)}
+    if len(steps & set(STEP_STAGES)) >= len(STEP_STAGES):
+        return []
+    return [s for step in STEP_STAGES for s in STEP_STAGES[step] if step in steps]
+
+
 # 阶段里的细分项：重测时不必整段重跑，可以只挑其中几项。
 # 编码是「阶段:子项」，写进 options["only_modules"]；某段一个子项都没写 = 整段照跑。
 # 被动源与测绘引擎不进这张静态表，按各自注册表现取（见 stage_submodules）。

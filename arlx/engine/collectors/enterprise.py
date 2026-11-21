@@ -1039,6 +1039,11 @@ def _is_generic_title(title: str) -> bool:
     return bool(_GENERIC_TITLE_RE.match(t))
 
 
+def _directory_wording(text: str) -> bool:
+    """这段文字读起来像目录/黄页/供求/行业门户（收录了这家企业），不是站点自报家门。"""
+    return any(w in (text or "") for w in _DIRECTORY_TITLE_HINT)
+
+
 # 品牌自家运营的产品根域：搜索里它就是这家公司的业务面，不是通用平台转载。
 # 只用于「这个域对当前品牌来说算不算自家站」的判断，不改变它对别人的平台属性 ——
 # 查腾讯时 qq.com 是自有资产，查别家时它仍然是平台，照样按平台扣分。
@@ -2376,6 +2381,13 @@ def _score_domain(domain: str, hits: list[web.Hit], name: str, *, declared: bool
                 # 黄页 / 行业门户收录了这家企业，标题当然写企业名：这条只说明「库里收录过」，
                 # 不能升级成强证据，否则下面的弱证据封顶会被它一个人绕开。
                 ev.reasons.append("首页自述与目标无关，这条只是收录条目，不算归属证据")
+            elif not site_title and _directory_wording(best.title + " " + best.snippet):
+                # 首页标题取不到，而引擎给回来的这条标题/摘要本身就是目录写法
+                # （「…招标公告 - 电力招标网」）：那是门户收录本企业的条目，不是它自己的站。
+                # 以前这种条目按「搜索第 1 位标题就是企业名」算强证据，标题 25 + 摘要 15
+                # + 多引擎 10 = 50，正好越过 45 的确认线 —— 招标门户就是这么进主域清单、
+                # 再被按根域跑一代子域的。空标题的 SPA 官网不在此列：它们的检索条目不会写成目录。
+                ev.reasons.append("首页无标题，检索条目是目录/门户写法，不算归属强证据")
             else:
                 strong += 1      # 引擎把这条排在最前，且标题写着品牌名：与官网声明同级
         else:
@@ -2383,7 +2395,7 @@ def _score_domain(domain: str, hits: list[web.Hit], name: str, *, declared: bool
     elif brand_hit and min(brand_hit, key=lambda h: h.rank).rank <= TOP_RANK:
         best = min(brand_hit, key=lambda h: h.rank)
         ev.add(W_TITLE, f"搜索第 {best.rank + 1} 位标题是品牌名：{best.title[:40]}")
-        if not site_unrelated:
+        if not site_unrelated and (site_title or not _directory_wording(best.title + " " + best.snippet)):
             strong += 1
     if snip_hit and not short_brand:
         ev.add(W_SNIPPET, "搜索摘要命中企业名")
@@ -2401,7 +2413,7 @@ def _score_domain(domain: str, hits: list[web.Hit], name: str, *, declared: bool
     if site_unrelated:
         ev.add(W_SITE_UNRELATED,
                f"首页自述「{site_title[:30]}」与目标无关，得分只来自检索排名，不是这家企业的站")
-        if any(w in site_title for w in _DIRECTORY_TITLE_HINT):
+        if _directory_wording(site_title):
             ev.add(W_PLATFORM, "首页标题是目录/黄页/供求/行业门户写法：它收录了这家企业，不是它的站")
     if subjects and not site_subject:
         # 站点写了自己的主体，但和目标对不上：加盟招商、山寨官网的典型形态——页面满屏品牌名，
@@ -3206,14 +3218,24 @@ async def collect_entity(target: str, *, mobile: bool = True,
         # 备案登记在目标自己名下的域，当前没有 A 记录也要留：备案主体是强归属证据
         # （域历史上就属于它），停解析只是眼下没站点，不等于「不是它的域」。
         # 以前一律按无解析剔除，现场表现是「备案都查到域了，候选池却只剩下一个」。
-        keep = [d for d in dead if d in icp_set]
-        dead = [d for d in dead if d not in icp_set]
+        keep_icp = [d for d in dead if d in icp_set]
+        # 品牌已知主域（`_OWN_ROOTS`）同理，而且更要留：省公司的站全挂在
+        # `www.fj.sgcc.com.cn`、`www.hk.sgcc.com.cn` 这类子域上，根域和 `www` 都没有 A
+        # 记录（内网解析），去活闸一剔，真实主域就永远进不了被动 / 测绘，只剩备案里
+        # 那条中文域名。这里只放行人工维护的品牌主域，不会把搜索召回的门户站捞回来。
+        keep_brand = [d for d in dead
+                      if d not in icp_set and (root_domain(d) or d) in own_known]
+        keep = keep_icp + keep_brand
+        dead = [d for d in dead if d not in keep]
         cand_list = live + keep
         if dead:
             notes.append(f"{len(dead)} 个候选域无解析已剔除：{'、'.join(dead[:4])}")
-        if keep:
-            notes.append(f"{len(keep)} 个候选域当前无解析但备案在目标名下，已保留取证："
-                         f"{'、'.join(keep[:4])}")
+        if keep_icp:
+            notes.append(f"{len(keep_icp)} 个候选域当前无解析但备案在目标名下，已保留取证："
+                         f"{'、'.join(keep_icp[:4])}")
+        if keep_brand:
+            notes.append(f"{len(keep_brand)} 个候选域当前无解析但属品牌已知主域，已保留取证"
+                         f"（站点可能只挂在子域上）：{'、'.join(keep_brand[:4])}")
         if guessed:
             survived = [d for d in cand_list if d in {root_domain(g) or g for g in guessed}]
             if not survived:

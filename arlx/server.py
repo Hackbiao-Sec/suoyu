@@ -464,7 +464,9 @@ def _decorate_tasks(items: list[dict]) -> list[dict]:
             "modules": {k: int(v or 0) for k, v in (bk.get("modules") or {}).items() if v},
         }
         options = t.get("options") or {}
-        only = options.get("only_stages") or []
+        # 显式 only_stages 优先，其次按一键收集勾的 steps 折算：没勾的段才算跳过，
+        # 不能把「没跑」和执行完的空结果一起写成无产出。
+        only = modules_mod.stages_of_options(options)
         # 只回真实阶段键：历史任务里存过认不出的键，直接回给前端会在卡片上
         # 显示一个并不存在的「已选阶段」，和实际跑过的阶段对不上。
         t["selected_stages"] = [str(s) for s in only if str(s) in modules_mod.STAGE_ORDER]

@@ -805,13 +805,30 @@ class TaskRunner(StagesMixin):
         self.log("task", "等待后台股权穿透收口（延时照旧；域名 / 端口 / 网页已先出）")
         started = time.time()
         minutes = 0
+
+        def _waiting_msg(extra: str = "") -> str:
+            # 这一段能等几十分钟，只写日志不改 message，界面上就是「88% + 一句旧提示」
+            # 定住不动，看着像卡死。每分钟把已等时长 / 已并进域数写回任务，进度条不动
+            # 但文案在走，人知道是在等穿透而不是挂了。
+            base = (f"等待后台股权穿透收口（已等 {minutes} 分钟，已并进 "
+                    f"{len(self.domains)} 个域）；其余阶段已完成，穿完自动收尾")
+            return base + extra
+
+        try:
+            store.update_task(self.task_id, message=_waiting_msg())
+        except Exception:
+            pass
         while not task.done():
             await asyncio.wait({task}, timeout=60)
             if task.done():
                 break
             minutes += 1
-            self.log("equity", f"股权穿透仍在后台穿子公司（约 {minutes} 分钟），"
-                               f"当前已并进 {len(self.domains)} 个域")
+            msg = _waiting_msg()
+            self.log("equity", msg)
+            try:
+                store.update_task(self.task_id, message=msg)
+            except Exception:
+                pass
             if wait_cap > 0 and time.time() - started >= wait_cap:
                 # 到点截断必须说清是被「等时上限」砍的，而不是渠道耗尽或这家没子公司，
                 # 否则下一次看到的只是「股权穿透比上次少」，排查方向全错。
