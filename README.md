@@ -1,8 +1,9 @@
-# ARL-X · 资产侦察灯塔（增强二次开发版）
+# 天鉴 · 索舆（ARL-X 资产侦察灯塔 · 增强二次开发版）
+
+> 天鉴系列之一，与 [天鉴 · 探微](https://github.com/Hackbiao-Sec/tanwei) 各自成库。仅限授权测试。
 
 基于 **ARL 2.6.2（TophantTechnology/ARL，仓库已下架，基线取 Aabyss-Team/ARL）** 的源码与字典做的
-单进程、跨平台（Windows / Linux / macOS）重写增强版，融合了
-`D:\03-AI工具\09-Trae\Trae_projects\03-Yiso\tianjian\suoyu\`（天鉴·索舆）的**企业主体信息收集思路**，
+单进程、跨平台（Windows / Linux / macOS）重写增强版，沿用天鉴·索舆前身的**企业主体信息收集思路**，
 并把 ARL 原本依赖的 Celery / RabbitMQ / MongoDB / massdns / phantomjs 全部去掉。
 
 ## 一、和 ARL 原版的差异
@@ -14,7 +15,7 @@
 | Web 框架 | Flask + flask-restx | FastAPI（异步，SSE 实时日志） |
 | DNS | massdns（Linux 二进制） | 自研 UDP 长连接异步 DNS（实测 ≈350 QPS，1.97 万子域 56 秒） |
 | 子域来源 | 十几个 | **26 个**（CT 三镜像 / certspotter / myssl / rapiddns / urlscan / anubis / riddler / 搜索引擎 / GitHub / RDAP / ICP 备案 + FOFA/Hunter/Quake/0zone/Shodan/Censys/…） |
-| 企业主体 | 无 | **ICP 备案 / 别名 / 新媒体 / AI 扩展**（对齐 suoyu 项目 P1） |
+| 企业主体 | 无 | **ICP 备案 / 别名 / 新媒体 / AI 扩展**（对齐原索舆项目 P1） |
 | 深度阶段 | 无 | 代码泄露（Sourcegraph/grep.app/GitHub/Bing）、邮箱、MX/SPF/DMARC、Git 泄露、截图、nuclei |
 | 敏感文件 | 固定规则 | 加**软 404 基线剔除**（随机路径取基线，前缀/尾部/长度相似即判废） |
 | 调度 | 无内置 | 内置周期任务（小时级）+ 任务模板 |
@@ -24,7 +25,7 @@
 ## 二、目录
 
 ```
-arl-x/
+suoyu/
 ├── arlx/
 │   ├── config.py            配置中心（yaml + 环境变量覆盖 + 热重载）
 │   ├── db.py                SQLite（WAL）：tasks/logs/assets/task_assets/users/schedules/templates/audit
@@ -51,7 +52,8 @@ arl-x/
 ## 三、安装与启动
 
 ```powershell
-cd D:\03-AI工具\ARL_recon\arl-x
+git clone https://github.com/Hackbiao-Sec/suoyu.git
+cd suoyu
 pip install -r requirements.txt
 python -m arlx
 ```
