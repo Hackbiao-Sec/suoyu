@@ -90,6 +90,9 @@ if __name__ == "__main__":
     sys.argv = [sys.argv[0], "-m", "arlx"]
     _install_crash_log()
     stamp = getattr(sys, "_crash_stamp", lambda _t: None)
+    # 放在保护块里 import：导入期的异常也能落 crash.log，打包分析也认得到 arlx 包
+    from arlx.server import main
+
     try:
         main()
         stamp("engine stopped normally")
