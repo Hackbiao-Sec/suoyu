@@ -61,6 +61,11 @@ _RATIO_SQL = "MAX(" + ", ".join(
     f"COALESCE(CAST(REPLACE(json_extract({_RATIO_JSON}, '$.{k}'), '%', '') AS REAL), 0)"
     for k in _RATIO_KEYS) + ")"
 
+# nuclei 命中行的 extra_json 由 deep.run_nuclei 写入：模板 id / 名称 / 等级 / 命中地址
+_VULN_SEV = f"LOWER(COALESCE(json_extract({_RATIO_JSON}, '$.severity'), 'unknown'))"
+_VULN_TPL = f"COALESCE(json_extract({_RATIO_JSON}, '$.template'), '')"
+_VULN_NAME = f"COALESCE(json_extract({_RATIO_JSON}, '$.name'), '')"
+
 
 # 脆弱资产分桶：命中即从全量里单独拉出来看，键值同时作为前端筛选参数
 RISK_RULES: tuple[tuple[str, str, str], ...] = (
@@ -1387,6 +1392,78 @@ class Store:
             " GROUP BY t.id HAVING risky > 0"
             " ORDER BY risky DESC, t.updated_at DESC LIMIT ?", (int(limit),)).fetchall()
         return [dict(r) for r in rows]
+
+    # ─────── nuclei 风险漏洞（kind='nuclei' 的命中行）───────
+    def _vuln_where(self, filters: dict, *, with_severity: bool = True) -> tuple[list[str], list[Any]]:
+        where = ["kind='nuclei'"]
+        vals: list[Any] = []
+        sev = str(filters.get("severity") or "").strip().lower()
+        if with_severity and sev and sev != "all":
+            where.append(f"{_VULN_SEV}=?")
+            vals.append(sev)
+        for k in ("host", "root_domain"):
+            if filters.get(k):
+                where.append(f"{k}=?")
+                vals.append(filters[k])
+        if filters.get("task_id"):
+            where.append("id IN (SELECT asset_id FROM task_assets WHERE task_id=?)")
+            vals.append(filters["task_id"])
+        if filters.get("template"):
+            where.append(f"{_VULN_TPL}=?")
+            vals.append(str(filters["template"]))
+        if filters.get("keyword"):
+            kw = f"%{filters['keyword']}%"
+            where.append(f"({_VULN_TPL} LIKE ? OR {_VULN_NAME} LIKE ? OR url LIKE ? OR host LIKE ?)")
+            vals.extend([kw, kw, kw, kw])
+        return where, vals
+
+    def query_vulns(self, **filters: Any) -> list[dict]:
+        """风险漏洞列表：一条 nuclei 命中一行，等级/模板从 extra_json 里取出来。"""
+        where, vals = self._vuln_where(filters)
+        order = "CASE " + " ".join(
+            f"WHEN {_VULN_SEV}='{s}' THEN {i}" for i, s in
+            enumerate(("critical", "high", "medium", "low", "info", "unknown"))) + " ELSE 9 END"
+        if str(filters.get("order") or "") != "severity":
+            order = "last_seen DESC"
+        sql = ("SELECT id, url, host, port, title, status_code, root_domain,"
+               f" COALESCE(json_extract(extra_json, '$.matched'), url) matched,"
+               f" {_VULN_SEV} severity, {_VULN_TPL} template, {_VULN_NAME} name,"
+               " first_seen, last_seen, extra_json FROM assets"
+               f" WHERE {' AND '.join(where)} ORDER BY {order}, id DESC LIMIT ? OFFSET ?")
+        vals = vals + [int(filters.get("limit", 100)), int(filters.get("offset", 0))]
+        rows = [dict(r) for r in self.conn().execute(sql, vals).fetchall()]
+        for r in rows:
+            try:
+                r["extra"] = json.loads(r.pop("extra_json") or "{}")
+            except Exception:
+                r["extra"] = {}
+        return rows
+
+    def count_vulns(self, **filters: Any) -> int:
+        where, vals = self._vuln_where(filters)
+        return int(self.conn().execute(
+            f"SELECT COUNT(*) FROM assets WHERE {' AND '.join(where)}", vals).fetchone()[0])
+
+    def vuln_stats(self, **filters: Any) -> dict[str, Any]:
+        """等级分桶 + 模板/主机计数；分桶不受等级筛选影响，点某个桶才看得见其它桶。"""
+        where, vals = self._vuln_where(filters, with_severity=False)
+        base = " FROM assets WHERE " + " AND ".join(where)
+        rows = self.conn().execute(
+            f"SELECT {_VULN_SEV} sev, COUNT(*) n{base} GROUP BY sev", vals).fetchall()
+        order = ("critical", "high", "medium", "low", "info", "unknown")
+        hit = {str(r["sev"] or "unknown"): int(r["n"]) for r in rows}
+        buckets = [{"key": s, "label": s, "count": hit.get(s, 0)} for s in order]
+        for s, n in hit.items():
+            if s not in order:
+                buckets.append({"key": s, "label": s, "count": n})
+        tpl = [{"value": r["t"], "count": int(r["n"])} for r in self.conn().execute(
+            f"SELECT {_VULN_TPL} t, COUNT(*) n{base} AND {_VULN_TPL}!=''"
+            f" GROUP BY t ORDER BY n DESC LIMIT 50", vals)]
+        roots = [{"value": r["root_domain"], "count": int(r["n"])} for r in self.conn().execute(
+            f"SELECT root_domain, COUNT(*) n{base}"
+            " AND root_domain IS NOT NULL AND root_domain!=''"
+            " GROUP BY root_domain ORDER BY n DESC LIMIT 40", vals)]
+        return {"total": sum(hit.values()), "buckets": buckets, "templates": tpl, "roots": roots}
 
     def facets(self, task_id: str = "", stage: str = "") -> dict[str, Any]:
         """资产搜索左侧分面；给任务 ID 时分面只统计该任务的资产"""

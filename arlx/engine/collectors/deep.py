@@ -279,9 +279,17 @@ async def screenshot(url: str, out_dir) -> str:
 
 async def run_nuclei(urls: list[str], severity: str = "critical,high") -> list[dict]:
     exe = config.get("deep", "nuclei_path") or "nuclei"
+    # POC 管理里导入的模板：目录里有 yaml 就用 -t 指过去，用户存完立刻能扫
+    args = [exe, "-silent", "-jsonl", "-severity", severity, "-no-color"]
+    try:
+        from ..pocs import scan_dirs
+        for d in scan_dirs():
+            args += ["-t", d]
+    except Exception:
+        pass
     try:
         proc = await asyncio.create_subprocess_exec(
-            exe, "-silent", "-jsonl", "-severity", severity, "-no-color",
+            *args,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
             stdin=asyncio.subprocess.PIPE)
         payload = "\n".join(urls).encode()

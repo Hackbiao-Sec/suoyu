@@ -100,9 +100,18 @@ export const listFingerprints = (params) => http.get('/api/fingerprints', { para
 export const addFingerprint = (payload) => http.post('/api/fingerprints', payload)
 export const deleteFingerprint = (name) => http.delete(`/api/fingerprints/${encodeURIComponent(name)}`)
 export const verifyFingerprint = (payload) => http.post('/api/fingerprints/verify', payload)
-export const listTemplates = () => http.get('/api/templates')
-export const saveTemplate = (payload) => http.post('/api/templates', payload)
-export const deleteTemplate = (name) => http.delete(`/api/templates/${encodeURIComponent(name)}`)
+
+// ── nuclei POC 模板库 ────────────────────────────
+// 模板落在 data/pocs，nuclei 扫描时用 -t 指过去；存完立刻能扫
+export const listPocs = () => http.get('/api/pocs')
+export const readPoc = (name) => http.get(`/api/pocs/${encodeURIComponent(name)}`)
+export const savePoc = (payload) => http.post('/api/pocs', payload)
+export const importPocs = (payload) => http.post('/api/pocs/import', payload)
+export const deletePoc = (name) => http.delete(`/api/pocs/${encodeURIComponent(name)}`)
+
+// ── 风险漏洞（nuclei 命中） ───────────────────────
+export const listVulns = (params) => http.get('/api/vulns', { params })
+export const vulnStats = (params) => http.get('/api/vulns/stats', { params })
 
 // ── 字典管理 ──────────────────────────────────────
 // 内置字典只读；用户在界面上改过的写进 data/dicts 覆盖同名内置文件

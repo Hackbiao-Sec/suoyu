@@ -48,14 +48,7 @@ from .names import core_same
 
 # 本机可用的外部工具（存在即启用，缺失自动跳过；核心链路不依赖其中任何一个）
 TOOL_PATHS = {
-    "oneforall": ["oneforall", "oneforall.exe"],
-    "ehole": ["ehole", "ehole.exe", "EHole"],
     "nuclei": ["nuclei", "nuclei.exe"],
-    "httpx": ["httpx", "httpx.exe"],
-    "ffuf": ["ffuf", "ffuf.exe"],
-    "nmap": ["nmap", "nmap.exe"],
-    "jadx": ["jadx", "jadx.bat", "jadx.exe"],
-    "apktool": ["apktool", "apktool.bat"],
 }
 
 # 证据权重（改这里就能调松紧，不用动判定逻辑）

@@ -67,7 +67,6 @@ const notify = reactive({ webhook: '', dingtalk: '', feishu: '', wecom: '', on_t
 const proxy = reactive({ url: '', sources_via_proxy: false, scan_via_proxy: false })
 const server = reactive({ host: '0.0.0.0', port: 5113, auth: true, api_key: '' })
 const deep = reactive({ ai_search: false, ai_triage: true })
-const mobile = reactive({ deep: true, jadx: false, apktool: false })
 const ai = reactive({ engine: '', timeout: 90, temperature: 0.2, models: [] })
 const bulkRelay = ref('')
 const relayPicks = ref(['fofa'])
@@ -599,7 +598,6 @@ async function load() {
     Object.assign(proxy, cfg.proxy || {})
     Object.assign(server, cfg.server || {})
     Object.assign(deep, cfg.deep || {})
-    Object.assign(mobile, cfg.mobile || {})
     Object.assign(ai, cfg.ai || {})
     loadPool()
   } finally {
@@ -665,7 +663,6 @@ async function save() {
       sources: { ...sources, ...credPatch },
       ai: { ...ai },
       deep: { ...deep },
-      mobile: { ...mobile },
       notification: { ...notify },
       proxy: { ...proxy },
       server: { ...server },
@@ -1445,32 +1442,6 @@ onMounted(() => {
             装到本程序自带目录 <span class="mono">{{ toolsDir || 'tools' }}</span>，不写系统 PATH、不装服务，删目录即卸载。
             下载走配置里的代理（当前{{ proxy.url ? '已配置 ' + proxy.url : '未配置，直连 GitHub 可能超时' }}）。
             内置探测不依赖这些工具，装了只是补充；装不上也不影响主流程。
-          </span>
-        </div>
-      </div>
-
-      <div class="panel">
-        <div class="panel-head">
-          <span><Icon name="layers" :size="13" />包体分析（APK / IPA）</span>
-        </div>
-        <div class="panel-body stack" style="gap: 8px">
-          <label class="opt">
-            <input type="checkbox" v-model="mobile.deep" />
-            <span>深度静态分析</span>
-            <span class="field-hint">解清单树、权限、导出组件、深链、dex 字符串池、接口与凭据。关闭后只看包名和文件清单。</span>
-          </label>
-          <label class="opt">
-            <input type="checkbox" v-model="mobile.jadx" :disabled="!mobile.deep" />
-            <span>附加源码反编译（jadx）</span>
-            <span class="field-hint">把 dex 还原成 java 再扫一遍，接口和硬编码串更全；单个包耗时数十秒到数分钟。需先装好下方 jadx。</span>
-          </label>
-          <label class="opt">
-            <input type="checkbox" v-model="mobile.apktool" :disabled="!mobile.deep" />
-            <span>附加资源解包（apktool）</span>
-            <span class="field-hint">解出 res/ 下的字符串表与 xml，补清单里看不到的域名和接口。需先装好下方 apktool。</span>
-          </label>
-          <span class="field-hint">
-            三项默认只开第一项：内置解析不依赖外部工具，装了 jadx / apktool 也只是加覆盖率，装不上会自动退回内置结果。
           </span>
         </div>
       </div>

@@ -422,6 +422,76 @@ def dicts_bind(request: Request, name: str, body: dict = Body(...)) -> dict:
     return {"ok": True, **out}
 
 
+# ─────────────── nuclei POC 模板库 ───────────────
+@app.get("/api/pocs")
+def pocs_index(request: Request) -> dict:
+    """POC 管理：DATA_DIR/pocs 下的 nuclei 模板，nuclei 扫描时用 -t 指过去"""
+    current_user(request)
+    from .engine import pocs as pocs_mod
+
+    items = pocs_mod.list_pocs()
+    sev: dict[str, int] = {}
+    for it in items:
+        k = str(it.get("severity") or "unknown")
+        sev[k] = sev.get(k, 0) + 1
+    return {"ok": True, "dir": str(pocs_mod.pocs_dir()), "items": items,
+            "total": len(items), "severity": sev,
+            "scan_dirs": pocs_mod.scan_dirs()}
+
+
+@app.get("/api/pocs/{name}")
+def pocs_read(request: Request, name: str) -> dict:
+    current_user(request)
+    from .engine import pocs as pocs_mod
+
+    try:
+        return {"ok": True, **pocs_mod.read_poc(name)}
+    except FileNotFoundError:
+        raise HTTPException(404, "模板不存在")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/pocs")
+def pocs_save(request: Request, body: dict = Body(...)) -> dict:
+    """保存模板：先按 nuclei 的模板结构校验，过不了直接拒，避免存进去扫不了。"""
+    user = current_user(request)
+    from .engine import pocs as pocs_mod
+
+    try:
+        out = pocs_mod.save_poc(str(body.get("name") or ""), str(body.get("content") or ""))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    audit("pocs.save", out["name"], f"模板 {out.get('id', '')}", user)
+    return {"ok": True, **out}
+
+
+@app.post("/api/pocs/import")
+def pocs_import(request: Request, body: dict = Body(...)) -> dict:
+    """批量导入：粘贴多份模板，按 --- 拆开、各自按 id 命名"""
+    user = current_user(request)
+    from .engine import pocs as pocs_mod
+
+    out = pocs_mod.import_many(str(body.get("content") or ""))
+    audit("pocs.import", "batch", f"成功 {out['count']}，失败 {len(out['failed'])}", user)
+    return {"ok": True, **out}
+
+
+@app.delete("/api/pocs/{name}")
+def pocs_delete(request: Request, name: str) -> dict:
+    user = current_user(request)
+    from .engine import pocs as pocs_mod
+
+    try:
+        out = pocs_mod.delete_poc(name)
+    except FileNotFoundError:
+        raise HTTPException(404, "模板不存在")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    audit("pocs.delete", name, "", user)
+    return {"ok": True, **out}
+
+
 # ─────────────── 任务 ───────────────
 @app.post("/api/tasks")
 async def create_task(request: Request, body: dict = Body(...)) -> dict:
@@ -783,6 +853,28 @@ def risk_view(request: Request, task_id: str = "", limit: int = 12) -> dict:
     return {"ok": True, "task_id": task_id, "rules": [k for k, _l, _c in RISK_RULES],
             "labels": {k: label for k, label, _c in RISK_RULES},
             **store.risk_overview(task_id=task_id, limit=min(int(limit), 100))}
+
+
+@app.get("/api/vulns")
+def vulns_list(request: Request, severity: str = "", template: str = "", host: str = "",
+               root_domain: str = "", task_id: str = "", keyword: str = "",
+               order: str = "time", limit: int = 100, offset: int = 0) -> dict:
+    """风险漏洞：nuclei 扫出来的命中结果，一条一行"""
+    current_user(request)
+    filters = dict(severity=severity, template=template, host=host, root_domain=root_domain,
+                   task_id=task_id, keyword=keyword, order=order,
+                   limit=max(1, min(int(limit), 500)), offset=max(0, int(offset)))
+    return {"ok": True, "items": store.query_vulns(**filters),
+            "total": store.count_vulns(**filters)}
+
+
+@app.get("/api/vulns/stats")
+def vulns_stats(request: Request, host: str = "", root_domain: str = "",
+                task_id: str = "", keyword: str = "") -> dict:
+    """等级分桶 + 模板分布，风险漏洞页的统计卡与筛选用"""
+    current_user(request)
+    return {"ok": True, **store.vuln_stats(host=host, root_domain=root_domain,
+                                           task_id=task_id, keyword=keyword)}
 
 
 @app.get("/api/risk/by-task")

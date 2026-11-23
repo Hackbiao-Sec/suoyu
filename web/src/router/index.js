@@ -12,7 +12,7 @@ export const NAV = [
       { path: '/ops', name: 'Ops', title: '功能自检', icon: 'flow', desc: '每一项能力单独跑一次' },
       { path: '/assets', name: 'Assets', title: '资产搜索', icon: 'search', desc: '全量资产检索' },
       { path: '/risk', name: 'Risk', title: '脆弱资产', icon: 'shield', desc: '整体预览与按任务分隔' },
-      { path: '/mobile', name: 'MobileRecon', title: '移动端', icon: 'globe', desc: '小程序 / App 测绘' },
+      { path: '/vulns', name: 'Vulns', title: '风险漏洞', icon: 'alert', desc: 'nuclei 扫描出的漏洞结果' },
     ],
   },
   {
@@ -52,7 +52,7 @@ const routes = [
       { path: '/ops', name: 'Ops', component: () => import('@/views/Ops.vue'), meta: { title: '功能自检', ownActions: true } },
       { path: '/assets', name: 'Assets', component: () => import('@/views/Assets.vue'), meta: { title: '资产搜索', ownActions: true } },
       { path: '/risk', name: 'Risk', component: () => import('@/views/Risk.vue'), meta: { title: '脆弱资产' } },
-      { path: '/mobile', name: 'MobileRecon', component: () => import('@/views/MobileRecon.vue'), meta: { title: '移动端测绘', ownActions: true } },
+      { path: '/vulns', name: 'Vulns', component: () => import('@/views/Vulns.vue'), meta: { title: '风险漏洞', ownActions: true } },
       { path: '/schedules', name: 'Schedules', component: () => import('@/views/Schedules.vue'), meta: { title: '计划与调度' } },
       { path: '/github', name: 'Github', component: () => import('@/views/GithubMonitor.vue'), meta: { title: 'GitHub 监控' } },
       { path: '/ai', name: 'AiWorkshop', component: () => import('@/views/AiWorkshop.vue'), meta: { title: 'AI 工坊' } },

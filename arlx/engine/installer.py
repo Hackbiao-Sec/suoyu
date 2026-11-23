@@ -75,106 +75,7 @@ CATALOG: dict[str, dict] = {
             "install_to": "解压出的 nuclei.exe 放到本程序目录下的 tools\\nuclei\\ 里",
         },
     },
-    "httpx": {
-        "label": "httpx",
-        "desc": "HTTP 存活与指纹批量探测，比内置探测更快",
-        "kind": "zip",
-        "bin": "httpx.exe",
-        "sources": [
-            ("github", "https://github.com/projectdiscovery/httpx/releases/latest/download/httpx_{ver}_windows_amd64.zip"),
-            ("gitee", "https://gitee.com/mirrors/httpx/releases/download/v{ver}/httpx_{ver}_windows_amd64.zip"),
-        ],
-        "versions": ["1.7.1", "1.6.10", "1.6.9"],
-        "manual": {
-            "download": "https://github.com/projectdiscovery/httpx/releases",
-            "pick": "选 httpx_<版本>_windows_amd64.zip",
-            "install_to": "解压出的 httpx.exe 放到本程序目录下的 tools\\httpx\\ 里",
-        },
-    },
-    "ffuf": {
-        "label": "ffuf",
-        "desc": "高速目录与参数模糊测试",
-        "kind": "zip",
-        "bin": "ffuf.exe",
-        "sources": [
-            ("github", "https://github.com/ffuf/ffuf/releases/latest/download/ffuf_{ver}_windows_amd64.zip"),
-            ("gitee", "https://gitee.com/mirrors/ffuf/releases/download/v{ver}/ffuf_{ver}_windows_amd64.zip"),
-        ],
-        "versions": ["2.1.0"],
-        "manual": {
-            "download": "https://github.com/ffuf/ffuf/releases",
-            "pick": "选 ffuf_<版本>_windows_amd64.zip",
-            "install_to": "解压出的 ffuf.exe 放到本程序目录下的 tools\\ffuf\\ 里",
-        },
-    },
-    "ehole": {
-        "label": "EHole",
-        "desc": "红队指纹识别",
-        "kind": "zip",
-        "bin": "EHole_windows_amd64.exe",
-        "sources": [
-            ("github", "https://github.com/EdgeSecurityTeam/EHole/releases/latest/download/EHole_windows_amd64.zip"),
-        ],
-        "versions": ["3.1"],
-        "manual": {
-            "download": "https://github.com/EdgeSecurityTeam/EHole/releases",
-            "pick": "选 EHole_windows_amd64.zip",
-            "install_to": "解压后的整个目录放到本程序目录下的 tools\\ehole\\ 里",
-        },
-    },
-    "jadx": {
-        "label": "jadx",
-        "desc": "APK 反编译成 Java 源码，用来从安卓包里抽接口与密钥",
-        "kind": "zip",
-        "bin": "bin\\jadx.bat",
-        "needs": "java",
-        "sources": [
-            ("github", "https://github.com/skylot/jadx/releases/latest/download/jadx-{ver}.zip"),
-            ("maven", "https://repo1.maven.org/maven2/io/github/skylot/jadx-cli/{ver}/jadx-cli-{ver}.zip"),
-            ("maven", "https://maven.aliyun.com/repository/central/io/github/skylot/jadx-cli/{ver}/jadx-cli-{ver}.zip"),
-        ],
-        "versions": ["1.5.1", "1.5.0"],
-        "manual": {
-            "download": "https://github.com/skylot/jadx/releases",
-            "pick": "选 jadx-<版本>.zip",
-            "install_to": "解压后的整个目录放到本程序目录下的 tools\\jadx\\ 里",
-        },
-    },
-    "apktool": {
-        "label": "apktool",
-        "desc": "APK 资源与清单解包；拿 AndroidManifest 与资源里的域名",
-        "kind": "jar",
-        "bin": "apktool.bat",
-        "needs": "java",
-        "wrapper": True,
-        "sources": [
-            ("github", "https://github.com/iBotPeaches/Apktool/releases/latest/download/apktool_{ver}.jar"),
-            ("maven", "https://repo1.maven.org/maven2/org/apktool/apktool/{ver}/apktool-{ver}.jar"),
-            ("maven", "https://maven.aliyun.com/repository/central/org/apktool/apktool/{ver}/apktool-{ver}.jar"),
-        ],
-        "versions": ["2.11.1", "2.10.0"],
-        "manual": {
-            "download": "https://github.com/iBotPeaches/Apktool/releases",
-            "pick": "选 apktool_<版本>.jar",
-            "install_to": "改名为 apktool.jar 放到本程序目录下的 tools\\apktool\\ 里（需要本机有 Java 运行环境）",
-        },
-    },
-    "dirsearch": {
-        "label": "dirsearch",
-        "desc": "目录与文件爆破，补内置字典之外的隐藏入口",
-        "kind": "zip",
-        "bin": "dirsearch\\dirsearch.py",
-        "sources": [("pypi", "dirsearch")],
-        "versions": [],
-        "entry": "dirsearch",
-        "manual": {
-            "download": "https://pypi.tuna.tsinghua.edu.cn/simple/dirsearch/",
-            "pick": "下载页面里后缀为 .tar.gz 的源码包",
-            "install_to": "解压后的目录改名成 dirsearch，放到本程序目录下的 tools\\dirsearch\\ 里",
-        },
-    },
 }
-
 
 _LAST: dict[str, dict] = {}
 
@@ -289,7 +190,7 @@ def status(name: str) -> dict:
         "system_installed": bool(system_path),
         "last": _LAST.get(name) or {},
     })
-    if (path or system_path) and name in ("nuclei", "httpx", "ffuf"):
+    if (path or system_path) and name in ("nuclei",):
         try:
             r = _run_bin(path or system_path, "-version")
             text = ((r.stdout or b"") + (r.stderr or b"")).decode("utf-8", "ignore")
