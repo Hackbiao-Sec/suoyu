@@ -124,7 +124,8 @@ def read_poc(name: str) -> dict:
 
 def save_poc(name: str, content: str) -> dict:
     n = normalize_name(name)
-    text = (content or "").replace("\r\n", "\n").strip() + "\n"
+    # Windows 记事本 / 部分仓库导出的 YAML 带 BOM，nuclei 和 PyYAML 都不认，直接吃掉
+    text = (content or "").replace("\r\n", "\n").lstrip("\ufeff").strip() + "\n"
     meta, err = _meta(text)
     if err:
         raise ValueError(err)
@@ -146,7 +147,7 @@ def delete_poc(name: str) -> dict:
 def split_docs(text: str) -> list[str]:
     """多文档合并粘贴：按 ``---`` 分隔行拆成单条模板。"""
     chunks = re.split(r"(?m)^---[ \t]*$", (text or "").replace("\r\n", "\n"))
-    return [c.strip() for c in chunks if c.strip()]
+    return [c.strip().lstrip("\ufeff").strip() for c in chunks if c.strip()]
 
 
 def import_many(text: str) -> dict:
@@ -162,6 +163,74 @@ def import_many(text: str) -> dict:
             saved.append(save_poc(name + ".yaml", chunk))
         except ValueError as e:
             failed.append({"error": str(e), "head": meta.get("id", "")})
+    return {"saved": saved, "failed": failed, "count": len(saved)}
+
+
+MAX_FILE_BYTES = 1024 * 1024
+
+
+def _file_basename(name: str) -> str:
+    return (name or "").replace("\\", "/").split("/")[-1].strip()
+
+
+def _save_doc(chunk: str, preferred: str, origin: str, saved: list, failed: list) -> None:
+    """单条 doc 入库：优先用用户选的文件名，文件名不合法再退回模板 id。"""
+    meta, err = _meta(chunk)
+    if err:
+        failed.append({"file": origin, "error": err,
+                       "head": (chunk.splitlines() or [""])[0][:80]})
+        return
+    id_name = (re.sub(r"[^A-Za-z0-9_.\-]+", "-", meta["id"]).strip("-") or "poc") + ".yaml"
+    names = []
+    if preferred:
+        try:
+            names.append(normalize_name(preferred))
+        except ValueError:
+            pass
+    if id_name not in names:
+        names.append(id_name)
+    last = ""
+    for n in names:
+        try:
+            existed = (pocs_dir() / n).exists()
+            saved.append({"file": origin, "overwritten": existed, **save_poc(n, chunk)})
+            return
+        except ValueError as e:
+            last = str(e)
+    failed.append({"file": origin, "error": last or "保存失败", "head": meta.get("id", "")})
+
+
+def import_files(files: list[dict]) -> tuple[list, list]:
+    """按文件导入：每个文件可能含多份模板，文件名优先，失败只记那一条。"""
+    saved: list = []
+    failed: list = []
+    for item in files or []:
+        if not isinstance(item, dict):
+            continue
+        origin = _file_basename(str(item.get("name") or ""))
+        text = str(item.get("content") or "")
+        if len(text.encode("utf-8", "ignore")) > MAX_FILE_BYTES:
+            failed.append({"file": origin, "error": "文件超过 1 MB，跳过"})
+            continue
+        docs = split_docs(text)
+        if not docs:
+            failed.append({"file": origin, "error": "文件里没有模板内容"})
+            continue
+        preferred = origin if len(docs) == 1 else ""
+        for chunk in docs:
+            _save_doc(chunk, preferred, origin, saved, failed)
+    return saved, failed
+
+
+def import_batch(text: str, files: list[dict] | None = None) -> dict:
+    """批量入口：文件在前、粘贴在后，两种来源合并成同一份结果。"""
+    saved, failed = import_files(files or [])
+    if (text or "").strip():
+        out = import_many(text)
+        for s in out["saved"]:
+            saved.append({"file": "", "overwritten": False, **s})
+        for f in out["failed"]:
+            failed.append({"file": "粘贴内容", **f})
     return {"saved": saved, "failed": failed, "count": len(saved)}
 
 

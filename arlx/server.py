@@ -468,11 +468,14 @@ def pocs_save(request: Request, body: dict = Body(...)) -> dict:
 
 @app.post("/api/pocs/import")
 def pocs_import(request: Request, body: dict = Body(...)) -> dict:
-    """批量导入：粘贴多份模板，按 --- 拆开、各自按 id 命名"""
+    """批量导入：选好的多个文件（文件名优先）+ 可选粘贴文本，失败的单条跳过"""
     user = current_user(request)
     from .engine import pocs as pocs_mod
 
-    out = pocs_mod.import_many(str(body.get("content") or ""))
+    files = body.get("files")
+    if not isinstance(files, list):
+        files = []
+    out = pocs_mod.import_batch(str(body.get("content") or ""), files)
     audit("pocs.import", "batch", f"成功 {out['count']}，失败 {len(out['failed'])}", user)
     return {"ok": True, **out}
 
