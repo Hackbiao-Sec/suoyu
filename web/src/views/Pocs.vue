@@ -15,10 +15,16 @@ const keyword = ref('')
 const sevFilter = ref('')
 
 const editor = ref({ open: false, name: '', text: '', creating: true, busy: false })
-const importer = ref({ open: false, text: '', files: [], skipped: [], busy: false, result: null, dropActive: false })
+const importer = ref({
+  open: false, text: '', files: [], skipped: [], busy: false, reading: false,
+  progress: null, result: null, dropActive: false,
+})
 const fileInput = ref(null)
-const MAX_FILES = 200
 const MAX_BYTES = 1024 * 1024
+// 一次请求带多少文件/字节；超过就接着发下一批，导入数量本身不设上限
+const CHUNK_FILES = 50
+const CHUNK_BYTES = 4 * 1024 * 1024
+const READ_WORKERS = 8
 
 const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low', 'info', 'unknown']
 const SEVERITY_LABEL = {
@@ -138,11 +144,14 @@ async function remove(it) {
 }
 
 function openImport() {
-  importer.value = { open: true, text: '', files: [], skipped: [], busy: false, result: null, dropActive: false }
+  importer.value = {
+    open: true, text: '', files: [], skipped: [], busy: false, reading: false,
+    progress: null, result: null, dropActive: false,
+  }
 }
 
 function pickFiles() {
-  if (importer.value.busy) return
+  if (importer.value.busy || importer.value.reading) return
   fileInput.value?.click()
 }
 
@@ -153,66 +162,157 @@ function onPick(ev) {
 
 function onDrop(ev) {
   importer.value.dropActive = false
+  if (importer.value.busy || importer.value.reading) return
   addFiles(ev.dataTransfer?.files)
+}
+
+function readText(file) {
+  if (typeof file.text === 'function') return file.text()
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader()
+    fr.onload = () => resolve(String(fr.result || ''))
+    fr.onerror = () => reject(fr.error || new Error('读取失败'))
+    fr.readAsText(file)
+  })
 }
 
 async function addFiles(list) {
   const incoming = Array.from(list || [])
   if (!incoming.length) return
   const skipped = [...importer.value.skipped]
-  const added = []
+  const seen = new Set(importer.value.files.map((x) => x.name))
+  const picked = []
   for (const f of incoming) {
-    if (!/\.ya?ml$/i.test(f.name)) {
-      skipped.push(`${f.name}（不是 .yaml / .yml）`)
+    if (!f.size) {
+      skipped.push({ name: f.name || '(无文件名)', why: '空文件' })
+      continue
+    }
+    if (!/\.ya?ml$/i.test(f.name || '')) {
+      skipped.push({ name: f.name || '(无文件名)', why: '不是 .yaml / .yml' })
       continue
     }
     if (f.size > MAX_BYTES) {
-      skipped.push(`${f.name}（超过 1 MB）`)
+      skipped.push({ name: f.name, why: '单个超过 1 MB' })
       continue
     }
-    if (importer.value.files.length + added.length >= MAX_FILES) {
-      skipped.push(`${f.name}（单次最多 ${MAX_FILES} 个）`)
+    if (seen.has(f.name)) {
+      skipped.push({ name: f.name, why: '同名重复，已忽略' })
       continue
     }
-    if (importer.value.files.some((x) => x.name === f.name)) continue
-    try {
-      added.push({ name: f.name, size: f.size, content: await f.text() })
-    } catch (e) {
-      skipped.push(`${f.name}（读取失败）`)
-    }
+    seen.add(f.name)
+    picked.push(f)
   }
-  importer.value.files = importer.value.files.concat(added)
+  if (picked.length) {
+    importer.value.reading = true
+    const slots = new Array(picked.length)
+    let cursor = 0
+    const workers = Array.from({ length: Math.min(READ_WORKERS, picked.length) }, async () => {
+      while (cursor < picked.length) {
+        const idx = cursor
+        cursor += 1
+        const f = picked[idx]
+        try {
+          slots[idx] = { name: f.name, size: f.size, content: await readText(f) }
+        } catch (e) {
+          skipped.push({ name: f.name, why: '读取失败' })
+        }
+      }
+    })
+    await Promise.all(workers)
+    importer.value.files = importer.value.files.concat(slots.filter(Boolean))
+    importer.value.reading = false
+  }
   importer.value.skipped = skipped
-  if (added.length) importer.value.result = null
+  if (picked.length) importer.value.result = null
 }
+
+const skipGroups = computed(() => {
+  const groups = new Map()
+  for (const s of importer.value.skipped) {
+    if (!groups.has(s.why)) groups.set(s.why, [])
+    groups.get(s.why).push(s.name)
+  }
+  return Array.from(groups, ([why, names]) => ({ why, names, count: names.length }))
+})
 
 function removeFile(i) {
   importer.value.files.splice(i, 1)
 }
 
 function clearFiles() {
+  if (importer.value.reading) return
   importer.value.files = []
   importer.value.skipped = []
 }
 
+function errText(e) {
+  const status = e?.response?.status
+  const detail = e?.response?.data?.detail
+  let msg = ''
+  if (Array.isArray(detail)) msg = detail.map((x) => x?.msg || String(x)).join('；')
+  else if (typeof detail === 'string') msg = detail
+  if (status) return `HTTP ${status}${msg ? ' · ' + msg : ''}`
+  if (e?.code === 'ECONNABORTED') return '请求超时，请重试或分批导入'
+  return e?.message || '导入失败'
+}
+
+// 文件按批上传，每批只带 CHUNK_FILES 个且不超过 CHUNK_BYTES；结果合并后一次展示
 async function doImport() {
-  const files = importer.value.files.map((f) => ({ name: f.name, content: f.content }))
   const text = (importer.value.text || '').trim()
-  if (!files.length && !text) return
+  const queue = importer.value.files.slice()
+  if (!queue.length && !text) return
+  const saved = []
+  const failed = []
+  const total = queue.length
+  let sent = 0
+  let cursor = 0
+  let pendingStart = 0
+  let firstRequest = true
   importer.value.busy = true
+  importer.value.result = null
+  importer.value.progress = total ? { done: 0, total } : null
   error.value = ''
   try {
-    const res = await importPocs({ files, content: text })
-    importer.value.result = res
-    importer.value.files = []
+    while (cursor < queue.length || firstRequest) {
+      pendingStart = cursor
+      const batch = []
+      let bytes = 0
+      while (cursor < queue.length && batch.length < CHUNK_FILES
+             && (!bytes || bytes + queue[cursor].size <= CHUNK_BYTES)) {
+        bytes += queue[cursor].size
+        batch.push(queue[cursor])
+        cursor += 1
+      }
+      const res = await importPocs({
+        files: batch.map((f) => ({ name: f.name, content: f.content })),
+        content: firstRequest ? text : '',
+      })
+      firstRequest = false
+      for (const s of res.saved || []) saved.push(s)
+      for (const f of res.failed || []) failed.push(f)
+      sent += batch.length
+      importer.value.progress = total ? { done: sent, total } : null
+    }
+    const failedNames = new Set(failed.map((f) => f.file).filter(Boolean))
+    importer.value.files = importer.value.files.filter((f) => failedNames.has(f.name))
+    const textFailed = failed.some((f) => f.file === '粘贴内容')
+    importer.value.text = textFailed ? text : ''
     importer.value.skipped = []
-    importer.value.text = ''
-    flash(`成功导入 ${res.count} 份 nuclei 模板`)
-    await load()
+    importer.value.result = { count: saved.length, saved, failed }
+    if (saved.length) {
+      flash(`成功导入 ${saved.length} 份 nuclei 模板`)
+      await load()
+    }
+    if (!saved.length && failed.length) error.value = '这一批没有导入成功，原因见下方'
   } catch (e) {
-    error.value = e?.response?.data?.detail || e.message || '导入失败'
+    // 没发出去的、以及这一批没拿到回包的，留在列表里方便重试（按文件名覆盖，重发不会重复）
+    importer.value.files = queue.slice(pendingStart)
+    importer.value.result = (saved.length || failed.length) ? { count: saved.length, saved, failed } : null
+    error.value = errText(e)
   } finally {
     importer.value.busy = false
+    importer.value.reading = false
+    importer.value.progress = null
   }
 }
 
@@ -373,13 +473,13 @@ onMounted(load)
                @drop.prevent="onDrop">
             <Icon name="upload" :size="20" />
             <div>点这里选择模板文件，或把 .yaml / .yml 拖进来</div>
-            <div class="muted" style="font-size: 10.5px">可以一次选多个；文件名会保留成模板文件名，同名则覆盖旧模板</div>
+            <div class="muted" style="font-size: 10.5px">可以一次选多个（Ctrl+A 全选也行，数量不限）；文件名会保留成模板文件名，同名则覆盖旧模板</div>
           </div>
           <input ref="fileInput" type="file" multiple accept=".yaml,.yml" style="display: none" @change="onPick" />
 
           <div v-if="importer.files.length" class="stack" style="gap: 6px">
             <div class="flex" style="align-items: center; justify-content: space-between">
-              <span class="muted" style="font-size: 11px">已选 {{ importer.files.length }} 个文件，待导入</span>
+              <span class="muted" style="font-size: 11px">已选 {{ importer.files.length }} 个文件{{ importer.reading ? '，正在读取…' : '，待导入' }}</span>
               <button class="btn xs" @click="clearFiles">清空</button>
             </div>
             <div class="file-list">
@@ -391,9 +491,11 @@ onMounted(load)
               </div>
             </div>
           </div>
-          <div v-if="importer.skipped.length" class="tag warn"
-               style="height: auto; padding: 4px 8px; white-space: normal; line-height: 1.6">
-            已跳过 {{ importer.skipped.length }} 个：{{ importer.skipped.join('；') }}
+          <div v-if="importer.skipped.length" class="tag warn skip-box">
+            <div>已跳过 {{ importer.skipped.length }} 个文件（不会提交）</div>
+            <div v-for="g in skipGroups" :key="g.why" class="skip-line">
+              {{ g.why }} × {{ g.count }}<span class="muted">：{{ g.names.slice(0, 3).join('、') }}<template v-if="g.names.length > 3"> 等</template></span>
+            </div>
           </div>
 
           <details class="paste">
@@ -406,11 +508,16 @@ onMounted(load)
           </details>
 
           <div v-if="importer.result" class="stack" style="gap: 6px">
-            <div class="tag ok" style="height: auto; padding: 4px 8px">成功导入 {{ importer.result.count }} 份</div>
+            <div class="tag ok" style="height: auto; padding: 4px 8px">
+              成功导入 {{ importer.result.count }} 份<template v-if="(importer.result.failed || []).length">，失败 {{ importer.result.failed.length }} 份（失败的文件仍留在列表里，可修好后重试）</template>
+            </div>
             <div v-for="(s, i) in (importer.result.saved || []).slice(0, 20)" :key="`s${i}`" class="tag"
                  style="height: auto; padding: 4px 8px; white-space: normal">
               {{ s.name }}<span class="muted"> · {{ s.id }}</span>
               <span v-if="s.overwritten" class="muted">（覆盖了同名旧模板）</span>
+            </div>
+            <div v-if="(importer.result.saved || []).length > 20" class="muted" style="font-size: 10.5px">
+              只列出前 20 份，完整结果已写入模板库
             </div>
             <div v-for="(f, i) in importer.result.failed" :key="`f${i}`" class="tag err"
                  style="height: auto; padding: 4px 8px; white-space: normal">
@@ -420,14 +527,19 @@ onMounted(load)
         </div>
         <div class="modal-foot">
           <span class="muted mono" style="font-size: 10.5px; margin-right: auto">
-            {{ importer.files.length ? `待导入 ${importer.files.length} 个文件`
+            {{ importer.busy
+              ? (importer.progress ? `正在导入 ${importer.progress.done}/${importer.progress.total} 个文件` : '正在导入…')
+              : importer.reading ? '正在读取所选文件…'
+              : importer.files.length ? `待导入 ${importer.files.length} 个文件${importer.skipped.length ? `，跳过 ${importer.skipped.length} 个` : ''}`
               : (importer.text.trim() ? '待导入粘贴内容' : '先选文件或粘贴内容') }}
           </span>
           <button class="btn sm" @click="importer.open = false">关闭</button>
           <button class="btn primary sm"
-                  :disabled="importer.busy || (!importer.files.length && !importer.text.trim())"
+                  :disabled="importer.busy || importer.reading || (!importer.files.length && !importer.text.trim())"
                   @click="doImport">
-            <Icon name="upload" :size="12" />{{ importer.busy ? '导入中…'
+            <Icon name="upload" :size="12" />{{ importer.busy
+              ? (importer.progress ? `导入中 ${importer.progress.done}/${importer.progress.total}` : '导入中…')
+              : importer.reading ? '读取中…'
               : (importer.files.length ? `导入 ${importer.files.length} 个文件` : '导入') }}
           </button>
         </div>
@@ -475,6 +587,18 @@ onMounted(load)
 }
 .file-row:last-child {
   border-bottom: 0;
+}
+.skip-box {
+  display: block;
+  height: auto;
+  padding: 6px 9px;
+  white-space: normal;
+  line-height: 1.6;
+  max-height: 130px;
+  overflow: auto;
+}
+.skip-line {
+  font-size: 11px;
 }
 .paste summary {
   cursor: pointer;
