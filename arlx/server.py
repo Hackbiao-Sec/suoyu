@@ -431,21 +431,25 @@ def pocs_index(request: Request) -> dict:
 
     items = pocs_mod.list_pocs()
     sev: dict[str, int] = {}
+    cats: dict[str, int] = {}
     for it in items:
         k = str(it.get("severity") or "unknown")
         sev[k] = sev.get(k, 0) + 1
+        c = str(it.get("category") or "")
+        cats[c] = cats.get(c, 0) + 1
     return {"ok": True, "dir": str(pocs_mod.pocs_dir()), "items": items,
-            "total": len(items), "severity": sev,
+            "total": len(items), "severity": sev, "categories": cats,
             "scan_dirs": pocs_mod.scan_dirs()}
 
 
-@app.get("/api/pocs/{name}")
-def pocs_read(request: Request, name: str) -> dict:
+# 路径里带分类：/api/pocs/网站CMS/xxx.yaml，用 :path 转换器才收得住斜杠
+@app.get("/api/pocs/{name:path}")
+def pocs_read(request: Request, name: str, category: str = "") -> dict:
     current_user(request)
     from .engine import pocs as pocs_mod
 
     try:
-        return {"ok": True, **pocs_mod.read_poc(name)}
+        return {"ok": True, **pocs_mod.read_poc(name, category)}
     except FileNotFoundError:
         raise HTTPException(404, "模板不存在")
     except ValueError as e:
@@ -459,10 +463,11 @@ def pocs_save(request: Request, body: dict = Body(...)) -> dict:
     from .engine import pocs as pocs_mod
 
     try:
-        out = pocs_mod.save_poc(str(body.get("name") or ""), str(body.get("content") or ""))
+        out = pocs_mod.save_poc(str(body.get("name") or ""), str(body.get("content") or ""),
+                                str(body.get("category") or ""), str(body.get("old") or ""))
     except ValueError as e:
         raise HTTPException(400, str(e))
-    audit("pocs.save", out["name"], f"模板 {out.get('id', '')}", user)
+    audit("pocs.save", out["path"], f"模板 {out.get('id', '')}", user)
     return {"ok": True, **out}
 
 
@@ -480,13 +485,13 @@ def pocs_import(request: Request, body: dict = Body(...)) -> dict:
     return {"ok": True, **out}
 
 
-@app.delete("/api/pocs/{name}")
-def pocs_delete(request: Request, name: str) -> dict:
+@app.delete("/api/pocs/{name:path}")
+def pocs_delete(request: Request, name: str, category: str = "") -> dict:
     user = current_user(request)
     from .engine import pocs as pocs_mod
 
     try:
-        out = pocs_mod.delete_poc(name)
+        out = pocs_mod.delete_poc(name, category)
     except FileNotFoundError:
         raise HTTPException(404, "模板不存在")
     except ValueError as e:
