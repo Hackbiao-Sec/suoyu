@@ -3,7 +3,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import PageHead from '@/components/PageHead.vue'
 import Icon from '@/components/Icon.vue'
-import { oneClick, presets as fetchPresets } from '@/api/endpoints'
+import { oneClick, presets as fetchPresets, listPolicies } from '@/api/endpoints'
 
 const router = useRouter()
 
@@ -44,7 +44,44 @@ const options = reactive({
   asn_expand: true,
   deep: true,
   vhost_collision: false,
+  // POC 全量扫描：默认关，勾上后深度阶段用 POC 管理里的模板全量扫（不限级别）
+  poc_scan: false,
 })
+
+// 命名策略：选中后整轮按它的强度 / 深挖跑，节流与网络参数同步写回全局配置
+const policyList = ref([])
+const policyId = ref('')
+const policyInfo = computed(() => policyList.value.find((p) => p.id === policyId.value) || null)
+
+function applyPolicy(id) {
+  policyId.value = id
+  const p = policyList.value.find((x) => x.id === id)
+  if (!p) return
+  const o = (p.payload || {}).oneclick || {}
+  const scan = (p.payload || {}).scan || {}
+  const deep = (p.payload || {}).deep || {}
+  if (o.preset && presetList.value.some((x) => x.key === o.preset)) presetKey.value = o.preset
+  if (scan.port_type) options.port_type = scan.port_type
+  for (const k of ['domain_brute', 'site_spider', 'file_leak', 'sibling', 'asn_expand', 'vhost_collision']) {
+    if (typeof scan[k] === 'boolean') options[k] = scan[k]
+  }
+  if (typeof deep.code_leak === 'boolean' || typeof deep.email_harvest === 'boolean') options.deep = true
+  if (typeof o.poc_scan === 'boolean') options.poc_scan = o.poc_scan
+  if (typeof o.expand_enterprise === 'boolean') expandEnterprise.value = o.expand_enterprise
+  if (typeof o.expand_mobile === 'boolean') expandMobile.value = o.expand_mobile
+  if (Array.isArray(o.steps) && o.steps.length) picked.value = [...o.steps]
+  syncPocStep()
+}
+
+// 勾 POC 扫描必须带深度阶段，否则这轮没有执行点
+function syncPocStep() {
+  if (options.poc_scan && !picked.value.includes('p5')) picked.value = [...picked.value, 'p5']
+}
+
+function togglePoc() {
+  options.poc_scan = !options.poc_scan
+  syncPocStep()
+}
 
 const lines = computed(() => raw.value.split('\n').filter((l) => l.trim()).length)
 
@@ -86,6 +123,15 @@ async function loadPresets() {
   }
 }
 
+async function loadPolicies() {
+  try {
+    const res = await listPolicies()
+    policyList.value = res.items || []
+  } catch {
+    /* 策略拿不到就按手选跑 */
+  }
+}
+
 function applyPreset(key) {
   presetKey.value = key
   const p = presetList.value.find((x) => x.key === key)
@@ -121,6 +167,7 @@ async function run() {
       expand_enterprise: expandEnterprise.value,
       expand_mobile: expandMobile.value,
       name: taskName.value.trim() || undefined,
+      policy_id: policyId.value || undefined,
       equity_ratio: has('p1') && expandEnterprise.value ? equityRatio.value : undefined,
       equity_ubo_threshold: has('p1') && expandEnterprise.value ? uboThreshold.value : undefined,
       options: { ...options },
@@ -160,7 +207,10 @@ const mobileBlock = computed(() => {
   return m && ((m.apps || []).length || (m.applets || []).length || (m.domains || []).length)
 })
 
-onMounted(loadPresets)
+onMounted(() => {
+  loadPresets()
+  loadPolicies()
+})
 </script>
 
 <template>
@@ -241,6 +291,29 @@ onMounted(loadPresets)
         </div>
 
         <div class="panel">
+          <div class="panel-head">
+            <span><Icon name="shield" :size="13" />侦察策略</span>
+            <button class="btn xs" @click="router.push('/policies')">管理策略</button>
+          </div>
+          <div class="panel-body stack" style="gap: 9px">
+            <div class="row" style="gap: 9px; flex-wrap: wrap">
+              <select v-model="policyId" class="input flex-1" style="min-width: 180px" @change="applyPolicy(policyId)">
+                <option value="">不套策略（按下面手选）</option>
+                <option v-for="p in policyList" :key="p.id" :value="p.id">
+                  {{ p.name }}{{ p.builtin ? ' · 内置' : '' }}
+                </option>
+              </select>
+              <span v-if="policyInfo" class="tag ok">{{ policyInfo.name }}</span>
+            </div>
+            <div v-if="policyInfo" class="policy-desc">
+              {{ policyInfo.desc || '这套策略没有写说明' }}
+              <span class="muted">（选中即按其范围 / 强度 / 节流 / 深挖 / 网络参数执行，下面手选项仍可临时改）</span>
+            </div>
+            <div v-else class="tip">不套策略时只按下面手选的强度与步骤跑；套策略会把该策略的范围、节流与网络参数一起写进本轮配置。</div>
+          </div>
+        </div>
+
+        <div class="panel">
           <div class="panel-head"><span><Icon name="control" :size="13" />采集强度</span></div>
           <div class="panel-body">
             <div class="preset-grid">
@@ -259,7 +332,7 @@ onMounted(loadPresets)
         </div>
 
         <details class="adv">
-          <summary>高级选项<span class="mono muted">字典爆破 · 爬虫 · 敏感文件 · 旁站 C 段 · ASN · 端口</span></summary>
+          <summary>高级选项<span class="mono muted">字典爆破 · 爬虫 · 敏感文件 · 旁站 C 段 · ASN · 端口 · POC 扫描</span></summary>
           <div class="adv-body">
             <label class="chk"><span class="switch" :class="{ on: options.domain_brute }" @click.prevent="options.domain_brute = !options.domain_brute" />字典爆破</label>
             <label class="chk"><span class="switch" :class="{ on: options.site_spider }" @click.prevent="options.site_spider = !options.site_spider" />站点爬虫</label>
@@ -268,6 +341,9 @@ onMounted(loadPresets)
             <label class="chk"><span class="switch" :class="{ on: options.asn_expand }" @click.prevent="options.asn_expand = !options.asn_expand" />ASN 网段</label>
             <label class="chk"><span class="switch" :class="{ on: options.deep }" @click.prevent="options.deep = !options.deep" />深度挖掘</label>
             <label class="chk"><span class="switch" :class="{ on: options.vhost_collision }" @click.prevent="options.vhost_collision = !options.vhost_collision" />VHost 碰撞</label>
+            <label class="chk poc" :class="{ hot: options.poc_scan }">
+              <span class="switch" :class="{ on: options.poc_scan }" @click.prevent="togglePoc" />POC 扫描
+            </label>
             <label class="chk">
               端口
               <select v-model="options.port_type" class="input" style="height: 26px; width: 118px">
@@ -279,6 +355,9 @@ onMounted(loadPresets)
                 <option value="all">全端口</option>
               </select>
             </label>
+            <div v-if="options.poc_scan" class="poc-hint">
+              POC 扫描已开：深度阶段会用 POC 管理里的全部模板扫（不限级别），执行步骤已自动补上「深度挖掘」。
+            </div>
           </div>
         </details>
 
@@ -484,6 +563,13 @@ onMounted(loadPresets)
   display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px;
   padding: 2px 13px 12px;
 }
+
+.chk.poc.hot { color: var(--ok, #3ddc97); }
+.poc-hint {
+  grid-column: 1 / -1; font-size: 10.5px; color: var(--muted); line-height: 1.7;
+  padding-top: 2px; border-top: 1px dashed var(--line);
+}
+.policy-desc { font-size: 11.5px; color: var(--text-2); line-height: 1.8; white-space: normal; }
 
 .ev-table { display: flex; flex-direction: column; gap: 5px; max-height: 190px; overflow-y: auto; }
 .ev-row {

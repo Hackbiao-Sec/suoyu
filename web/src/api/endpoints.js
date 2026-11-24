@@ -44,6 +44,8 @@ export const oneClick = (payload) => http.post('/api/oneclick', payload)
 // ── 资产 ──────────────────────────────────────────
 export const listAssets = (params) => http.get('/api/assets', { params })
 export const assetDetail = (id) => http.get(`/api/assets/${id}`)
+// 批量删：一次一串 id，任务关联一起清
+export const deleteAssets = (ids) => http.post('/api/assets/delete', { ids })
 export const assetFacets = (params) => http.get('/api/assets/facets', { params })
 export const repairLiveness = (taskId = '') => http.post('/api/assets/liveness', null, { params: { task_id: taskId } })
 export const exportAssets = (params) => http.get('/api/export', { params, responseType: 'blob' })
@@ -127,6 +129,13 @@ export const bindDict = (name, key) => http.post(`/api/dicts/${encodeURIComponen
 // ── 通知 / 配置 ───────────────────────────────────
 export const getConfig = () => http.get('/api/config')
 export const saveConfig = (payload) => http.post('/api/config', payload)
+
+// ── 侦察策略（命名策略：范围 / 强度 / 节流 / 深挖 / 网络） ──
+export const listPolicies = () => http.get('/api/policies')
+export const savePolicy = (payload) => http.post('/api/policies', payload)
+export const deletePolicy = (id) => http.delete(`/api/policies/${encodeURIComponent(id)}`)
+// 把整套策略写回全局配置（之后不选策略的任务也按它跑）
+export const applyPolicy = (id) => http.post(`/api/policies/${encodeURIComponent(id)}/apply`)
 export const testNotify = (payload) => http.post('/api/notify/test', payload)
 export const testConfig = (payload) => http.post('/api/config/test', payload)
 export const toolsStatus = () => http.get('/api/tools')

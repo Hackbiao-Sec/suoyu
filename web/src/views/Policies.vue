@@ -1,12 +1,17 @@
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import PageHead from '@/components/PageHead.vue'
 import Icon from '@/components/Icon.vue'
-import { getConfig, saveConfig } from '@/api/endpoints'
+import { getConfig, listPolicies, savePolicy, deletePolicy, applyPolicy } from '@/api/endpoints'
 
+const items = ref([])
 const loading = ref(false)
 const saving = ref(false)
-const saved = ref(false)
+const selectedId = ref('')
+const section = ref('policy')
+
+const cur = reactive({ id: '', name: '', desc: '', builtin: 0 })
 
 const policy = reactive({
   scope_keywords: [],
@@ -92,6 +97,28 @@ const perSource = reactive({
   qichacha: { min_interval: 3.0, max_interval: 7.0 },
   miit: { min_interval: 6.0, max_interval: 9.0 },
 })
+// 一键收集怎么跑：套这套策略时把这些编排一起带出来
+const oneclick = reactive({
+  preset: 'standard',
+  steps: ['p1', 'p2', 'p3', 'p4', 'p5'],
+  expand_enterprise: true,
+  expand_mobile: true,
+  poc_scan: false,
+})
+
+const STEPS = [
+  { k: 'p1', label: '主体穿透' },
+  { k: 'p2', label: '域名收集' },
+  { k: 'p3', label: '空间测绘' },
+  { k: 'p4', label: '主动探测' },
+  { k: 'p5', label: '深度挖掘' },
+]
+const PRESETS = [
+  { v: 'quick', label: '快速' },
+  { v: 'standard', label: '标准' },
+  { v: 'deep', label: '深度' },
+  { v: 'hunt', label: '只收根域' },
+]
 
 const dicts = ref([])
 const PORT_TYPES = [
@@ -120,74 +147,199 @@ const SECTIONS = [
   { k: 'throttle', label: '风控节流', icon: 'clock' },
   { k: 'deep', label: '深度挖掘', icon: 'route' },
   { k: 'http', label: '网络参数', icon: 'server' },
+  { k: 'oneclick', label: '执行编排', icon: 'flow' },
 ]
-const section = ref('policy')
+
+const kwText = ref('')
+const exText = ref('')
 
 function splitLines(text) {
   return (text || '').split(/[\n,，]/).map((s) => s.trim()).filter(Boolean)
 }
 
-const kwText = ref('')
-const exText = ref('')
+function fill(cfg) {
+  Object.assign(policy, cfg.policy || {})
+  Object.assign(scan, cfg.scan || {})
+  Object.assign(deep, cfg.deep || {})
+  Object.assign(httpOpt, cfg.http || {})
+  const th = cfg.throttle || {}
+  Object.assign(throttle, {
+    enabled: th.enabled !== false,
+    min_interval: th.min_interval ?? 1.5,
+    max_interval: th.max_interval ?? 4.0,
+    concurrent: th.concurrent ?? 1,
+    risk_threshold: th.risk_threshold ?? 3,
+    cooldown: th.cooldown ?? 60,
+    cooldown_max: th.cooldown_max ?? 900,
+  })
+  const ps = th.per_source || {}
+  for (const k of Object.keys(perSource)) {
+    const item = ps[k] || {}
+    perSource[k] = {
+      min_interval: item.min_interval ?? perSource[k].min_interval,
+      max_interval: item.max_interval ?? perSource[k].max_interval,
+    }
+  }
+  kwText.value = (policy.scope_keywords || []).join('\n')
+  exText.value = (policy.exclude_domains || []).join('\n')
+  Object.assign(oneclick, {
+    preset: 'standard',
+    steps: STEPS.map((s) => s.k),
+    expand_enterprise: true,
+    expand_mobile: true,
+    poc_scan: false,
+  })
+}
+
+function select(item) {
+  if (!item) return
+  selectedId.value = item.id
+  cur.id = item.id
+  cur.name = item.name
+  cur.desc = item.desc || ''
+  cur.builtin = item.builtin ? 1 : 0
+  const p = item.payload || {}
+  fill(p)
+  const oc = p.oneclick || {}
+  Object.assign(oneclick, {
+    preset: oc.preset || 'standard',
+    steps: Array.isArray(oc.steps) && oc.steps.length ? [...oc.steps] : STEPS.map((s) => s.k),
+    expand_enterprise: oc.expand_enterprise !== false,
+    expand_mobile: oc.expand_mobile !== false,
+    poc_scan: !!oc.poc_scan,
+  })
+  section.value = 'policy'
+}
+
+async function loadGlobalCfg() {
+  try {
+    const res = await getConfig()
+    return res.config || {}
+  } catch {
+    return {}
+  }
+}
 
 async function load() {
   loading.value = true
   try {
-    const res = await getConfig()
-    const cfg = res.config || {}
-    Object.assign(policy, cfg.policy || {})
-    Object.assign(scan, cfg.scan || {})
-    Object.assign(deep, cfg.deep || {})
-    Object.assign(httpOpt, cfg.http || {})
-    const th = cfg.throttle || {}
-    Object.assign(throttle, {
-      enabled: th.enabled !== false,
-      min_interval: th.min_interval ?? 1.5,
-      max_interval: th.max_interval ?? 4.0,
-      concurrent: th.concurrent ?? 1,
-      risk_threshold: th.risk_threshold ?? 3,
-      cooldown: th.cooldown ?? 60,
-      cooldown_max: th.cooldown_max ?? 900,
-    })
-    const ps = th.per_source || {}
-    for (const k of Object.keys(perSource)) {
-      const item = ps[k] || {}
-      perSource[k] = {
-        min_interval: item.min_interval ?? perSource[k].min_interval,
-        max_interval: item.max_interval ?? perSource[k].max_interval,
-      }
+    const res = await listPolicies()
+    items.value = res.items || []
+    if (!items.value.length) {
+      await blank()
+      return
     }
-    kwText.value = (policy.scope_keywords || []).join('\n')
-    exText.value = (policy.exclude_domains || []).join('\n')
+    select(items.value.find((x) => x.id === selectedId.value) || items.value[0])
   } finally {
     loading.value = false
   }
 }
 
+// 新建：默认克隆当前全局配置，省得每次从零填十几项
+async function blank() {
+  const cfg = await loadGlobalCfg()
+  fill(cfg)
+  selectedId.value = ''
+  cur.id = ''
+  cur.name = ''
+  cur.desc = ''
+  cur.builtin = 0
+  section.value = 'policy'
+}
+
+function buildPayload() {
+  policy.scope_keywords = splitLines(kwText.value)
+  policy.exclude_domains = splitLines(exText.value)
+  return {
+    policy: { ...policy },
+    scan: { ...scan },
+    throttle: {
+      ...throttle,
+      per_source: Object.fromEntries(Object.entries(perSource).map(([k, v]) => [k, { ...v }])),
+    },
+    deep: { ...deep },
+    http: { ...httpOpt },
+    oneclick: {
+      preset: oneclick.preset,
+      steps: [...oneclick.steps],
+      expand_enterprise: oneclick.expand_enterprise,
+      expand_mobile: oneclick.expand_mobile,
+      poc_scan: oneclick.poc_scan,
+    },
+  }
+}
+
 async function save() {
+  if (!cur.name.trim()) return ElMessage.warning('先给策略起个名字，例如「常用」「深度」')
   saving.value = true
-  saved.value = false
   try {
-    policy.scope_keywords = splitLines(kwText.value)
-    policy.exclude_domains = splitLines(exText.value)
-    await saveConfig({
-      policy: { ...policy },
-      scan: { ...scan },
-      throttle: {
-        ...throttle,
-        per_source: Object.fromEntries(
-          Object.entries(perSource).map(([k, v]) => [k, { ...v }]),
-        ),
-      },
-      deep: { ...deep },
-      http: { ...httpOpt },
+    const res = await savePolicy({
+      id: cur.id || undefined,
+      name: cur.name.trim(),
+      desc: cur.desc.trim(),
+      payload: buildPayload(),
     })
-    saved.value = true
-    setTimeout(() => { saved.value = false }, 2400)
+    const item = res.item
+    if (item) selectedId.value = item.id
+    const list = await listPolicies()
+    items.value = list.items || []
+    select(items.value.find((x) => x.id === selectedId.value) || items.value[0])
+    ElMessage.success('策略已保存，一键收集里可以直接选它')
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '保存失败')
   } finally {
     saving.value = false
   }
 }
+
+// 另存一份：改个名再存，内置策略也能当模板用
+function duplicate() {
+  cur.id = ''
+  cur.builtin = 0
+  cur.name = `${cur.name || '策略'} 副本`
+  selectedId.value = ''
+}
+
+async function remove() {
+  if (!cur.id) return
+  try {
+    await ElMessageBox.confirm(`删除策略「${cur.name}」？已下发的任务不受影响。`, '删除策略', {
+      type: 'warning',
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return
+  }
+  try {
+    await deletePolicy(cur.id)
+    const list = await listPolicies()
+    items.value = list.items || []
+    if (items.value.length) select(items.value[0])
+    else await blank()
+    ElMessage.success('已删除')
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '删除失败')
+  }
+}
+
+async function applyToGlobal() {
+  if (!cur.id) return ElMessage.warning('先把策略存下来再应用')
+  try {
+    await applyPolicy(cur.id)
+    ElMessage.success('已写回全局配置，不选策略的任务也按它跑')
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '应用失败')
+  }
+}
+
+function toggleStep(k) {
+  oneclick.steps = oneclick.steps.includes(k)
+    ? oneclick.steps.filter((x) => x !== k)
+    : [...oneclick.steps, k]
+}
+
+const selected = computed(() => items.value.find((x) => x.id === selectedId.value) || null)
 
 onMounted(async () => {
   await load()
@@ -203,386 +355,335 @@ onMounted(async () => {
 
 <template>
   <div class="stack">
-    <PageHead title="策略配置" desc="控制收什么、收多深、走什么网络；这些是任务默认值，任务里也能临时覆盖">
+    <PageHead title="策略管理" desc="把范围、强度、节流、深挖、网络参数打包成一套命名策略；一键收集里选中就整轮生效">
       <template #actions>
-        <span v-if="saved" class="tag ok">已保存并生效</span>
         <button class="btn sm" @click="load"><Icon name="refresh" :size="13" />重载</button>
-        <button class="btn primary sm" :disabled="saving" @click="save"><Icon name="check" :size="13" />保存配置</button>
+        <button class="btn sm" @click="blank"><Icon name="plus" :size="13" />新建策略</button>
+        <button class="btn primary sm" :disabled="saving" @click="save"><Icon name="check" :size="13" />保存策略</button>
       </template>
     </PageHead>
 
-    <div class="row">
-      <div class="seg">
-        <button v-for="s in SECTIONS" :key="s.k" :class="{ on: section === s.k }" @click="section = s.k">
-          {{ s.label }}
-        </button>
-      </div>
-    </div>
-
-    <div v-if="section === 'policy'" class="cards two">
-      <div class="panel">
-        <div class="panel-head"><span><Icon name="shield" :size="13" />范围过滤</span></div>
-        <div class="panel-body stack" style="gap: 12px">
-          <div class="field">
-            <span class="field-label">名称黑名单（命中即剔除，一行一个）</span>
-            <textarea v-model="kwText" class="textarea" style="min-height: 90px" placeholder="cdn&#10;cloudflare" />
-          </div>
-          <div class="field">
-            <span class="field-label">域名黑名单（不收集这些后缀，一行一个）</span>
-            <textarea v-model="exText" class="textarea" style="min-height: 90px" placeholder="example-cdn.com" />
+    <div class="policy-layout">
+      <aside class="panel policy-list">
+        <div class="panel-head">
+          <span><Icon name="shield" :size="13" />策略库</span>
+          <span class="mono muted">{{ items.length }}</span>
+        </div>
+        <div class="policy-items">
+          <button
+            v-for="p in items"
+            :key="p.id"
+            class="policy-item"
+            :class="{ on: p.id === selectedId }"
+            @click="select(p)"
+          >
+            <span class="pi-name">
+              {{ p.name }}
+              <span v-if="p.builtin" class="tag" style="margin-left: 6px">内置</span>
+            </span>
+            <span class="pi-desc">{{ p.desc || '无说明' }}</span>
+          </button>
+          <div v-if="!items.length" class="muted" style="padding: 14px; font-size: 11.5px">
+            还没有策略，点右上「新建策略」。
           </div>
         </div>
-      </div>
+      </aside>
 
-      <div class="panel">
-        <div class="panel-head"><span><Icon name="filter" :size="13" />收集范围</span></div>
-        <div class="panel-body stack" style="gap: 12px">
-          <label class="opt"><span class="switch" :class="{ on: policy.only_root_domain }" @click="policy.only_root_domain = !policy.only_root_domain" />仅收集目标根域</label>
-          <label class="opt"><span class="switch" :class="{ on: policy.cdn_exclude }" @click="policy.cdn_exclude = !policy.cdn_exclude" />剔除 CDN 反解域名</label>
-          <div class="field">
-            <span class="field-label">只收指定后缀</span>
-            <input v-model="policy.allowed_suffix" class="input" placeholder="留空表示不限，例如 .gov.cn" />
+      <div class="stack policy-editor">
+        <div class="panel">
+          <div class="panel-head">
+            <span><Icon name="settings" :size="13" />{{ cur.id ? '编辑策略' : '新建策略' }}</span>
+            <span v-if="cur.builtin" class="tag warn">内置策略，改动后点保存即自定义</span>
           </div>
-          <div class="field">
-            <span class="field-label">最大子域数</span>
-            <input v-model.number="policy.max_subdomain" class="input mono" type="number" />
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div v-if="section === 'scan'" class="cards two">
-      <div class="panel">
-        <div class="panel-head"><span><Icon name="tasks" :size="13" />阶段开关</span></div>
-        <div class="panel-body" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px">
-          <label class="opt"><span class="switch" :class="{ on: scan.enterprise }" @click="scan.enterprise = !scan.enterprise" />企业主体</label>
-          <label class="opt"><span class="switch" :class="{ on: scan.domain_brute }" @click="scan.domain_brute = !scan.domain_brute" />字典爆破</label>
-          <label class="opt"><span class="switch" :class="{ on: scan.alt_dns }" @click="scan.alt_dns = !scan.alt_dns" />泛解析变体</label>
-          <label class="opt"><span class="switch" :class="{ on: scan.port_scan }" @click="scan.port_scan = !scan.port_scan" />端口扫描</label>
-          <label class="opt"><span class="switch" :class="{ on: scan.service_detect }" @click="scan.service_detect = !scan.service_detect" />服务识别</label>
-          <label class="opt"><span class="switch" :class="{ on: scan.site_spider }" @click="scan.site_spider = !scan.site_spider" />站点爬虫</label>
-          <label class="opt"><span class="switch" :class="{ on: scan.file_leak }" @click="scan.file_leak = !scan.file_leak" />敏感文件</label>
-          <label class="opt"><span class="switch" :class="{ on: scan.vhost_collision }" @click="scan.vhost_collision = !scan.vhost_collision" />VHost 碰撞</label>
-          <label class="opt"><span class="switch" :class="{ on: scan.sibling }" @click="scan.sibling = !scan.sibling" />旁站 C 段</label>
-          <label class="opt"><span class="switch" :class="{ on: scan.asn_expand }" @click="scan.asn_expand = !scan.asn_expand" />ASN 网段归集</label>
-          <label class="opt"><span class="switch" :class="{ on: scan.asn_scan_blocks }" @click="scan.asn_scan_blocks = !scan.asn_scan_blocks" />同 ASN 小段扫描</label>
-        </div>
-      </div>
-
-      <div class="panel">
-        <div class="panel-head"><span><Icon name="server" :size="13" />端口与字典</span></div>
-        <div class="panel-body stack" style="gap: 12px">
-          <div class="field">
-            <span class="field-label">端口范围</span>
-            <select v-model="scan.port_type" class="select">
-              <option v-for="p in PORT_TYPES" :key="p.v" :value="p.v">{{ p.label }}</option>
-            </select>
-          </div>
-          <div v-if="scan.port_type === 'custom'" class="field">
-            <span class="field-label">自定义端口</span>
-            <input v-model="scan.port_custom" class="input mono" placeholder="80,443,8080-8090" />
-          </div>
-          <div class="field">
-            <span class="field-label">排除端口</span>
-            <input v-model="scan.port_exclude" class="input mono" placeholder="22,3389,6379（从端口组里剔除）" />
-          </div>
-          <div class="row">
-            <div class="field flex-1">
-              <span class="field-label">端口超时（秒）</span>
-              <input v-model.number="scan.port_timeout" class="input mono" type="number" step="0.5" />
+          <div class="panel-body stack" style="gap: 10px">
+            <div class="row" style="gap: 10px; flex-wrap: wrap">
+              <div class="field flex-1" style="min-width: 200px">
+                <span class="field-label">策略名称</span>
+                <input v-model="cur.name" class="input" placeholder="例如：常用 / 深度 / 只打官网" />
+              </div>
+              <div class="field flex-1" style="min-width: 240px">
+                <span class="field-label">一句话说明</span>
+                <input v-model="cur.desc" class="input" placeholder="这套策略适合什么场景" />
+              </div>
             </div>
-            <div class="field flex-1">
-              <span class="field-label">端口并发</span>
-              <input v-model.number="scan.port_concurrent" class="input mono" type="number" />
-            </div>
-          </div>
-          <div class="row">
-            <div class="field flex-1">
-              <span class="field-label">每秒连接上限（0 = 不限）</span>
-              <input v-model.number="scan.port_qps" class="input mono" type="number" min="0" />
-            </div>
-            <div class="field flex-1">
-              <span class="field-label">断点续扫</span>
-              <label class="opt"><span class="switch" :class="{ on: scan.port_resume }" @click="scan.port_resume = !scan.port_resume" />中断后跳过已扫组合</label>
-            </div>
-          </div>
-          <div class="row">
-            <div class="field flex-1">
-              <span class="field-label">同时扫几台 IP（0 = 不限）</span>
-              <input v-model.number="scan.port_ip_concurrent" class="input mono" type="number" min="0" />
-              <span class="field-hint">端口级并发由「端口并发」管；这里是 IP 级线程数，调小可避开对端扫描告警。</span>
-            </div>
-            <div class="field flex-1">
-              <span class="field-label">每台 IP 错开（秒）</span>
-              <input v-model.number="scan.port_ip_gap" class="input mono" type="number" min="0" step="0.1" />
-              <span class="field-hint">第 n 台 IP 延迟 n×该值起扫，几千个 IP 不会同一毫秒砸过去；0 = 不错开。</span>
-            </div>
-          </div>
-          <div class="row">
-            <div class="field flex-1">
-              <span class="field-label">字典爆破并发</span>
-              <input v-model.number="scan.domain_brute_concurrent" class="input mono" type="number" min="1" />
-            </div>
-            <div class="field flex-1">
-              <span class="field-label">根域间等待（秒）</span>
-              <input v-model.number="scan.domain_brute_gap" class="input mono" type="number" min="0" step="0.5" />
-              <span class="field-hint">一轮两万字典跑完一个根域后歇一下再打下一个；0 = 不等。</span>
-            </div>
-          </div>
-          <div class="row">
-            <div class="field flex-1">
-              <span class="field-label">子域字典</span>
-              <select v-model="scan.domain_dict" class="select">
-                <option v-for="d in dicts.filter((x) => x.includes('domain'))" :key="d" :value="d">{{ d }}</option>
-                <option v-if="!dicts.length" :value="scan.domain_dict">{{ scan.domain_dict }}</option>
-              </select>
-            </div>
-            <div class="field flex-1">
-              <span class="field-label">目录字典</span>
-              <select v-model="scan.fuzz_dict" class="select">
-                <option v-for="d in dicts.filter((x) => !x.includes('domain'))" :key="d" :value="d">{{ d }}</option>
-                <option v-if="!dicts.length" :value="scan.fuzz_dict">{{ scan.fuzz_dict }}</option>
-              </select>
-            </div>
-          </div>
-          <div class="field">
-            <span class="field-label">单任务同 ASN 小段扫描上限（个）</span>
-            <input v-model.number="scan.asn_block_limit" class="input mono" type="number" min="0" />
-            <span class="field-hint">只扫 /24 及更小的宣告段；运营商骨干大段只落网段资产，不扫。</span>
-          </div>
-          <div class="field">
-            <span class="field-label">被动源策略</span>
-            <select v-model="scan.dns_source_policy" class="select">
-              <option v-for="p in POLICIES" :key="p.v" :value="p.v">{{ p.label }}</option>
-            </select>
-          </div>
-          <div class="field">
-            <span class="field-label">空间测绘</span>
-            <label class="opt"><span class="switch" :class="{ on: scan.space_mapping }" @click="scan.space_mapping = !scan.space_mapping" />拿已确认根域去测绘引擎反查</label>
-            <span class="field-hint">补「域名不解析但对外暴露过」的资产（历史解析、旁路入口）；关掉则不消耗测绘配额。</span>
-          </div>
-          <div class="row">
-            <div class="field flex-1">
-              <span class="field-label">每根域每引擎取多少条</span>
-              <input v-model.number="scan.space_size" class="input mono" type="number" min="20" max="1000" />
-              <span class="field-hint">20～1000。调大可多捞长尾，配额消耗同步变多。</span>
-            </div>
-            <div class="field flex-1">
-              <span class="field-label">根域上限（0 = 不限）</span>
-              <input v-model.number="scan.space_max_roots" class="input mono" type="number" min="0" />
-              <span class="field-hint">默认 0：本轮确认的根域全部反查，一棵都不漏。填正数才启用熔断，超出按「主目标根优先 + 已收集资产量降序」截断，被砍掉的根域这一轮不会有新资产。</span>
+            <div class="row" style="gap: 8px; flex-wrap: wrap">
+              <button class="btn xs" @click="duplicate"><Icon name="copy" :size="12" />另存为副本</button>
+              <button class="btn xs" :disabled="!cur.id" @click="applyToGlobal"><Icon name="download" :size="12" />写回全局配置</button>
+              <button class="btn xs danger" :disabled="!cur.id" @click="remove"><Icon name="trash" :size="12" />删除</button>
+              <span class="tip flex-1">「写回全局配置」只影响之后不套策略的任务；套了策略的任务一律按策略走。</span>
             </div>
           </div>
         </div>
-      </div>
 
-      <div class="panel">
-        <div class="panel-head"><span><Icon name="tasks" :size="13" />股权穿透</span></div>
-        <div class="panel-body stack" style="gap: 12px">
-          <div class="field">
-            <span class="field-label">控股门槛 %</span>
-            <input v-model.number="scan.equity_ratio" class="input mono" type="number" min="0" max="100" />
-            <span class="field-hint">达到这条线的子/孙公司才进资产池继续展开：100 只收全资，51 收控盘，0 收全部持股。</span>
-          </div>
-          <div class="field">
-            <span class="field-label">向下穿透层数</span>
-            <input v-model.number="scan.equity_depth" class="input mono" type="number" min="1" max="4" />
-            <span class="field-hint">2 = 子公司 + 孙公司；3 再往下穿一层。只对已达控股门槛的节点继续展开，参股公司不耗次数。</span>
-          </div>
-          <div class="field">
-            <span class="field-label">穿透请求预算（次 · 0=不限）</span>
-            <input v-model.number="scan.equity_budget" class="input mono" type="number" min="0" max="2000" />
-            <span class="field-hint">一次约拉一页（100 家公司），额度小的工商账号把这里调小；额度用尽会自动停并写明原因。拉到整棵树常要几十次请求，预算给不到就会截断；填 0 = 不限次数，一直翻到没有下一页，只受每层页上限和执行时限约束。</span>
-          </div>
-          <div class="field">
-            <span class="field-label">查询间隔（秒）</span>
-            <input v-model.number="scan.equity_sleep" class="input mono" type="number" min="0" max="300" step="1" />
-            <span class="field-hint">每一次工商请求之前额外等待，叠加在节流闸之上——翻页、补穿、重试都吃这一份。慢节奏才拉得全：填 30 就是每分钟 2 次，一次穿透大约要跑十几分钟，下面的执行时限会跟着自动放宽；0 = 不额外等。</span>
-          </div>
-          <div class="field">
-            <span class="field-label">实控线 %</span>
-            <input v-model.number="scan.equity_ubo_threshold" class="input mono" type="number" min="1" max="100" />
-            <span class="field-hint">最终受益人判定线：股东树逐级折算后的累计持股达到这条线标成控制，25 是工商常用口径。</span>
-          </div>
-          <div class="field">
-            <span class="field-label">上游穿透层数（0 关闭）</span>
-            <input v-model.number="scan.equity_ubo_levels" class="input mono" type="number" min="0" max="3" />
-            <span class="field-hint">机构股东再往上拉几层股东，才能把人穿到底。每多一层都多花工商次数。</span>
-          </div>
-          <div class="field">
-            <span class="field-label">每层展开机构数</span>
-            <input v-model.number="scan.equity_ubo_branches" class="input mono" type="number" min="0" max="20" />
-            <span class="field-hint">每层最多展开几家机构股东，遇到风控或额度用尽会自行停下。</span>
-          </div>
+        <div class="seg">
+          <button v-for="s in SECTIONS" :key="s.k" :class="{ on: section === s.k }" @click="section = s.k">
+            {{ s.label }}
+          </button>
         </div>
-      </div>
-    </div>
 
-    <div v-if="section === 'throttle'" class="cards two">
-      <div class="panel">
-        <div class="panel-head"><span><Icon name="clock" :size="13" />全局限速</span></div>
-        <div class="panel-body stack" style="gap: 12px">
-          <label class="opt"><span class="switch" :class="{ on: throttle.enabled }" @click="throttle.enabled = !throttle.enabled" />启用风控节流</label>
-          <span class="field-hint">工商 / 备案 / 测绘这类要登录态的站点，同一出口连着打很快被风控。这里控的是「同来源两次请求之间歇多久、同时能发几个」，关掉则全速发。</span>
-          <div class="row">
-            <div class="field flex-1">
-              <span class="field-label">最小间隔（秒）</span>
-              <input v-model.number="throttle.min_interval" class="input mono" type="number" min="0" step="0.1" />
-            </div>
-            <div class="field flex-1">
-              <span class="field-label">最大间隔（秒）</span>
-              <input v-model.number="throttle.max_interval" class="input mono" type="number" min="0" step="0.1" />
-              <span class="field-hint">实际间隔在两者之间随机，行为更像人；只认最小间隔时填成同一个值。</span>
+        <div v-if="section === 'policy'" class="cards two">
+          <div class="panel">
+            <div class="panel-head"><span><Icon name="shield" :size="13" />范围过滤</span></div>
+            <div class="panel-body stack" style="gap: 12px">
+              <div class="field">
+                <span class="field-label">名称黑名单（命中即剔除，一行一个）</span>
+                <textarea v-model="kwText" class="textarea" style="min-height: 90px" placeholder="cdn&#10;cloudflare" />
+              </div>
+              <div class="field">
+                <span class="field-label">域名黑名单（不收集这些后缀，一行一个）</span>
+                <textarea v-model="exText" class="textarea" style="min-height: 90px" placeholder="example-cdn.com" />
+              </div>
             </div>
           </div>
-          <div class="row">
-            <div class="field flex-1">
-              <span class="field-label">同来源并发</span>
-              <input v-model.number="throttle.concurrent" class="input mono" type="number" min="1" />
-            </div>
-            <div class="field flex-1">
-              <span class="field-label">连续风控几次熔断</span>
-              <input v-model.number="throttle.risk_threshold" class="input mono" type="number" min="1" />
-            </div>
-          </div>
-          <div class="row">
-            <div class="field flex-1">
-              <span class="field-label">首次冷却（秒）</span>
-              <input v-model.number="throttle.cooldown" class="input mono" type="number" min="1" />
-            </div>
-            <div class="field flex-1">
-              <span class="field-label">冷却封顶（秒）</span>
-              <input v-model.number="throttle.cooldown_max" class="input mono" type="number" min="1" />
-              <span class="field-hint">熔断后停这么久，再犯逐次翻倍，到封顶为止；冷却期间该来源直接跳过，不会硬打。</span>
+
+          <div class="panel">
+            <div class="panel-head"><span><Icon name="filter" :size="13" />收集范围</span></div>
+            <div class="panel-body stack" style="gap: 12px">
+              <label class="opt"><span class="switch" :class="{ on: policy.only_root_domain }" @click="policy.only_root_domain = !policy.only_root_domain" />仅收集目标根域</label>
+              <label class="opt"><span class="switch" :class="{ on: policy.cdn_exclude }" @click="policy.cdn_exclude = !policy.cdn_exclude" />剔除 CDN 反解域名</label>
+              <div class="field">
+                <span class="field-label">只收指定后缀</span>
+                <input v-model="policy.allowed_suffix" class="input" placeholder="留空表示不限，例如 .gov.cn" />
+              </div>
+              <div class="field">
+                <span class="field-label">最大子域数</span>
+                <input v-model.number="policy.max_subdomain" class="input mono" type="number" />
+              </div>
             </div>
           </div>
         </div>
-      </div>
 
-      <div class="panel">
-        <div class="panel-head"><span><Icon name="server" :size="13" />站点级间隔</span></div>
-        <div class="panel-body stack" style="gap: 12px">
-          <span class="field-hint">单个站点没写就用上面的全局值；账号额度小、已经被盯上的站，把这里调大。</span>
-          <div v-for="s in SOURCES" :key="s.k" class="row">
-            <div class="field flex-1">
-              <span class="field-label">{{ s.label }} 最小（秒）</span>
-              <input v-model.number="perSource[s.k].min_interval" class="input mono" type="number" min="0" step="0.5" />
+        <div v-if="section === 'scan'" class="cards two">
+          <div class="panel">
+            <div class="panel-head"><span><Icon name="tasks" :size="13" />阶段开关</span></div>
+            <div class="panel-body" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px">
+              <label class="opt"><span class="switch" :class="{ on: scan.enterprise }" @click="scan.enterprise = !scan.enterprise" />企业主体</label>
+              <label class="opt"><span class="switch" :class="{ on: scan.domain_brute }" @click="scan.domain_brute = !scan.domain_brute" />字典爆破</label>
+              <label class="opt"><span class="switch" :class="{ on: scan.alt_dns }" @click="scan.alt_dns = !scan.alt_dns" />泛解析变体</label>
+              <label class="opt"><span class="switch" :class="{ on: scan.port_scan }" @click="scan.port_scan = !scan.port_scan" />端口扫描</label>
+              <label class="opt"><span class="switch" :class="{ on: scan.service_detect }" @click="scan.service_detect = !scan.service_detect" />服务识别</label>
+              <label class="opt"><span class="switch" :class="{ on: scan.site_spider }" @click="scan.site_spider = !scan.site_spider" />站点爬虫</label>
+              <label class="opt"><span class="switch" :class="{ on: scan.file_leak }" @click="scan.file_leak = !scan.file_leak" />敏感文件</label>
+              <label class="opt"><span class="switch" :class="{ on: scan.vhost_collision }" @click="scan.vhost_collision = !scan.vhost_collision" />VHost 碰撞</label>
+              <label class="opt"><span class="switch" :class="{ on: scan.sibling }" @click="scan.sibling = !scan.sibling" />旁站 C 段</label>
+              <label class="opt"><span class="switch" :class="{ on: scan.asn_expand }" @click="scan.asn_expand = !scan.asn_expand" />ASN 网段归集</label>
+              <label class="opt"><span class="switch" :class="{ on: scan.asn_scan_blocks }" @click="scan.asn_scan_blocks = !scan.asn_scan_blocks" />同 ASN 小段扫描</label>
+              <label class="opt"><span class="switch" :class="{ on: scan.space_mapping }" @click="scan.space_mapping = !scan.space_mapping" />空间测绘</label>
             </div>
-            <div class="field flex-1">
-              <span class="field-label">{{ s.label }} 最大（秒）</span>
-              <input v-model.number="perSource[s.k].max_interval" class="input mono" type="number" min="0" step="0.5" />
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><span><Icon name="server" :size="13" />端口与字典</span></div>
+            <div class="panel-body stack" style="gap: 12px">
+              <div class="field">
+                <span class="field-label">端口范围</span>
+                <select v-model="scan.port_type" class="select">
+                  <option v-for="p in PORT_TYPES" :key="p.v" :value="p.v">{{ p.label }}</option>
+                </select>
+              </div>
+              <div v-if="scan.port_type === 'custom'" class="field">
+                <span class="field-label">自定义端口</span>
+                <input v-model="scan.port_custom" class="input mono" placeholder="80,443,8080-8090" />
+              </div>
+              <div class="field">
+                <span class="field-label">排除端口</span>
+                <input v-model="scan.port_exclude" class="input mono" placeholder="22,3389,6379（从端口组里剔除）" />
+              </div>
+              <div class="row">
+                <div class="field flex-1">
+                  <span class="field-label">端口超时（秒）</span>
+                  <input v-model.number="scan.port_timeout" class="input mono" type="number" step="0.5" />
+                </div>
+                <div class="field flex-1">
+                  <span class="field-label">端口并发</span>
+                  <input v-model.number="scan.port_concurrent" class="input mono" type="number" />
+                </div>
+              </div>
+              <div class="row">
+                <div class="field flex-1">
+                  <span class="field-label">爆破并发</span>
+                  <input v-model.number="scan.domain_brute_concurrent" class="input mono" type="number" />
+                </div>
+                <div class="field flex-1">
+                  <span class="field-label">爆破字典</span>
+                  <select v-model="scan.domain_dict" class="select">
+                    <option v-for="d in dicts" :key="d" :value="d">{{ d }}</option>
+                    <option v-if="!dicts.length" value="domain_2w.txt">domain_2w.txt</option>
+                  </select>
+                </div>
+              </div>
             </div>
           </div>
         </div>
-      </div>
 
-      <div class="panel">
-        <div class="panel-head"><span><Icon name="tasks" :size="13" />主体收集节奏</span></div>
-        <div class="panel-body stack" style="gap: 12px">
-          <span class="field-hint">企业主体（备案 / 工商 / 反查）是按根域逐个查的，几十个根域连着打最容易触发风控。取数和入库分开：取数按这里限并发、拉间隔，入库仍逐条写，不会写乱。</span>
-          <div class="row">
-            <div class="field flex-1">
-              <span class="field-label">同时补几个根域</span>
-              <input v-model.number="scan.enterprise_concurrent" class="input mono" type="number" min="1" />
-              <span class="field-hint">1 = 串行，最稳；调大只提升速度，风控风险同步上升。</span>
-            </div>
-            <div class="field flex-1">
-              <span class="field-label">根域间等待（秒）</span>
-              <input v-model.number="scan.enterprise_gap" class="input mono" type="number" min="0" step="0.5" />
+        <div v-if="section === 'throttle'" class="cards two">
+          <div class="panel">
+            <div class="panel-head"><span><Icon name="clock" :size="13" />全局节流</span></div>
+            <div class="panel-body stack" style="gap: 12px">
+              <label class="opt"><span class="switch" :class="{ on: throttle.enabled }" @click="throttle.enabled = !throttle.enabled" />开启节流</label>
+              <div class="row">
+                <div class="field flex-1">
+                  <span class="field-label">最小间隔（秒）</span>
+                  <input v-model.number="throttle.min_interval" class="input mono" type="number" step="0.1" />
+                </div>
+                <div class="field flex-1">
+                  <span class="field-label">最大间隔（秒）</span>
+                  <input v-model.number="throttle.max_interval" class="input mono" type="number" step="0.1" />
+                </div>
+              </div>
+              <div class="row">
+                <div class="field flex-1">
+                  <span class="field-label">同源并发</span>
+                  <input v-model.number="throttle.concurrent" class="input mono" type="number" />
+                </div>
+                <div class="field flex-1">
+                  <span class="field-label">风控阈值（次）</span>
+                  <input v-model.number="throttle.risk_threshold" class="input mono" type="number" />
+                </div>
+              </div>
+              <div class="row">
+                <div class="field flex-1">
+                  <span class="field-label">冷却时长（秒）</span>
+                  <input v-model.number="throttle.cooldown" class="input mono" type="number" />
+                </div>
+                <div class="field flex-1">
+                  <span class="field-label">冷却上限（秒）</span>
+                  <input v-model.number="throttle.cooldown_max" class="input mono" type="number" />
+                </div>
+              </div>
             </div>
           </div>
-          <div class="field">
-            <span class="field-label">每次备案查询前额外等待（秒 · 0 = 用备案默认 6~9 秒）</span>
-            <input v-model.number="scan.icp_gap" class="input mono" type="number" min="0" step="1" />
-            <span class="field-hint">叠加在备案自身节流之上。填 0 走站点级间隔；填 10 就是每次备案至少歇 10 秒。</span>
+
+          <div class="panel">
+            <div class="panel-head"><span><Icon name="globe" :size="13" />分源间隔</span></div>
+            <div class="panel-body stack" style="gap: 10px">
+              <div v-for="s in SOURCES" :key="s.k" class="row" style="gap: 8px; align-items: flex-end">
+                <span style="width: 88px; font-size: 11.5px">{{ s.label }}</span>
+                <div class="field flex-1">
+                  <span class="field-label">最小</span>
+                  <input v-model.number="perSource[s.k].min_interval" class="input mono" type="number" step="0.1" />
+                </div>
+                <div class="field flex-1">
+                  <span class="field-label">最大</span>
+                  <input v-model.number="perSource[s.k].max_interval" class="input mono" type="number" step="0.1" />
+                </div>
+              </div>
+              <span class="tip">工商 / 备案主源容易封 IP，间隔别低于 2 秒；写 0 表示跟随全局。</span>
+            </div>
           </div>
         </div>
-      </div>
 
-      <div class="panel">
-        <div class="panel-head"><span><Icon name="control" :size="13" />其它阶段的节奏</span></div>
-        <div class="panel-body stack" style="gap: 12px">
-          <span class="field-hint">端口扫描和字典爆破的并发 / 间隔在上面的「采集强度」里；这三项在这里也能直接改。</span>
-          <div class="row">
-            <div class="field flex-1">
-              <span class="field-label">同时扫几台 IP（0 = 不限）</span>
-              <input v-model.number="scan.port_ip_concurrent" class="input mono" type="number" min="0" />
-            </div>
-            <div class="field flex-1">
-              <span class="field-label">每台 IP 错开（秒）</span>
-              <input v-model.number="scan.port_ip_gap" class="input mono" type="number" min="0" step="0.1" />
+        <div v-if="section === 'deep'" class="cards two">
+          <div class="panel">
+            <div class="panel-head"><span><Icon name="route" :size="13" />深挖开关</span></div>
+            <div class="panel-body" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px">
+              <label class="opt"><span class="switch" :class="{ on: deep.code_leak }" @click="deep.code_leak = !deep.code_leak" />代码泄露</label>
+              <label class="opt"><span class="switch" :class="{ on: deep.email_harvest }" @click="deep.email_harvest = !deep.email_harvest" />邮箱收集</label>
+              <label class="opt"><span class="switch" :class="{ on: deep.mail_dns }" @click="deep.mail_dns = !deep.mail_dns" />邮件 DNS</label>
+              <label class="opt"><span class="switch" :class="{ on: deep.bucket_enum }" @click="deep.bucket_enum = !deep.bucket_enum" />存储桶枚举</label>
+              <label class="opt"><span class="switch" :class="{ on: deep.screenshot }" @click="deep.screenshot = !deep.screenshot" />页面截图</label>
+              <label class="opt"><span class="switch" :class="{ on: deep.nuclei }" @click="deep.nuclei = !deep.nuclei" />Nuclei 复核</label>
+              <label class="opt"><span class="switch" :class="{ on: deep.ai_search }" @click="deep.ai_search = !deep.ai_search" />AI 搜索</label>
+              <label class="opt"><span class="switch" :class="{ on: deep.ai_triage }" @click="deep.ai_triage = !deep.ai_triage" />AI 归因</label>
             </div>
           </div>
-          <div class="row">
-            <div class="field flex-1">
-              <span class="field-label">爆破并发</span>
-              <input v-model.number="scan.domain_brute_concurrent" class="input mono" type="number" min="1" />
-            </div>
-            <div class="field flex-1">
-              <span class="field-label">根域间等待（秒）</span>
-              <input v-model.number="scan.domain_brute_gap" class="input mono" type="number" min="0" step="0.5" />
+
+          <div class="panel">
+            <div class="panel-head"><span><Icon name="shield" :size="13" />Nuclei 口径</span></div>
+            <div class="panel-body stack" style="gap: 12px">
+              <div class="field">
+                <span class="field-label">模板级别（复核用）</span>
+                <input v-model="deep.nuclei_severity" class="input mono" placeholder="critical,high" />
+              </div>
+              <div class="field">
+                <span class="field-label">nuclei 可执行路径</span>
+                <input v-model="deep.nuclei_path" class="input mono" placeholder="nuclei" />
+              </div>
+              <span class="tip">「Nuclei 复核」按上面的级别跑；一键收集里勾「POC 扫描」则忽略级别、全量扫 POC 管理里的模板。</span>
             </div>
           </div>
         </div>
-      </div>
-    </div>
 
-    <div v-if="section === 'deep'" class="cards two">
-      <div class="panel">
-        <div class="panel-head"><span><Icon name="route" :size="13" />深度阶段</span></div>
-        <div class="panel-body" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px">
-          <label class="opt"><span class="switch" :class="{ on: deep.code_leak }" @click="deep.code_leak = !deep.code_leak" />代码泄露检索</label>
-          <label class="opt"><span class="switch" :class="{ on: deep.email_harvest }" @click="deep.email_harvest = !deep.email_harvest" />邮箱收集</label>
-          <label class="opt"><span class="switch" :class="{ on: deep.mail_dns }" @click="deep.mail_dns = !deep.mail_dns" />MX / SPF / DMARC</label>
-          <label class="opt"><span class="switch" :class="{ on: deep.bucket_enum }" @click="deep.bucket_enum = !deep.bucket_enum" />存储桶枚举</label>
-          <label class="opt"><span class="switch" :class="{ on: deep.screenshot }" @click="deep.screenshot = !deep.screenshot" />站点截图</label>
-          <label class="opt"><span class="switch" :class="{ on: deep.nuclei }" @click="deep.nuclei = !deep.nuclei" />Nuclei 模板</label>
-          <label class="opt"><span class="switch" :class="{ on: deep.ai_search }" @click="deep.ai_search = !deep.ai_search" />AI 关键词扩展（企业阶段别名 / 产品名）</label>
-          <label class="opt"><span class="switch" :class="{ on: deep.ai_triage }" @click="deep.ai_triage = !deep.ai_triage" />任务结束自动写 AI 侦察小结</label>
-          <span class="field-hint">两项都需要先在「系统设置 → AI」接入大模型；其它 AI 能力在左侧「AI 工坊」。</span>
-        </div>
-      </div>
-
-      <div class="panel">
-        <div class="panel-head"><span><Icon name="bug" :size="13" />外部工具</span></div>
-        <div class="panel-body stack" style="gap: 12px">
-          <div class="field">
-            <span class="field-label">Nuclei 可执行路径</span>
-            <input v-model="deep.nuclei_path" class="input mono" placeholder="nuclei" />
-          </div>
-          <div class="field">
-            <span class="field-label">Nuclei 严重级别</span>
-            <input v-model="deep.nuclei_severity" class="input mono" placeholder="critical,high" />
-          </div>
-          <span class="field-hint">
-            存储桶枚举与站点截图会产生大量外部请求，默认关闭；Nuclei 需本机已安装并在 PATH 中。
-          </span>
-        </div>
-      </div>
-    </div>
-
-    <div v-if="section === 'http'" class="cards two">
-      <div class="panel">
-        <div class="panel-head"><span><Icon name="server" :size="13" />HTTP 探测</span></div>
-        <div class="panel-body stack" style="gap: 12px">
-          <div class="row">
-            <div class="field flex-1">
-              <span class="field-label">超时（秒）</span>
-              <input v-model.number="httpOpt.timeout" class="input mono" type="number" />
-            </div>
-            <div class="field flex-1">
-              <span class="field-label">并发</span>
-              <input v-model.number="httpOpt.concurrent" class="input mono" type="number" />
+        <div v-if="section === 'http'" class="cards two">
+          <div class="panel">
+            <div class="panel-head"><span><Icon name="server" :size="13" />HTTP 网络</span></div>
+            <div class="panel-body stack" style="gap: 12px">
+              <div class="row">
+                <div class="field flex-1">
+                  <span class="field-label">超时（秒）</span>
+                  <input v-model.number="httpOpt.timeout" class="input mono" type="number" step="1" />
+                </div>
+                <div class="field flex-1">
+                  <span class="field-label">并发</span>
+                  <input v-model.number="httpOpt.concurrent" class="input mono" type="number" />
+                </div>
+              </div>
+              <label class="opt"><span class="switch" :class="{ on: httpOpt.follow_redirects }" @click="httpOpt.follow_redirects = !httpOpt.follow_redirects" />跟随跳转</label>
+              <label class="opt"><span class="switch" :class="{ on: httpOpt.verify }" @click="httpOpt.verify = !httpOpt.verify" />校验 TLS 证书</label>
             </div>
           </div>
-          <label class="opt"><span class="switch" :class="{ on: httpOpt.verify }" @click="httpOpt.verify = !httpOpt.verify" />校验 TLS 证书</label>
-          <label class="opt"><span class="switch" :class="{ on: httpOpt.follow_redirects }" @click="httpOpt.follow_redirects = !httpOpt.follow_redirects" />跟随跳转</label>
+
+          <div class="panel">
+            <div class="panel-head"><span><Icon name="globe" :size="13" />请求特征</span></div>
+            <div class="panel-body stack" style="gap: 12px">
+              <div class="field">
+                <span class="field-label">User-Agent（留空用默认）</span>
+                <input v-model="httpOpt.user_agent" class="input mono" placeholder="Mozilla/5.0 …" />
+              </div>
+              <div class="field">
+                <span class="field-label">同 ASN 小段上限</span>
+                <input v-model.number="scan.asn_block_limit" class="input mono" type="number" />
+              </div>
+              <div class="field">
+                <span class="field-label">空间测绘单根域上限（0 = 不限）</span>
+                <input v-model.number="scan.space_max_roots" class="input mono" type="number" />
+              </div>
+            </div>
+          </div>
         </div>
-      </div>
-      <div class="panel">
-        <div class="panel-head"><span><Icon name="terminal" :size="13" />User-Agent</span></div>
-        <div class="panel-body">
-          <textarea v-model="httpOpt.user_agent" class="textarea" style="min-height: 90px" />
+
+        <div v-if="section === 'oneclick'" class="cards two">
+          <div class="panel">
+            <div class="panel-head"><span><Icon name="flow" :size="13" />一键收集默认编排</span></div>
+            <div class="panel-body stack" style="gap: 12px">
+              <div class="field">
+                <span class="field-label">采集强度</span>
+                <select v-model="oneclick.preset" class="select">
+                  <option v-for="p in PRESETS" :key="p.v" :value="p.v">{{ p.label }}</option>
+                </select>
+              </div>
+              <div class="field">
+                <span class="field-label">执行步骤</span>
+                <div class="row" style="gap: 6px; flex-wrap: wrap">
+                  <button
+                    v-for="s in STEPS"
+                    :key="s.k"
+                    class="btn xs"
+                    :class="{ primary: oneclick.steps.includes(s.k) }"
+                    @click="toggleStep(s.k)"
+                  >
+                    {{ s.label }}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><span><Icon name="aim" :size="13" />开关</span></div>
+            <div class="panel-body stack" style="gap: 12px">
+              <label class="opt"><span class="switch" :class="{ on: oneclick.expand_enterprise }" @click="oneclick.expand_enterprise = !oneclick.expand_enterprise" />企业主体扩展</label>
+              <label class="opt"><span class="switch" :class="{ on: oneclick.expand_mobile }" @click="oneclick.expand_mobile = !oneclick.expand_mobile" />小程序 / App</label>
+              <label class="opt"><span class="switch" :class="{ on: oneclick.poc_scan }" @click="oneclick.poc_scan = !oneclick.poc_scan" />POC 全量扫描</label>
+              <span class="tip">勾 POC 全量扫描会自动带上「深度挖掘」步骤，用 POC 管理里的全部模板扫，不限级别。</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="action-bar">
+          <button class="btn primary" :disabled="saving" @click="save"><Icon name="check" :size="14" />{{ saving ? '保存中…' : '保存策略' }}</button>
+          <button v-if="selected" class="btn" :disabled="!cur.id" @click="applyToGlobal"><Icon name="download" :size="14" />写回全局</button>
+          <span class="action-tip">{{ cur.id ? `正在编辑：${selected?.name || cur.name}` : '新策略（尚未保存）' }}</span>
         </div>
       </div>
     </div>
@@ -590,5 +691,22 @@ onMounted(async () => {
 </template>
 
 <style scoped>
-.opt { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-2); cursor: pointer; }
+.policy-layout { display: grid; grid-template-columns: 236px minmax(0, 1fr); gap: 12px; align-items: start; }
+.policy-list { position: sticky; top: 12px; }
+.policy-items { display: flex; flex-direction: column; gap: 4px; padding: 8px; max-height: calc(100vh - 200px); overflow-y: auto; }
+.policy-item {
+  display: flex; flex-direction: column; gap: 4px; text-align: left;
+  padding: 9px 10px; border-radius: 8px; border: 1px solid transparent;
+  background: transparent; color: var(--text-2); cursor: pointer;
+}
+.policy-item:hover { background: var(--hover, rgba(120, 200, 220, 0.07)); }
+.policy-item.on { border-color: var(--accent, #34e5c8); background: rgba(52, 229, 200, 0.09); color: var(--text); }
+.pi-name { font-size: 12.5px; display: flex; align-items: center; }
+.pi-desc { font-size: 10.5px; color: var(--muted); line-height: 1.5; }
+.policy-editor { min-width: 0; }
+@media (max-width: 900px) {
+  .policy-layout { grid-template-columns: minmax(0, 1fr); }
+  .policy-list { position: static; }
+  .policy-items { max-height: 200px; }
+}
 </style>

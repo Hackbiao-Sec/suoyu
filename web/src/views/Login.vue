@@ -9,7 +9,7 @@ const auth = useAuthStore()
 const router = useRouter()
 const route = useRoute()
 
-const form = reactive({ username: 'admin', password: '' })
+const form = reactive({ username: 'hkbb', password: '' })
 const loading = ref(false)
 const error = ref('')
 
@@ -42,7 +42,7 @@ async function submit() {
       <form class="login-form" @submit.prevent="submit">
         <div class="field">
           <label class="field-label">账号</label>
-          <input v-model="form.username" class="input" placeholder="admin" autocomplete="username" />
+          <input v-model="form.username" class="input" placeholder="hkbb" autocomplete="username" />
         </div>
         <div class="field">
           <label class="field-label">密码</label>
@@ -67,6 +67,7 @@ async function submit() {
       </form>
 
       <p class="field-hint" style="margin-top: 18px; line-height: 1.7">
+        默认账号 <span class="mono">hkbb</span> · 默认密码 <span class="mono">hkbb666</span>，登录后请及时修改。<br />
         企业主体 · 被动子域 · 空间测绘 · 端口指纹 · 站点爬虫 · 代码泄露<br />
         单进程运行，数据全部落在本机。
       </p>

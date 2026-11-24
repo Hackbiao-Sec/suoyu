@@ -118,7 +118,10 @@ def current_user(request: Request) -> str:
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    store.ensure_admin("admin", hash_password("arlpass"))
+    # 出厂管理员：hkbb / hkbb666；老库里的 admin/arlpass 若还没被改过，一并迁过来
+    store.ensure_admin("hkbb", hash_password("hkbb666"))
+    store.migrate_admin("admin", hash_password("arlpass"), "hkbb", hash_password("hkbb666"))
+    _seed_policies()
     load_tokens()
     # 进程重启后内存里没有 RUNNING 实例：上次没跑完的任务不可能再继续，统一标成中断
     for t in store.list_tasks(limit=500):
@@ -176,6 +179,119 @@ def set_config(request: Request, patch: dict = Body(...)) -> dict:
     config.reload()
     audit("config_update", json.dumps(list(patch.keys())), user=user)
     _ = masked
+    return {"ok": True, "config": config.masked()}
+
+
+# ─────────────── 侦察策略 ───────────────
+# 一套策略 = 名字 + 五个子段（范围 / 采集强度 / 风控节流 / 深度挖掘 / 网络参数）
+# + 一键收集默认项。一键收集把 scan/deep 平铺成本轮 options 真正生效；
+# 节流 / 网络 / 范围由引擎各处直接读 config，所以选中策略时写回全局配置。
+POLICY_SECTIONS = ("policy", "scan", "throttle", "deep", "http")
+
+
+def _policy_snapshot() -> dict:
+    return {sec: json.loads(json.dumps(config.section(sec) or {})) for sec in POLICY_SECTIONS}
+
+
+def _seed_policies() -> None:
+    """首次启动落两套出厂策略：常用、深度。用户删光后不会再补。"""
+    try:
+        if store.list_policies():
+            return
+    except Exception:
+        return
+    standard = _policy_snapshot()
+    standard["scan"].update({"port_type": "top100", "domain_brute": True, "site_spider": True,
+                             "file_leak": True, "sibling": True, "asn_expand": True,
+                             "vhost_collision": False})
+    standard["deep"].update({"nuclei": False, "bucket_enum": False})
+    standard["oneclick"] = {"preset": "standard", "steps": [], "expand_enterprise": True,
+                            "expand_mobile": True, "poc_scan": False}
+
+    deep = _policy_snapshot()
+    deep["scan"].update({"port_type": "top1000", "domain_brute": True, "site_spider": True,
+                         "file_leak": True, "sibling": True, "asn_expand": True,
+                         "vhost_collision": True})
+    deep["deep"].update({"nuclei": True, "bucket_enum": True, "ai_search": True,
+                         "code_leak": True, "email_harvest": True})
+    deep["oneclick"] = {"preset": "deep", "steps": [], "expand_enterprise": True,
+                        "expand_mobile": True, "poc_scan": False}
+
+    for i, (name, desc, payload) in enumerate((
+        ("常用", "常规一轮：被动全源 + 字典 + TOP100 端口 + 爬虫 / 敏感文件，nuclei 复核关闭", standard),
+        ("深度", "深度一轮：TOP1000 端口 + VHost 碰撞 + 存储桶 / 代码泄露 / 邮箱，可叠加 POC 全量扫描", deep),
+    )):
+        store.save_policy({"id": f"builtin-{i + 1}", "name": name, "desc": desc,
+                           "payload": payload, "builtin": 1, "sort": i})
+
+
+def _clean_policy(body: dict, pid: str | None) -> dict:
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="策略名称不能为空")
+    payload = body.get("payload")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="策略内容格式不对")
+    clean: dict = {}
+    for sec in POLICY_SECTIONS:
+        v = payload.get(sec)
+        if isinstance(v, dict):
+            clean[sec] = v
+    if isinstance(payload.get("oneclick"), dict):
+        clean["oneclick"] = payload["oneclick"]
+    return {"id": pid or f"p{os.urandom(6).hex()}", "name": name,
+            "desc": (body.get("desc") or "").strip(), "payload": clean}
+
+
+@app.get("/api/policies")
+def list_policies(request: Request) -> dict:
+    current_user(request)
+    return {"ok": True, "items": store.list_policies()}
+
+
+@app.post("/api/policies")
+def save_policy(request: Request, body: dict = Body(...)) -> dict:
+    user = current_user(request)
+    pid = (body.get("id") or "").strip() or None
+    item = _clean_policy(body, pid)
+    if pid:
+        old = store.get_policy(pid)
+        if old:
+            item["builtin"] = 1 if old.get("builtin") else 0
+            item["sort"] = old.get("sort", 0)
+    for p in store.list_policies():
+        if p["name"] == item["name"] and p["id"] != item["id"]:
+            raise HTTPException(status_code=400, detail=f"策略「{item['name']}」已存在")
+    store.save_policy(item)
+    audit("policy_save", item["name"], item["id"], user=user)
+    return {"ok": True, "item": store.get_policy(item["id"])}
+
+
+@app.delete("/api/policies/{pid}")
+def delete_policy(request: Request, pid: str) -> dict:
+    user = current_user(request)
+    items = store.list_policies()
+    if any(p["id"] == pid for p in items) and len(items) <= 1:
+        raise HTTPException(status_code=400, detail="至少保留一套策略")
+    removed = store.delete_policy(pid)
+    if not removed:
+        raise HTTPException(status_code=404, detail="策略不存在")
+    audit("policy_delete", pid, user=user)
+    return {"ok": True, "removed": removed}
+
+
+@app.post("/api/policies/{pid}/apply")
+def apply_policy(request: Request, pid: str) -> dict:
+    """把整套策略写回全局配置，之后不选策略的任务也按它跑。"""
+    user = current_user(request)
+    p = store.get_policy(pid)
+    if not p:
+        raise HTTPException(status_code=404, detail="策略不存在")
+    payload = p.get("payload") or {}
+    patch = {sec: payload[sec] for sec in POLICY_SECTIONS if isinstance(payload.get(sec), dict)}
+    config.persist(patch)
+    config.reload()
+    audit("policy_apply", p["name"], pid, user=user)
     return {"ok": True, "config": config.masked()}
 
 
@@ -843,6 +959,18 @@ def repair_liveness(request: Request, task_id: str = "") -> dict:
     current_user(request)
     hit = store.repair_liveness(task_id)
     return {"ok": True, "updated": hit, "task_id": task_id}
+
+
+@app.post("/api/assets/delete")
+def delete_assets(request: Request, body: dict = Body(...)) -> dict:
+    """批量删资产：body 传 {"ids": [1,2,3]}，任务关联一起清。"""
+    user = current_user(request)
+    ids = body.get("ids")
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(status_code=400, detail="没有选中资产")
+    removed = store.delete_assets(ids)
+    audit("asset_delete", f"{removed} 条", json.dumps(ids[:50]), user=user)
+    return {"ok": True, "removed": removed}
 
 
 # 注意顺序：/api/assets/facets 必须注册在 /api/assets/{asset_id} 之前，
@@ -2505,6 +2633,26 @@ async def oneclick(request: Request, body: dict = Body(...)) -> dict:
 
     preset = ONECLICK_PRESETS.get((body.get("preset") or "standard").lower())
     options = dict(preset["options"]) if preset else {}
+
+    # 命名策略：先把策略里的采集强度 / 深挖项铺成本轮 options（覆盖预设），
+    # 再让前端显式开关覆盖策略；范围 / 节流 / 网络写回全局配置（引擎直接读 config）。
+    policy = None
+    policy_id = (body.get("policy_id") or "").strip()
+    if policy_id:
+        policy = store.get_policy(policy_id)
+        if policy:
+            pol = policy.get("payload") or {}
+            for sec in ("scan", "deep"):
+                for k, v in (pol.get(sec) or {}).items():
+                    options[k] = v
+            side = {sec: pol[sec] for sec in ("policy", "throttle", "http")
+                    if isinstance(pol.get(sec), dict)}
+            if side:
+                try:
+                    config.persist(side)
+                    config.reload()
+                except Exception:
+                    pass
     options.update(body.get("options") or {})
     # 前端可以按任务覆盖控股门槛；没给就用配置里的 scan.equity_ratio
     if body.get("equity_ratio") not in (None, ""):
@@ -2522,10 +2670,15 @@ async def oneclick(request: Request, body: dict = Body(...)) -> dict:
     # 五步勾选：p1 主体 / p2 域名 / p3 测绘 / p4 探测 / p5 深挖。
     # 前端默认全选；全选时不写 steps，老任务与外部调用照旧走完整流程。
     raw_steps = body.get("steps")
+    if raw_steps in (None, "") and policy:
+        raw_steps = ((policy.get("payload") or {}).get("oneclick") or {}).get("steps")
     if isinstance(raw_steps, str):
         raw_steps = [s for s in raw_steps.replace("，", ",").split(",")]
     steps = [s for s in (raw_steps or []) if s in pipeline.ONECLICK_STEPS]
     steps = list(dict.fromkeys(steps))
+    # 勾了 POC 扫描就得有深度阶段，否则没有执行点
+    if options.get("poc_scan") and steps and "p5" not in steps:
+        steps.append("p5")
     all_steps = len(steps) == len(pipeline.ONECLICK_STEPS)
     if steps and not all_steps:
         options["steps"] = steps
@@ -2537,6 +2690,8 @@ async def oneclick(request: Request, body: dict = Body(...)) -> dict:
     name = body.get("name") or f"一键收集-{seeds[0][:20]}"
     if preset:
         name = f"{name}（{preset['label']}）"
+    if policy:
+        name = f"{name}·{policy['name']}策略"
     task_id = await pipeline.start_task(
         targets, options, name,
         expand={"enterprise": bool(body.get("expand_enterprise", True)) and "p1" in (steps or pipeline.ONECLICK_STEPS),
@@ -2548,6 +2703,8 @@ async def oneclick(request: Request, body: dict = Body(...)) -> dict:
     return {"ok": True, "task_id": task_id, "targets": targets, "count": len(targets),
             "entities": [], "mobile": {"apps": [], "applets": [], "domains": [], "notes": []},
             "preset": body.get("preset") or "standard",
+            "policy": policy["name"] if policy else "",
+            "poc_scan": bool(options.get("poc_scan")),
             "steps": steps or list(pipeline.ONECLICK_STEPS),
             "message": "任务已创建，主体扩线 / 应用 / 小程序正在后台展开，进度看任务详情"} 
 

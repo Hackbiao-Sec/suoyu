@@ -256,6 +256,18 @@ CREATE TABLE IF NOT EXISTS task_templates (
     created_at REAL
 );
 
+-- 侦察策略：一套命名策略 = 范围 / 强度 / 节流 / 深挖 / 网络 五段 + 一键收集默认项
+CREATE TABLE IF NOT EXISTS policies (
+    id TEXT PRIMARY KEY,
+    name TEXT UNIQUE,
+    desc TEXT,
+    payload_json TEXT,
+    builtin INTEGER DEFAULT 0,
+    sort INTEGER DEFAULT 0,
+    created_at REAL,
+    updated_at REAL
+);
+
 CREATE TABLE IF NOT EXISTS audit (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL,
@@ -485,6 +497,28 @@ class Store:
     def get_task(self, task_id: str) -> dict | None:
         row = self.conn().execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         return self._task_row(row) if row else None
+
+    def delete_assets(self, ids: Iterable[int]) -> int:
+        """按 id 批量删资产；任务关联一起清，返回真正删掉的条数。"""
+        clean: list[int] = []
+        for i in ids:
+            try:
+                clean.append(int(i))
+            except (TypeError, ValueError):
+                continue
+        if not clean:
+            return 0
+        removed = 0
+        with self._write_lock:
+            c = self.conn()
+            for i in range(0, len(clean), 400):
+                chunk = clean[i:i + 400]
+                marks = ",".join("?" * len(chunk))
+                c.execute(f"DELETE FROM task_assets WHERE asset_id IN ({marks})", chunk)
+                cur = c.execute(f"DELETE FROM assets WHERE id IN ({marks})", chunk)
+                removed += cur.rowcount
+            c.commit()
+        return removed
 
     def list_tasks(self, limit: int = 100) -> list[dict]:
         rows = self.conn().execute(
@@ -1140,6 +1174,68 @@ class Store:
         row = self.conn().execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
         return dict(row) if row else None
 
+    def migrate_admin(self, old_username: str, old_hash: str,
+                      new_username: str, new_hash: str) -> None:
+        """出厂默认账号迁移：旧账号还在用出厂密码才改名改密，用户自己改过的不动。"""
+        c = self.conn()
+        row = c.execute("SELECT * FROM users WHERE username=?", (old_username,)).fetchone()
+        if not row or row["password"] != old_hash:
+            return
+        try:
+            c.execute("UPDATE users SET username=?, password=? WHERE id=?",
+                      (new_username, new_hash, row["id"]))
+            c.commit()
+        except sqlite3.IntegrityError:
+            # 新账号名已存在（用户自己建过），保留现状，不覆盖用户数据
+            return
+
+    # ─────── policies ───────
+    def list_policies(self) -> list[dict]:
+        rows = self.conn().execute(
+            "SELECT * FROM policies ORDER BY sort ASC, created_at ASC").fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["payload"] = json.loads(d.pop("payload_json") or "{}")
+            d["builtin"] = bool(d.get("builtin"))
+            out.append(d)
+        return out
+
+    def get_policy(self, pid: str) -> dict | None:
+        row = self.conn().execute("SELECT * FROM policies WHERE id=?", (pid,)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["payload"] = json.loads(d.pop("payload_json") or "{}")
+        d["builtin"] = bool(d.get("builtin"))
+        return d
+
+    def save_policy(self, item: dict) -> None:
+        now = time.time()
+        with self._write_lock:
+            c = self.conn()
+            old = c.execute("SELECT created_at, builtin FROM policies WHERE id=?",
+                            (item["id"],)).fetchone()
+            c.execute(
+                "INSERT OR REPLACE INTO policies (id,name,desc,payload_json,builtin,sort,created_at,updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    item["id"], item.get("name", ""), item.get("desc", ""),
+                    json.dumps(item.get("payload") or {}, ensure_ascii=False),
+                    int(item.get("builtin", 0)),
+                    int(item.get("sort", 0)),
+                    (old["created_at"] if old else now), now,
+                ),
+            )
+            c.commit()
+
+    def delete_policy(self, pid: str) -> int:
+        with self._write_lock:
+            c = self.conn()
+            cur = c.execute("DELETE FROM policies WHERE id=?", (pid,))
+            c.commit()
+            return cur.rowcount
+
     # ─────── schedules ───────
     def list_schedules(self) -> list[dict]:
         rows = self.conn().execute("SELECT * FROM schedules ORDER BY created_at DESC").fetchall()
@@ -1260,6 +1356,10 @@ class Store:
         new_week = c.execute("SELECT COUNT(*) FROM assets WHERE first_seen>=?", (week,)).fetchone()[0]
         site = stats["by_kind"].get("site", 0)
         cdn = c.execute("SELECT COUNT(*) FROM assets WHERE cdn IS NOT NULL AND cdn!=''").fetchone()[0]
+        # 根域个数要全量算：top_roots 只取前 30，不能拿来当总数
+        roots = c.execute(
+            "SELECT COUNT(DISTINCT root_domain) FROM assets"
+            " WHERE root_domain IS NOT NULL AND root_domain!=''").fetchone()[0]
         tasks = c.execute(
             "SELECT status, COUNT(*) FROM tasks GROUP BY status").fetchall()
         task_stat = {r[0]: r[1] for r in tasks}
@@ -1275,7 +1375,7 @@ class Store:
             last7.append({"day": time.strftime("%m-%d", time.localtime(hi)), "count": n})
         return {
             "total": total, "by_kind": stats["by_kind"], "site": site, "cdn": cdn,
-            "new_day": new_day, "new_week": new_week,
+            "roots": int(roots or 0), "new_day": new_day, "new_week": new_week,
             "tasks": task_stat, "running": len(pipeline_running()),
             "top_fingerprints": stats["top_fingerprints"],
             "top_roots": stats["top_roots"], "top_ports": stats["top_ports"],

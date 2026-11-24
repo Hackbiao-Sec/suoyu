@@ -3292,12 +3292,13 @@ class StagesMixin:
                     self.save_asset({"kind": "screenshot", "url": u, "host": host_of(u),
                                      "extra": {"file": fp}, "sources": "playwright"})
             self.log("deep", f"  截图 {len(picks)} 个（存 {shot_dir}）")
-        # nuclei
-        if want_nuclei and self._deep_flag("nuclei", False) and sites:
-            self.log("deep", "  nuclei 复核中…")
-            hits = await deep.run_nuclei(
-                sites[:200],
+        # nuclei：POC 扫描勾选时跑全量模板（不限级别），否则只按配置的级别复核
+        want_poc = bool(self.opt("poc_scan", False))
+        if sites and (want_poc or (want_nuclei and self._deep_flag("nuclei", False))):
+            self.log("deep", "  nuclei POC 全量扫描中…" if want_poc else "  nuclei 复核中…")
+            sev = "" if want_poc else (
                 self.opt("nuclei_severity", None) or config.get("deep", "nuclei_severity") or "critical,high")
+            hits = await deep.run_nuclei(sites[:200], sev)
             for h in hits:
                 self.save_asset({"kind": "nuclei", "url": f"nuclei:{h.get('matched')}",
                                  "host": host_of(str(h.get("host") or "")),
