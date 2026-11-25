@@ -18,6 +18,8 @@ let win = null;
 let server = null;
 let serverPort = 0;
 let quitting = false;
+// 引擎子进程提前退出时记下来：探活还在傻等 60 秒，用户看到的就是「卡住 + 白屏」
+let engineExited = null;
 
 // ── 自绘窗口按钮的 IPC ─────────────────────────────────────────
 // 按发送方定位窗口：内嵌窗口和外链窗口共用同一套网页按钮，不写死主窗口。
@@ -108,6 +110,7 @@ function startServer(port) {
   const dataDir = path.join(app.getPath("userData"), "data");
   fs.mkdirSync(dataDir, { recursive: true });
   log(`start engine ${exe} port=${port} data=${dataDir}`);
+  engineExited = null;
   const child = spawn(exe, [], {
     cwd: path.dirname(exe),
     env: {
@@ -124,7 +127,14 @@ function startServer(port) {
   const out = fs.createWriteStream(path.join(LOG_DIR(), "engine.log"), { flags: "a" });
   child.stdout?.pipe(out);
   child.stderr?.pipe(out);
-  child.on("exit", (code) => log(`engine exited code=${code}`));
+  child.on("error", (err) => {
+    engineExited = { code: null, signal: null, at: Date.now(), error: String(err) };
+    log(`engine spawn error ${err}`);
+  });
+  child.on("exit", (code, signal) => {
+    engineExited = { code, signal, at: Date.now() };
+    log(`engine exited code=${code} signal=${signal}`);
+  });
   return child;
 }
 
@@ -157,10 +167,52 @@ function probe(port) {
   });
 }
 
+/** 就绪后取一次版本号，日志里留下这次跑的是哪个前端构建 */
+function readStatus(port) {
+  return new Promise((resolve) => {
+    const req = http.get({ host: "127.0.0.1", port, path: "/api/status", timeout: 2000 }, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        if (body.length < 8192) body += chunk;
+      });
+      res.on("end", () => {
+        try {
+          resolve(JSON.parse(body));
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(null);
+    });
+  });
+}
+
+/** 启动期间窗口里是本地 splash，等引擎时用这两句更新文案，避免白屏干等 */
+function splashStep(text) {
+  if (!win || win.isDestroyed()) return;
+  win.webContents
+    .executeJavaScript(`window.__suoyuStep && window.__suoyuStep(${JSON.stringify(text)})`)
+    .catch(() => {});
+}
+
+function splashFail(text) {
+  if (!win || win.isDestroyed()) return;
+  win.webContents
+    .executeJavaScript(`window.__suoyuFail && window.__suoyuFail(${JSON.stringify(text)})`)
+    .catch(() => {});
+}
+
 async function waitReady(port, timeoutMs = 60000) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     if (await probe(port)) return true;
+    // 引擎已经挂了就别再等满一分钟：onefile 的引导进程退出就是真退出
+    if (engineExited) return false;
     // 首启动要建库、装内置字典，慢一点是正常的
     await new Promise((r) => setTimeout(r, 600));
   }
@@ -212,13 +264,16 @@ function createWindow() {
   });
   trackMaximized(win);
 
+  // 先挂本地 splash：引擎冷启动十几秒，这段窗口期不能是白的
+  win.loadFile(path.join(__dirname, "splash.html")).catch((err) => log(`splash load failed ${err}`));
+
   const showWindow = (why) => {
     if (!win || win.isDestroyed() || win.isVisible()) return;
     log(`show window (${why})`);
     win.show();
   };
   win.once("ready-to-show", () => showWindow("ready-to-show"));
-  setTimeout(() => showWindow("fallback"), 2500);
+  setTimeout(() => showWindow("fallback"), 1200);
   // 站内点开链接一律留在应用内，避免启动/点击时弹出系统浏览器
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:/i.test(url) && url.includes("127.0.0.1")) {
@@ -261,11 +316,33 @@ function stopServer() {
   server = null;
 }
 
+/** 出错弹窗里带一段引擎日志尾巴，用户不用自己去翻文件 */
+function engineLogTail(lines = 12) {
+  try {
+    const text = fs.readFileSync(path.join(LOG_DIR(), "engine.log"), "utf8");
+    return text.trimEnd().split(/\r?\n/).slice(-lines).join("\n");
+  } catch {
+    return "";
+  }
+}
+
 if (process.env.SUOYU_SAFE_MODE === "1") app.disableHardwareAcceleration();
 
 process.on("uncaughtException", (err) => log(`uncaughtException ${err && err.stack}`));
 
+// 连着双击图标时，第二个实例不该再拉一个引擎去抢端口，把已有窗口提到前台即可
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) app.quit();
+
+app.on("second-instance", () => {
+  if (!win || win.isDestroyed()) return;
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+});
+
 app.whenReady().then(async () => {
+  if (!gotLock) return;
   Menu.setApplicationMenu(null);
   serverPort = await pickPort();
   if (!serverPort) {
@@ -273,17 +350,24 @@ app.whenReady().then(async () => {
     app.quit();
     return;
   }
-  server = startServer(serverPort);
   createWindow();
   if (!win) return;
+  splashStep("正在拉起本地引擎…");
+  server = startServer(serverPort);
   const ok = await waitReady(serverPort);
   if (!ok) {
-    log("engine not ready in time");
+    const exited = engineExited;
+    log(`engine not ready exited=${JSON.stringify(exited)}`);
+    splashFail(exited ? "引擎启动失败" : "引擎启动超时");
+    const headline = exited
+      ? `本地侦察引擎启动后立即退出${exited.error ? `：${exited.error}` : `（code=${exited.code}）`}。`
+      : "本地侦察引擎在 60 秒内没有就绪。";
+    const tail = engineLogTail();
     const choice = dialog.showMessageBoxSync(win, {
       type: "error",
       title: "引擎未能启动",
-      message: "本地侦察引擎在 60 秒内没有就绪。",
-      detail: `端口 ${serverPort}\n日志：${path.join(LOG_DIR(), "engine.log")}`,
+      message: headline,
+      detail: `端口 ${serverPort}\n日志：${path.join(LOG_DIR(), "engine.log")}${tail ? `\n\n最后几行：\n${tail}` : ""}`,
       buttons: ["打开日志目录", "退出"],
       defaultId: 0,
     });
@@ -291,6 +375,9 @@ app.whenReady().then(async () => {
     app.quit();
     return;
   }
+  const status = await readStatus(serverPort);
+  log(`engine ready port=${serverPort} version=${status?.version} build=${status?.build}`);
+  splashStep("引擎就绪，正在载入界面…");
   await win.loadURL(`http://127.0.0.1:${serverPort}/`);
 });
 

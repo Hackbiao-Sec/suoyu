@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>天鉴·索舆</title>
+    <style>
+      * { box-sizing: border-box; }
+      html, body {
+        height: 100%; margin: 0; background: #060b11; color: #77909f;
+        font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+        user-select: none; -webkit-user-select: none;
+      }
+      .wrap {
+        height: 100%; display: flex; flex-direction: column;
+        align-items: center; justify-content: center; gap: 16px;
+      }
+      .ring {
+        width: 36px; height: 36px; border-radius: 50%;
+        border: 2px solid rgba(52, 229, 200, 0.16); border-top-color: #34e5c8;
+        animation: spin 0.9s linear infinite;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .brand { color: #cfe4ee; font-size: 15px; letter-spacing: 3px; }
+      .brand span { color: #34e5c8; }
+      .step { font-size: 12px; letter-spacing: 1.5px; color: #77909f; }
+      .elapsed { font-size: 11px; letter-spacing: 1px; color: #3d5665; }
+      .hint { font-size: 11px; letter-spacing: 1px; color: #3d5665; margin-top: 10px; }
+      .fail .ring { border-color: rgba(255, 107, 107, 0.2); border-top-color: #ff6b6b; }
+      .fail .step { color: #ff8f8f; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap" id="wrap">
+      <div class="ring"></div>
+      <div class="brand">天鉴 · <span>索舆</span></div>
+      <div class="step" id="step">正在启动本地侦察引擎…</div>
+      <div class="elapsed" id="elapsed">0.0 秒</div>
+      <div class="hint">首次启动需要建库并装载内置字典，通常 10～30 秒</div>
+    </div>
+    <script>
+      const started = Date.now();
+      const stepEl = document.getElementById("step");
+      const elapsedEl = document.getElementById("elapsed");
+      const tick = () => {
+        elapsedEl.textContent = ((Date.now() - started) / 1000).toFixed(1) + " 秒";
+      };
+      tick();
+      setInterval(tick, 100);
+      // 外壳通过 executeJavaScript 调到这两个函数更新界面
+      window.__suoyuStep = (text) => { stepEl.textContent = text; };
+      window.__suoyuFail = (text) => {
+        document.getElementById("wrap").classList.add("fail");
+        stepEl.textContent = text;
+      };
+    </script>
+  </body>
+</html>
