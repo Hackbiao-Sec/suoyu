@@ -24,4 +24,5 @@ portable:
   unicode: true
   artifactName: SuoyuConsole-${version}-portable.${ext}
   # 单文件运行：启动时解压到临时目录，退出后清理
-  splashImage: null
+  # 解压这十几秒里窗口还没起来，用品牌图占位，别让双击之后像没反应
+  splashImage: assets/splash.bmp
