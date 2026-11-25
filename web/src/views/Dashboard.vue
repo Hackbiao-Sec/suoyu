@@ -26,6 +26,7 @@ const KIND_LABEL = {
   mobile: 'App', takeover: '子域接管', nuclei: 'POC 命中', api: '接口', js: 'JS 文件',
   icp: '备案', enterprise: '企业', equity: '股权', branch: '分支机构', holds: '控股企业',
   invest: '对外投资', partner: '股东', copyright: '软著', github: '代码仓库',
+  sibling: '旁站', subdomain: '子域', cdn: 'CDN', asn: 'ASN', root: '根域',
 }
 const STATUS_TEXT = {
   running: '执行中', done: '已完成', stopped: '已停止', error: '异常', pending: '排队中',
@@ -61,6 +62,21 @@ const metrics = computed(() => {
     { key: 'run', label: '执行中任务', icon: 'bolt', tone: 'cyan', value: d.running || 0,
       foot: `累计 ${taskTotal.value} 个任务`, to: '/tasks' },
   ]
+})
+
+// 头图圆心的存活率与趋势峰值：都放在这里算，模板和图表共用一份
+const siteRate = computed(() => {
+  const d = data.value
+  if (!d || !d.total) return 0
+  return Math.round((d.site / d.total) * 1000) / 10
+})
+
+const trendStats = computed(() => {
+  const counts = (data.value?.trend || []).map((t) => t.count || 0)
+  const sum = counts.reduce((a, b) => a + b, 0)
+  const avg = counts.length ? sum / counts.length : 0
+  const peak = counts.length ? Math.max(...counts) : 0
+  return { sum, avg: Math.round(avg), peak }
 })
 
 const heroLine = computed(() => {
@@ -126,9 +142,9 @@ function renderTrend() {
   const c = echarts.init(trendEl.value)
   const rows = data.value?.trend || []
   const counts = rows.map((t) => t.count)
-  const avg = counts.length ? counts.reduce((a, b) => a + b, 0) / counts.length : 0
+  const avg = trendStats.value.avg
   c.setOption({
-    grid: { left: 38, right: 16, top: 26, bottom: 24 },
+    grid: { left: 40, right: 16, top: 30, bottom: 24 },
     tooltip: {
       trigger: 'axis',
       backgroundColor: 'rgba(8,17,26,.94)',
@@ -141,7 +157,10 @@ function renderTrend() {
       data: rows.map((t) => t.day),
       axisTick: { show: false },
       axisLine: { lineStyle: { color: 'rgba(115,196,214,.2)' } },
-      axisLabel: { color: '#77909f', fontSize: 10, fontFamily: 'JetBrains Mono, monospace' },
+      axisLabel: {
+        color: '#77909f', fontSize: 10, fontFamily: 'JetBrains Mono, monospace',
+        formatter: (v) => String(v).replace(/^\d{4}-/, ''),
+      },
     },
     yAxis: {
       type: 'value',
@@ -152,6 +171,13 @@ function renderTrend() {
       type: 'bar',
       data: counts,
       barWidth: '44%',
+      showBackground: true,
+      backgroundStyle: { color: 'rgba(120,200,220,.05)', borderRadius: [3, 3, 0, 0] },
+      label: {
+        show: true, position: 'top', distance: 5,
+        color: '#a9bfcd', fontSize: 9.5, fontFamily: 'JetBrains Mono, monospace',
+        formatter: (p) => (p.value > 0 ? p.value : ''),
+      },
       itemStyle: {
         borderRadius: [4, 4, 0, 0],
         color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
@@ -163,11 +189,8 @@ function renderTrend() {
       markLine: {
         silent: true,
         symbol: 'none',
-        lineStyle: { color: 'rgba(245,181,68,.55)', type: 'dashed', width: 1 },
-        label: {
-          formatter: `日均 ${Math.round(avg)}`, color: '#f5b544',
-          fontSize: 9.5, position: 'insideEndTop',
-        },
+        lineStyle: { color: 'rgba(245,181,68,.5)', type: 'dashed', width: 1 },
+        label: { show: false },
         data: [{ yAxis: avg }],
       },
     }],
@@ -308,9 +331,10 @@ onBeforeUnmount(() => {
         <div class="sweep" />
         <i class="blip b1" /><i class="blip b2" /><i class="blip b3" />
         <div class="radar-core">
-          <b>{{ Number(data?.roots || 0).toLocaleString() }}</b>
-          <span>ROOT DOMAINS</span>
-          <em>根域资产组</em>
+          <b>{{ siteRate }}<em class="pct">%</em></b>
+          <span>SITE ALIVE</span>
+          <em>站点存活率</em>
+          <small class="mono">{{ Number(data?.site || 0).toLocaleString() }} / {{ Number(data?.total || 0).toLocaleString() }}</small>
         </div>
       </div>
     </section>
@@ -325,6 +349,7 @@ onBeforeUnmount(() => {
         class="kpi" :class="`tone-${m.tone}`"
         @click="router.push(m.to)"
       >
+        <Icon :name="m.icon" :size="66" class="kpi-mark" />
         <span class="kpi-top">
           <span class="ico"><Icon :name="m.icon" :size="15" /></span>
           <span class="kpi-label">{{ m.label }}</span>
@@ -342,7 +367,9 @@ onBeforeUnmount(() => {
           <div class="panel-head">
             <span><Icon name="chart" :size="13" />资产入库趋势</span>
             <span class="head-note">
-              近 7 日合计 <b class="mono">{{ Number(data.new_week || 0).toLocaleString() }}</b> 条
+              近 7 日 <b class="mono">{{ Number(data.new_week || 0).toLocaleString() }}</b> 条
+              · 日均 <b class="mono">{{ trendStats.avg.toLocaleString() }}</b>
+              · 峰值 <b class="mono">{{ trendStats.peak.toLocaleString() }}</b>
             </span>
           </div>
           <div ref="trendEl" class="chart" style="height: 236px" />
@@ -427,10 +454,12 @@ onBeforeUnmount(() => {
                     </span>
                   </td>
                   <td>
-                    <div class="progress"><i :style="{ width: (t.progress || 0) + '%' }" /></div>
-                    <span class="mono muted" style="font-size: 9.5px">{{ t.progress || 0 }}%</span>
+                    <div class="prog-cell">
+                      <span class="progress"><i :style="{ width: (t.progress || 0) + '%' }" /></span>
+                      <span class="mono prog-num">{{ t.progress || 0 }}%</span>
+                    </div>
                   </td>
-                  <td class="mono muted">{{ fmtTime(t.created_at) }}</td>
+                  <td class="mono muted task-time">{{ fmtTime(t.created_at) }}</td>
                 </tr>
                 <tr v-if="!(data.recent_tasks || []).length">
                   <td colspan="4"><div class="empty">还没有任务，点上方「发起一键收集」开始</div></td>
@@ -573,9 +602,9 @@ onBeforeUnmount(() => {
 .cross.y { width: 1px; height: 100%; }
 .sweep {
   position: absolute; inset: 0; border-radius: 50%;
-  background: conic-gradient(from 0deg, rgba(52, 229, 200, 0.5), rgba(52, 229, 200, 0.02) 24%, transparent 40%);
-  -webkit-mask-image: radial-gradient(circle, transparent 14%, #000 15%);
-  mask-image: radial-gradient(circle, transparent 14%, #000 15%);
+  background: conic-gradient(from 0deg, rgba(52, 229, 200, 0.3), rgba(52, 229, 200, 0.02) 22%, transparent 38%);
+  -webkit-mask-image: radial-gradient(circle, transparent 26%, #000 27%);
+  mask-image: radial-gradient(circle, transparent 26%, #000 27%);
   animation: spin 6s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -597,9 +626,11 @@ onBeforeUnmount(() => {
   border: 1px solid rgba(52, 229, 200, 0.22);
   backdrop-filter: blur(5px);
 }
-.radar-core b { font-family: var(--mono); font-size: 23px; font-weight: 600; line-height: 1.1; color: #eafaff; }
+.radar-core b { font-family: var(--mono); font-size: 23px; font-weight: 600; line-height: 1.1; color: #eafaff; display: flex; align-items: baseline; }
+.radar-core b .pct { font-size: 12px; font-style: normal; color: var(--cyan-2); margin-left: 1px; }
 .radar-core span { font-family: var(--mono); font-size: 8px; letter-spacing: 1.6px; color: var(--cyan-2); }
 .radar-core em { font-style: normal; font-size: 10px; color: var(--muted); }
+.radar-core small { margin-top: 3px; font-size: 8.5px; color: var(--muted-2); }
 @media (prefers-reduced-motion: reduce) {
   .sweep, .blip, .live-dot { animation: none; }
 }
@@ -617,18 +648,31 @@ onBeforeUnmount(() => {
 .kpi {
   position: relative; overflow: hidden;
   display: flex; flex-direction: column; align-items: flex-start;
-  padding: 11px 13px 10px;
+  min-height: 104px;
+  padding: 12px 14px 12px;
   border: 1px solid var(--line); border-radius: 11px;
-  background: linear-gradient(160deg, rgba(14, 27, 38, 0.8), rgba(8, 16, 24, 0.62));
+  background:
+    radial-gradient(140px 90px at 100% 100%, rgba(120, 200, 220, 0.09), transparent 70%),
+    linear-gradient(160deg, rgba(14, 27, 38, 0.86), rgba(8, 16, 24, 0.66));
   text-align: left;
   transition: border-color 0.16s, transform 0.16s, background 0.16s;
 }
+.kpi::before {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 2px;
+  background: linear-gradient(180deg, currentColor, transparent);
+  opacity: 0.55;
+}
 .kpi::after {
   content: ""; position: absolute; left: 0; right: 0; top: 0; height: 1px;
-  background: linear-gradient(90deg, transparent, currentColor, transparent);
-  opacity: 0.28;
+  background: linear-gradient(90deg, currentColor, transparent 70%);
+  opacity: 0.3;
+}
+.kpi-mark {
+  position: absolute; right: 4px; bottom: -12px;
+  opacity: 0.06; color: currentColor; pointer-events: none;
 }
 .kpi:hover { border-color: var(--line-strong); transform: translateY(-1px); }
+.kpi:hover .kpi-mark { opacity: 0.11; }
 .kpi-top { display: flex; align-items: center; gap: 7px; width: 100%; }
 .ico {
   display: grid; place-items: center;
@@ -639,11 +683,11 @@ onBeforeUnmount(() => {
 .kpi-go { margin-left: auto; color: var(--muted-2); opacity: 0; transition: opacity 0.16s; }
 .kpi:hover .kpi-go { opacity: 1; }
 .kpi-value {
-  margin-top: 6px;
-  font-family: var(--mono); font-size: 25px; font-weight: 600;
-  line-height: 1.15; color: #eafaff; letter-spacing: -0.4px;
+  margin-top: 8px;
+  font-family: var(--mono); font-size: 28px; font-weight: 600;
+  line-height: 1.15; color: #eafaff; letter-spacing: -0.6px;
 }
-.kpi-foot { margin-top: 1px; font-size: 10.5px; color: var(--muted); }
+.kpi-foot { margin-top: 3px; font-size: 10.5px; color: var(--muted); position: relative; z-index: 1; }
 
 .kpi.tone-cyan { color: var(--cyan); }
 .kpi.tone-cyan .ico { color: var(--cyan); background: rgba(52, 229, 200, 0.1); box-shadow: inset 0 0 0 1px rgba(52, 229, 200, 0.2); }
@@ -667,6 +711,11 @@ onBeforeUnmount(() => {
 .chart { width: 100%; }
 .head-note { font-size: 10.5px; color: var(--muted); }
 .head-note b { color: var(--cyan-ink); font-weight: 600; }
+
+.prog-cell { display: flex; align-items: center; gap: 8px; }
+.prog-cell .progress { display: block; flex: 1 1 auto; }
+.prog-num { font-size: 10px; color: var(--text-2); width: 32px; text-align: right; }
+.task-time { white-space: nowrap; font-size: 10.5px; }
 
 .donut-wrap { position: relative; padding: 8px 10px 0; }
 .donut-center {

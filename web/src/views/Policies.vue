@@ -387,6 +387,11 @@ onMounted(async () => {
             还没有策略，点右上「新建策略」。
           </div>
         </div>
+        <div class="policy-hint">
+          <span class="hint-k">怎么用</span>
+          <p>在「一键收集」顶部选中策略，整轮就按这套参数跑；不选则用全局配置。</p>
+          <p>内置策略改完点保存，会存成你自己的策略。</p>
+        </div>
       </aside>
 
       <div class="stack policy-editor">
@@ -406,19 +411,18 @@ onMounted(async () => {
                 <input v-model="cur.desc" class="input" placeholder="这套策略适合什么场景" />
               </div>
             </div>
-            <div class="row" style="gap: 8px; flex-wrap: wrap">
+            <div class="editor-foot">
               <button class="btn xs" @click="duplicate"><Icon name="copy" :size="12" />另存为副本</button>
               <button class="btn xs" :disabled="!cur.id" @click="applyToGlobal"><Icon name="download" :size="12" />写回全局配置</button>
               <button class="btn xs danger" :disabled="!cur.id" @click="remove"><Icon name="trash" :size="12" />删除</button>
               <span class="tip flex-1">「写回全局配置」只影响之后不套策略的任务；套了策略的任务一律按策略走。</span>
             </div>
+            <div class="seg tabs">
+              <button v-for="s in SECTIONS" :key="s.k" :class="{ on: section === s.k }" @click="section = s.k">
+                {{ s.label }}
+              </button>
+            </div>
           </div>
-        </div>
-
-        <div class="seg">
-          <button v-for="s in SECTIONS" :key="s.k" :class="{ on: section === s.k }" @click="section = s.k">
-            {{ s.label }}
-          </button>
         </div>
 
         <div v-if="section === 'policy'" class="cards two">
@@ -439,8 +443,8 @@ onMounted(async () => {
           <div class="panel">
             <div class="panel-head"><span><Icon name="filter" :size="13" />收集范围</span></div>
             <div class="panel-body stack" style="gap: 12px">
-              <label class="opt"><span class="switch" :class="{ on: policy.only_root_domain }" @click="policy.only_root_domain = !policy.only_root_domain" />仅收集目标根域</label>
-              <label class="opt"><span class="switch" :class="{ on: policy.cdn_exclude }" @click="policy.cdn_exclude = !policy.cdn_exclude" />剔除 CDN 反解域名</label>
+              <label class="opt" @click="policy.only_root_domain = !policy.only_root_domain"><span class="switch" :class="{ on: policy.only_root_domain }"></span>仅收集目标根域</label>
+              <label class="opt" @click="policy.cdn_exclude = !policy.cdn_exclude"><span class="switch" :class="{ on: policy.cdn_exclude }"></span>剔除 CDN 反解域名</label>
               <div class="field">
                 <span class="field-label">只收指定后缀</span>
                 <input v-model="policy.allowed_suffix" class="input" placeholder="留空表示不限，例如 .gov.cn" />
@@ -457,18 +461,18 @@ onMounted(async () => {
           <div class="panel">
             <div class="panel-head"><span><Icon name="tasks" :size="13" />阶段开关</span></div>
             <div class="panel-body" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px">
-              <label class="opt"><span class="switch" :class="{ on: scan.enterprise }" @click="scan.enterprise = !scan.enterprise" />企业主体</label>
-              <label class="opt"><span class="switch" :class="{ on: scan.domain_brute }" @click="scan.domain_brute = !scan.domain_brute" />字典爆破</label>
-              <label class="opt"><span class="switch" :class="{ on: scan.alt_dns }" @click="scan.alt_dns = !scan.alt_dns" />泛解析变体</label>
-              <label class="opt"><span class="switch" :class="{ on: scan.port_scan }" @click="scan.port_scan = !scan.port_scan" />端口扫描</label>
-              <label class="opt"><span class="switch" :class="{ on: scan.service_detect }" @click="scan.service_detect = !scan.service_detect" />服务识别</label>
-              <label class="opt"><span class="switch" :class="{ on: scan.site_spider }" @click="scan.site_spider = !scan.site_spider" />站点爬虫</label>
-              <label class="opt"><span class="switch" :class="{ on: scan.file_leak }" @click="scan.file_leak = !scan.file_leak" />敏感文件</label>
-              <label class="opt"><span class="switch" :class="{ on: scan.vhost_collision }" @click="scan.vhost_collision = !scan.vhost_collision" />VHost 碰撞</label>
-              <label class="opt"><span class="switch" :class="{ on: scan.sibling }" @click="scan.sibling = !scan.sibling" />旁站 C 段</label>
-              <label class="opt"><span class="switch" :class="{ on: scan.asn_expand }" @click="scan.asn_expand = !scan.asn_expand" />ASN 网段归集</label>
-              <label class="opt"><span class="switch" :class="{ on: scan.asn_scan_blocks }" @click="scan.asn_scan_blocks = !scan.asn_scan_blocks" />同 ASN 小段扫描</label>
-              <label class="opt"><span class="switch" :class="{ on: scan.space_mapping }" @click="scan.space_mapping = !scan.space_mapping" />空间测绘</label>
+              <label class="opt" @click="scan.enterprise = !scan.enterprise"><span class="switch" :class="{ on: scan.enterprise }"></span>企业主体</label>
+              <label class="opt" @click="scan.domain_brute = !scan.domain_brute"><span class="switch" :class="{ on: scan.domain_brute }"></span>字典爆破</label>
+              <label class="opt" @click="scan.alt_dns = !scan.alt_dns"><span class="switch" :class="{ on: scan.alt_dns }"></span>泛解析变体</label>
+              <label class="opt" @click="scan.port_scan = !scan.port_scan"><span class="switch" :class="{ on: scan.port_scan }"></span>端口扫描</label>
+              <label class="opt" @click="scan.service_detect = !scan.service_detect"><span class="switch" :class="{ on: scan.service_detect }"></span>服务识别</label>
+              <label class="opt" @click="scan.site_spider = !scan.site_spider"><span class="switch" :class="{ on: scan.site_spider }"></span>站点爬虫</label>
+              <label class="opt" @click="scan.file_leak = !scan.file_leak"><span class="switch" :class="{ on: scan.file_leak }"></span>敏感文件</label>
+              <label class="opt" @click="scan.vhost_collision = !scan.vhost_collision"><span class="switch" :class="{ on: scan.vhost_collision }"></span>VHost 碰撞</label>
+              <label class="opt" @click="scan.sibling = !scan.sibling"><span class="switch" :class="{ on: scan.sibling }"></span>旁站 C 段</label>
+              <label class="opt" @click="scan.asn_expand = !scan.asn_expand"><span class="switch" :class="{ on: scan.asn_expand }"></span>ASN 网段归集</label>
+              <label class="opt" @click="scan.asn_scan_blocks = !scan.asn_scan_blocks"><span class="switch" :class="{ on: scan.asn_scan_blocks }"></span>同 ASN 小段扫描</label>
+              <label class="opt" @click="scan.space_mapping = !scan.space_mapping"><span class="switch" :class="{ on: scan.space_mapping }"></span>空间测绘</label>
             </div>
           </div>
 
@@ -520,7 +524,7 @@ onMounted(async () => {
           <div class="panel">
             <div class="panel-head"><span><Icon name="clock" :size="13" />全局节流</span></div>
             <div class="panel-body stack" style="gap: 12px">
-              <label class="opt"><span class="switch" :class="{ on: throttle.enabled }" @click="throttle.enabled = !throttle.enabled" />开启节流</label>
+              <label class="opt" @click="throttle.enabled = !throttle.enabled"><span class="switch" :class="{ on: throttle.enabled }"></span>开启节流</label>
               <div class="row">
                 <div class="field flex-1">
                   <span class="field-label">最小间隔（秒）</span>
@@ -577,14 +581,14 @@ onMounted(async () => {
           <div class="panel">
             <div class="panel-head"><span><Icon name="route" :size="13" />深挖开关</span></div>
             <div class="panel-body" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px">
-              <label class="opt"><span class="switch" :class="{ on: deep.code_leak }" @click="deep.code_leak = !deep.code_leak" />代码泄露</label>
-              <label class="opt"><span class="switch" :class="{ on: deep.email_harvest }" @click="deep.email_harvest = !deep.email_harvest" />邮箱收集</label>
-              <label class="opt"><span class="switch" :class="{ on: deep.mail_dns }" @click="deep.mail_dns = !deep.mail_dns" />邮件 DNS</label>
-              <label class="opt"><span class="switch" :class="{ on: deep.bucket_enum }" @click="deep.bucket_enum = !deep.bucket_enum" />存储桶枚举</label>
-              <label class="opt"><span class="switch" :class="{ on: deep.screenshot }" @click="deep.screenshot = !deep.screenshot" />页面截图</label>
-              <label class="opt"><span class="switch" :class="{ on: deep.nuclei }" @click="deep.nuclei = !deep.nuclei" />Nuclei 复核</label>
-              <label class="opt"><span class="switch" :class="{ on: deep.ai_search }" @click="deep.ai_search = !deep.ai_search" />AI 搜索</label>
-              <label class="opt"><span class="switch" :class="{ on: deep.ai_triage }" @click="deep.ai_triage = !deep.ai_triage" />AI 归因</label>
+              <label class="opt" @click="deep.code_leak = !deep.code_leak"><span class="switch" :class="{ on: deep.code_leak }"></span>代码泄露</label>
+              <label class="opt" @click="deep.email_harvest = !deep.email_harvest"><span class="switch" :class="{ on: deep.email_harvest }"></span>邮箱收集</label>
+              <label class="opt" @click="deep.mail_dns = !deep.mail_dns"><span class="switch" :class="{ on: deep.mail_dns }"></span>邮件 DNS</label>
+              <label class="opt" @click="deep.bucket_enum = !deep.bucket_enum"><span class="switch" :class="{ on: deep.bucket_enum }"></span>存储桶枚举</label>
+              <label class="opt" @click="deep.screenshot = !deep.screenshot"><span class="switch" :class="{ on: deep.screenshot }"></span>页面截图</label>
+              <label class="opt" @click="deep.nuclei = !deep.nuclei"><span class="switch" :class="{ on: deep.nuclei }"></span>Nuclei 复核</label>
+              <label class="opt" @click="deep.ai_search = !deep.ai_search"><span class="switch" :class="{ on: deep.ai_search }"></span>AI 搜索</label>
+              <label class="opt" @click="deep.ai_triage = !deep.ai_triage"><span class="switch" :class="{ on: deep.ai_triage }"></span>AI 归因</label>
             </div>
           </div>
 
@@ -618,8 +622,8 @@ onMounted(async () => {
                   <input v-model.number="httpOpt.concurrent" class="input mono" type="number" />
                 </div>
               </div>
-              <label class="opt"><span class="switch" :class="{ on: httpOpt.follow_redirects }" @click="httpOpt.follow_redirects = !httpOpt.follow_redirects" />跟随跳转</label>
-              <label class="opt"><span class="switch" :class="{ on: httpOpt.verify }" @click="httpOpt.verify = !httpOpt.verify" />校验 TLS 证书</label>
+              <label class="opt" @click="httpOpt.follow_redirects = !httpOpt.follow_redirects"><span class="switch" :class="{ on: httpOpt.follow_redirects }"></span>跟随跳转</label>
+              <label class="opt" @click="httpOpt.verify = !httpOpt.verify"><span class="switch" :class="{ on: httpOpt.verify }"></span>校验 TLS 证书</label>
             </div>
           </div>
 
@@ -672,9 +676,9 @@ onMounted(async () => {
           <div class="panel">
             <div class="panel-head"><span><Icon name="aim" :size="13" />开关</span></div>
             <div class="panel-body stack" style="gap: 12px">
-              <label class="opt"><span class="switch" :class="{ on: oneclick.expand_enterprise }" @click="oneclick.expand_enterprise = !oneclick.expand_enterprise" />企业主体扩展</label>
-              <label class="opt"><span class="switch" :class="{ on: oneclick.expand_mobile }" @click="oneclick.expand_mobile = !oneclick.expand_mobile" />小程序 / App</label>
-              <label class="opt"><span class="switch" :class="{ on: oneclick.poc_scan }" @click="oneclick.poc_scan = !oneclick.poc_scan" />POC 全量扫描</label>
+              <label class="opt" @click="oneclick.expand_enterprise = !oneclick.expand_enterprise"><span class="switch" :class="{ on: oneclick.expand_enterprise }"></span>企业主体扩展</label>
+              <label class="opt" @click="oneclick.expand_mobile = !oneclick.expand_mobile"><span class="switch" :class="{ on: oneclick.expand_mobile }"></span>小程序 / App</label>
+              <label class="opt" @click="oneclick.poc_scan = !oneclick.poc_scan"><span class="switch" :class="{ on: oneclick.poc_scan }"></span>POC 全量扫描</label>
               <span class="tip">勾 POC 全量扫描会自动带上「深度挖掘」步骤，用 POC 管理里的全部模板扫，不限级别。</span>
             </div>
           </div>
@@ -703,7 +707,33 @@ onMounted(async () => {
 .policy-item.on { border-color: var(--accent, #34e5c8); background: rgba(52, 229, 200, 0.09); color: var(--text); }
 .pi-name { font-size: 12.5px; display: flex; align-items: center; }
 .pi-desc { font-size: 10.5px; color: var(--muted); line-height: 1.5; }
+.policy-hint { border-top: 1px solid var(--line-soft); padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 5px; }
+.policy-hint .hint-k { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--cyan); opacity: 0.85; }
+.policy-hint p { margin: 0; font-size: 11px; line-height: 1.65; color: var(--muted); }
 .policy-editor { min-width: 0; }
+/* 这些类原本只定义在其它视图的 scoped 样式里，跨组件不生效，会串成开关压字 */
+.opt { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-2); cursor: pointer; }
+.tip { font-size: 11px; line-height: 1.6; color: var(--muted); }
+.seg.tabs {
+  display: flex; flex-wrap: wrap; gap: 4px;
+  margin: 2px -13px -12px; padding: 9px 13px;
+  border: 0; border-top: 1px solid var(--line-soft);
+  border-radius: 0 0 var(--radius) var(--radius);
+  background: rgba(6, 12, 18, 0.4);
+}
+.seg.tabs button { height: 26px; padding: 0 12px; }
+.seg.tabs button.on { box-shadow: none; }
+.editor-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; border-top: 1px solid var(--line-soft); padding-top: 10px; }
+.policy-editor .cards.two { align-items: start; }
+.action-bar {
+  position: sticky; bottom: 0; z-index: 6;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 9px 12px; border-radius: 10px;
+  border: 1px solid var(--line);
+  background: linear-gradient(180deg, rgba(12, 24, 33, 0.92), rgba(8, 16, 23, 0.98));
+  backdrop-filter: blur(8px);
+}
+.action-tip { font-size: 11.5px; color: var(--muted); }
 @media (max-width: 900px) {
   .policy-layout { grid-template-columns: minmax(0, 1fr); }
   .policy-list { position: static; }
