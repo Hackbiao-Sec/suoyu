@@ -529,7 +529,7 @@ onMounted(() => {
 .step-card.on .step-idx { border-color: rgba(52, 229, 200, 0.5); color: var(--cyan-ink); }
 .step-name { grid-area: name; font-size: 12.5px; color: var(--text); }
 .step-desc { grid-area: desc; font-size: 10.5px; color: var(--muted); line-height: 1.55; }
-.step-hint { grid-area: hint; font-size: 10px; color: var(--warn, #f0c36d); line-height: 1.5; min-height: 0; }
+.step-hint { grid-area: hint; font-size: 10px; color: var(--amber); line-height: 1.5; min-height: 0; }
 .step-card:not(.on) { opacity: 0.78; border-style: dashed; }
 
 /* 底部操作条：左侧面板再长，开跑按钮也一直可见 */
@@ -579,7 +579,8 @@ onMounted(() => {
 .ev-dom { color: var(--text); overflow: hidden; text-overflow: ellipsis; }
 .ev-score { color: var(--muted); text-align: right; }
 .ev-why { color: var(--muted); line-height: 1.6; }
-.tag.warn { color: var(--warn, #f0c36d); border-color: rgba(240, 195, 109, 0.35); background: rgba(240, 195, 109, 0.09); }
+.tag.warn { color: var(--amber-ink); border-color: rgba(240, 195, 109, 0.35); background: rgba(240, 195, 109, 0.09); }
+html[data-theme="light"] .tag.warn { border-color: rgba(185, 122, 16, 0.32); background: rgba(185, 122, 16, 0.1); color: var(--amber-ink); }
 
 .step { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line-soft); }
 .step:last-of-type { border-bottom: none; }

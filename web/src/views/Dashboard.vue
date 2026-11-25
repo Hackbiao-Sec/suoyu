@@ -1,8 +1,9 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import * as echarts from 'echarts'
 import Icon from '@/components/Icon.vue'
+import { useUiStore } from '@/stores'
 import {
   overview as fetchOverview, diff as fetchDiff, vulnStats as fetchVulnStats,
 } from '@/api/endpoints'
@@ -17,6 +18,24 @@ const trendEl = ref(null)
 const pieEl = ref(null)
 const fpEl = ref(null)
 let charts = []
+
+const ui = useUiStore()
+const isLight = computed(() => ui.theme === 'light')
+
+// ECharts 的颜色是写在 option 里的，CSS 变量管不到；两套值跟着主题走
+const chartInk = computed(() => (isLight.value
+  ? {
+    tipBg: 'rgba(255,255,255,.97)', tipBorder: 'rgba(24,62,82,.18)', tipText: '#1f3440',
+    axisLine: 'rgba(24,62,82,.18)', axisText: '#5b7284', splitLine: 'rgba(24,62,82,.09)',
+    barBg: 'rgba(24,62,82,.045)', barLabel: '#4a6172', pieBorder: '#ffffff',
+    pointer: 'rgba(14,155,136,.07)',
+  }
+  : {
+    tipBg: 'rgba(8,17,26,.94)', tipBorder: 'rgba(115,196,214,.24)', tipText: '#d9e7ef',
+    axisLine: 'rgba(115,196,214,.2)', axisText: '#77909f', splitLine: 'rgba(115,196,214,.08)',
+    barBg: 'rgba(120,200,220,.05)', barLabel: '#a9bfcd', pieBorder: 'rgba(9,19,28,.9)',
+    pointer: 'rgba(52,229,200,.06)',
+  }))
 
 const PALETTE = ['#34e5c8', '#9d8cff', '#f5b544', '#5aa9ff', '#ff8fb1', '#46d68a', '#77909f']
 
@@ -143,39 +162,40 @@ function renderTrend() {
   const rows = data.value?.trend || []
   const counts = rows.map((t) => t.count)
   const avg = trendStats.value.avg
+  const ink = chartInk.value
   c.setOption({
     grid: { left: 40, right: 16, top: 30, bottom: 24 },
     tooltip: {
       trigger: 'axis',
-      backgroundColor: 'rgba(8,17,26,.94)',
-      borderColor: 'rgba(115,196,214,.24)',
-      textStyle: { color: '#d9e7ef', fontSize: 11 },
-      axisPointer: { type: 'shadow', shadowStyle: { color: 'rgba(52,229,200,.06)' } },
+      backgroundColor: ink.tipBg,
+      borderColor: ink.tipBorder,
+      textStyle: { color: ink.tipText, fontSize: 11 },
+      axisPointer: { type: 'shadow', shadowStyle: { color: ink.pointer } },
     },
     xAxis: {
       type: 'category',
       data: rows.map((t) => t.day),
       axisTick: { show: false },
-      axisLine: { lineStyle: { color: 'rgba(115,196,214,.2)' } },
+      axisLine: { lineStyle: { color: ink.axisLine } },
       axisLabel: {
-        color: '#77909f', fontSize: 10, fontFamily: 'JetBrains Mono, monospace',
+        color: ink.axisText, fontSize: 10, fontFamily: 'JetBrains Mono, monospace',
         formatter: (v) => String(v).replace(/^\d{4}-/, ''),
       },
     },
     yAxis: {
       type: 'value',
-      splitLine: { lineStyle: { color: 'rgba(115,196,214,.08)' } },
-      axisLabel: { color: '#77909f', fontSize: 10 },
+      splitLine: { lineStyle: { color: ink.splitLine } },
+      axisLabel: { color: ink.axisText, fontSize: 10 },
     },
     series: [{
       type: 'bar',
       data: counts,
       barWidth: '44%',
       showBackground: true,
-      backgroundStyle: { color: 'rgba(120,200,220,.05)', borderRadius: [3, 3, 0, 0] },
+      backgroundStyle: { color: ink.barBg, borderRadius: [3, 3, 0, 0] },
       label: {
         show: true, position: 'top', distance: 5,
-        color: '#a9bfcd', fontSize: 9.5, fontFamily: 'JetBrains Mono, monospace',
+        color: ink.barLabel, fontSize: 9.5, fontFamily: 'JetBrains Mono, monospace',
         formatter: (p) => (p.value > 0 ? p.value : ''),
       },
       itemStyle: {
@@ -202,12 +222,13 @@ function renderPie() {
   if (!pieEl.value) return
   const c = echarts.init(pieEl.value)
   const rows = composition.value
+  const ink = chartInk.value
   c.setOption({
     tooltip: {
       trigger: 'item',
-      backgroundColor: 'rgba(8,17,26,.94)',
-      borderColor: 'rgba(115,196,214,.24)',
-      textStyle: { color: '#d9e7ef', fontSize: 11 },
+      backgroundColor: ink.tipBg,
+      borderColor: ink.tipBorder,
+      textStyle: { color: ink.tipText, fontSize: 11 },
       formatter: (p) => `${p.name}<br/><b>${Number(p.value).toLocaleString()}</b> · ${p.percent}%`,
     },
     series: [{
@@ -217,7 +238,7 @@ function renderPie() {
       avoidLabelOverlap: false,
       label: { show: false },
       labelLine: { show: false },
-      itemStyle: { borderColor: 'rgba(9,19,28,.9)', borderWidth: 3 },
+      itemStyle: { borderColor: ink.pieBorder, borderWidth: 3 },
       emphasis: { scale: true, scaleSize: 4 },
       data: rows.map((r) => ({
         name: r.label, value: r.count, itemStyle: { color: r.color },
@@ -231,19 +252,20 @@ function renderFingerprints() {
   if (!fpEl.value) return
   const c = echarts.init(fpEl.value)
   const items = (data.value?.top_fingerprints || []).slice(0, 9)
+  const ink = chartInk.value
   c.setOption({
     grid: { left: 8, right: 34, top: 8, bottom: 8, containLabel: true },
     tooltip: {
       trigger: 'axis',
       axisPointer: { type: 'shadow' },
-      backgroundColor: 'rgba(8,17,26,.94)',
-      borderColor: 'rgba(115,196,214,.24)',
-      textStyle: { color: '#d9e7ef', fontSize: 11 },
+      backgroundColor: ink.tipBg,
+      borderColor: ink.tipBorder,
+      textStyle: { color: ink.tipText, fontSize: 11 },
     },
     xAxis: {
       type: 'value',
-      splitLine: { lineStyle: { color: 'rgba(115,196,214,.08)' } },
-      axisLabel: { color: '#77909f', fontSize: 10 },
+      splitLine: { lineStyle: { color: ink.splitLine } },
+      axisLabel: { color: ink.axisText, fontSize: 10 },
     },
     yAxis: {
       type: 'category',
@@ -252,7 +274,7 @@ function renderFingerprints() {
       axisTick: { show: false },
       axisLine: { show: false },
       axisLabel: {
-        color: '#a9bfcd', fontSize: 10.5, width: 96, overflow: 'truncate',
+        color: ink.barLabel, fontSize: 10.5, width: 96, overflow: 'truncate',
       },
     },
     series: [{
@@ -260,7 +282,7 @@ function renderFingerprints() {
       data: items.map((i) => i.count),
       barWidth: 9,
       label: {
-        show: true, position: 'right', color: '#77909f',
+        show: true, position: 'right', color: ink.axisText,
         fontSize: 9.5, fontFamily: 'JetBrains Mono, monospace',
       },
       itemStyle: {
@@ -289,6 +311,11 @@ function onResize() {
 onMounted(() => {
   load()
   window.addEventListener('resize', onResize)
+})
+// 切主题后图表容器没变，但 option 里的文字色要换，重建一次
+watch(() => ui.theme, async () => {
+  await nextTick()
+  render()
 })
 onBeforeUnmount(() => {
   window.removeEventListener('resize', onResize)
@@ -794,5 +821,92 @@ onBeforeUnmount(() => {
   .kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .legend-row { grid-template-columns: 8px minmax(40px, 1fr) 46px 40px; }
   .legend-bar { display: none; }
+}
+
+/* ── 白天模式 ─────────────────────────────────────────────── */
+/* 头图和指标卡是深色渐变实底，白底下会变成一块块深蓝板；雷达装饰也要降压 */
+
+html[data-theme="light"] .hero {
+  background:
+    radial-gradient(560px 260px at 8% 0%, rgba(14, 155, 136, 0.14), transparent 68%),
+    radial-gradient(460px 300px at 92% 110%, rgba(108, 85, 216, 0.1), transparent 66%),
+    linear-gradient(120deg, #ffffff, #f1f8fb);
+  box-shadow: 0 14px 34px rgba(24, 62, 82, 0.1);
+}
+html[data-theme="light"] .hero-lines {
+  background-image:
+    linear-gradient(rgba(14, 155, 136, 0.09) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(14, 155, 136, 0.09) 1px, transparent 1px);
+}
+html[data-theme="light"] .hero h1 { color: #102028; }
+html[data-theme="light"] .hero h1 span {
+  background: linear-gradient(96deg, #0e9b88, #1c86c9 58%, #6c55d8);
+  -webkit-background-clip: text; background-clip: text;
+}
+html[data-theme="light"] .hero-desc { color: var(--text-2); }
+html[data-theme="light"] .chip {
+  border-color: rgba(24, 62, 82, 0.12);
+  background: rgba(24, 62, 82, 0.04);
+  color: var(--text-2);
+}
+html[data-theme="light"] .chip.cyan {
+  border-color: rgba(14, 155, 136, 0.3);
+  background: rgba(14, 155, 136, 0.09);
+  color: var(--cyan-ink);
+}
+html[data-theme="light"] .chip.shield {
+  border-color: rgba(210, 58, 72, 0.26);
+  background: rgba(210, 58, 72, 0.07);
+  color: var(--red-ink);
+}
+html[data-theme="light"] .chip.ghost { color: var(--muted); }
+
+html[data-theme="light"] .radar::before {
+  background: radial-gradient(circle, rgba(14, 155, 136, 0.12), transparent 66%);
+}
+html[data-theme="light"] .ring { border-color: rgba(14, 155, 136, 0.22); }
+html[data-theme="light"] .ring.r2 { border-color: rgba(14, 155, 136, 0.17); }
+html[data-theme="light"] .ring.r3 { border-color: rgba(14, 155, 136, 0.12); }
+html[data-theme="light"] .cross { background: rgba(14, 155, 136, 0.12); }
+html[data-theme="light"] .sweep {
+  background: conic-gradient(from 0deg, rgba(14, 155, 136, 0.28), rgba(14, 155, 136, 0.02) 22%, transparent 38%);
+}
+html[data-theme="light"] .radar-core {
+  background: rgba(255, 255, 255, 0.88);
+  border-color: rgba(14, 155, 136, 0.26);
+}
+html[data-theme="light"] .radar-core b { color: #102028; }
+
+html[data-theme="light"] .kpi {
+  background:
+    radial-gradient(140px 90px at 100% 100%, rgba(14, 155, 136, 0.07), transparent 70%),
+    linear-gradient(160deg, #ffffff, #f5fafc);
+  box-shadow: 0 6px 18px rgba(24, 62, 82, 0.06);
+}
+html[data-theme="light"] .kpi-value { color: #102028; }
+html[data-theme="light"] .ico { background: rgba(24, 62, 82, 0.05); }
+html[data-theme="light"] .kpi.tone-ok { color: var(--ok-text); }
+html[data-theme="light"] .kpi.tone-ok .ico {
+  color: var(--ok-text);
+  background: var(--ok-bg);
+  box-shadow: inset 0 0 0 1px var(--ok-line);
+}
+
+html[data-theme="light"] .donut-center b { color: #102028; }
+html[data-theme="light"] .legend-bar { background: rgba(24, 62, 82, 0.08); }
+html[data-theme="light"] .root-bar { background: rgba(24, 62, 82, 0.08); }
+html[data-theme="light"] .root-row:hover { background: rgba(14, 155, 136, 0.07); }
+html[data-theme="light"] .port-chip {
+  border-color: var(--line);
+  background: rgba(24, 62, 82, 0.04);
+}
+html[data-theme="light"] .port-chip.warm {
+  border-color: rgba(14, 155, 136, 0.22);
+  background: rgba(14, 155, 136, 0.07);
+}
+html[data-theme="light"] .port-chip.hot {
+  border-color: rgba(14, 155, 136, 0.38);
+  background: rgba(14, 155, 136, 0.12);
+  box-shadow: none;
 }
 </style>

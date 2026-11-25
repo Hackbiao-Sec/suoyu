@@ -666,6 +666,35 @@ html[data-theme="light"] .textarea,
 html[data-theme="light"] .seg { background: #ffffff; }
 html[data-theme="light"] .select option { background: #ffffff; color: var(--text); }
 
+/* 浅底上的细部：深色主题靠薄青底提层次，白底照抄会脏成灰块 */
+html[data-theme="light"] .panel-head { background: rgba(24, 62, 82, 0.03); }
+html[data-theme="light"] .table tbody tr:hover td { background: rgba(14, 155, 136, 0.06); }
+html[data-theme="light"] .progress { background: rgba(24, 62, 82, 0.09); }
+html[data-theme="light"] .switch { background: rgba(24, 62, 82, 0.16); }
+html[data-theme="light"] .switch::after { background: #ffffff; box-shadow: 0 1px 3px rgba(24, 62, 82, 0.3); }
+html[data-theme="light"] .switch.on { background: var(--cyan); }
+html[data-theme="light"] .switch.on::after { background: #ffffff; }
+html[data-theme="light"] .overlay { background: rgba(16, 32, 40, 0.42); }
+html[data-theme="light"] .modal-head { color: #102028; }
+html[data-theme="light"] .modal,
+html[data-theme="light"] .drawer { box-shadow: 0 24px 60px rgba(24, 62, 82, 0.22); }
+html[data-theme="light"] .toast { box-shadow: 0 12px 30px rgba(24, 62, 82, 0.16); }
+html[data-theme="light"] .skeleton {
+  background: linear-gradient(90deg, rgba(24, 62, 82, 0.05), rgba(24, 62, 82, 0.1), rgba(24, 62, 82, 0.05));
+  background-size: 200% 100%;
+}
+html[data-theme="light"] .login-wrap {
+  background:
+    radial-gradient(900px 480px at 50% -10%, rgba(14, 155, 136, 0.16), transparent 62%),
+    radial-gradient(700px 400px at 90% 100%, rgba(74, 59, 176, 0.1), transparent 60%),
+    var(--bg);
+}
+html[data-theme="light"] .login-card {
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 22px 60px rgba(24, 62, 82, 0.18);
+}
+html[data-theme="light"] .login-title { color: #102028; }
+
 /* ---------------------------------------------------------------- 窄屏 */
 
 /* 侧栏收成图标条：1280 以下主内容只剩一条缝，表格和股权图都没法看 */

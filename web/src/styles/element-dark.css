@@ -136,4 +136,6 @@ html[data-theme="light"] .el-select__wrapper {
 .el-tabs__item { color: #77909f; }
 .el-tabs__item.is-active { color: #b9f4ea; }
 .el-tabs__active-bar { background-color: #34e5c8; }
+html[data-theme="light"] .el-tabs__item.is-active { color: var(--cyan-ink); }
+html[data-theme="light"] .el-tabs__active-bar { background-color: var(--cyan); }
 .el-tabs__nav-wrap::after { background-color: rgba(115, 196, 214, 0.1); }

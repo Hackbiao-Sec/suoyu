@@ -279,6 +279,7 @@ onBeforeUnmount(stop)
   border-radius: var(--radius);
   background: rgba(6, 12, 18, 0.5);
 }
+html[data-theme="light"] .live { background: #f6fafc; }
 .live-top {
   display: flex;
   align-items: center;

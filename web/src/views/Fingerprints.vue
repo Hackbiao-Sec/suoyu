@@ -265,4 +265,6 @@ onMounted(() => load())
 .tag.pick.on { border-color: rgba(52, 229, 200, 0.6); background: rgba(52, 229, 200, 0.12); color: #b9f4ea; }
 .hit-row { display: flex; align-items: center; gap: 6px; padding: 2px 0; }
 .hit-name { color: #b9f4ea; font-size: 11.5px; }
+html[data-theme="light"] .tag.pick.on { color: var(--cyan-ink); }
+html[data-theme="light"] .hit-name { color: var(--cyan-ink); }
 </style>

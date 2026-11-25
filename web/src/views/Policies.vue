@@ -734,6 +734,22 @@ onMounted(async () => {
   backdrop-filter: blur(8px);
 }
 .action-tip { font-size: 11.5px; color: var(--muted); }
+/* 白天模式：tab 条与底部动作栏原来是深色实底，白底上会变成灰带和黑条 */
+html[data-theme="light"] .seg.tabs { background: #eef4f8; }
+html[data-theme="light"] .seg.tabs button.on {
+  background: rgba(14, 155, 136, 0.16);
+  box-shadow: inset 0 0 0 1px rgba(14, 155, 136, 0.22);
+  color: var(--cyan-ink);
+}
+html[data-theme="light"] .action-bar {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.95), rgba(248, 252, 254, 0.98));
+  box-shadow: 0 -8px 24px rgba(24, 62, 82, 0.08);
+}
+html[data-theme="light"] .policy-item:hover { background: rgba(14, 155, 136, 0.07); }
+html[data-theme="light"] .policy-item.on {
+  border-color: var(--cyan);
+  background: rgba(14, 155, 136, 0.1);
+}
 @media (max-width: 900px) {
   .policy-layout { grid-template-columns: minmax(0, 1fr); }
   .policy-list { position: static; }

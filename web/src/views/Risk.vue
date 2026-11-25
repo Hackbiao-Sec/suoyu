@@ -115,4 +115,6 @@ onMounted(load)</script><template>
 .bucket-list { display: grid;
  grid-template-columns: 1fr;
  gap: 14px;
- }</style>
+ }
+html[data-theme="light"] .link-btn { color: var(--cyan-ink); }
+</style>
