@@ -370,6 +370,9 @@ html.is-desktop .login-card { -webkit-app-region: no-drag; }
 .tag.err { border-color: rgba(255, 100, 112, 0.36); background: rgba(255, 100, 112, 0.1); color: var(--red-ink); }
 .tag.info { border-color: rgba(157, 140, 255, 0.34); background: rgba(157, 140, 255, 0.1); color: var(--violet-ink); }
 .tag.cyan { border-color: rgba(52, 229, 200, 0.34); background: rgba(52, 229, 200, 0.1); color: var(--cyan-ink); }
+/* 来源标记：只标出处类别（小程序 / JS / 被动源…），不抢存活与状态色 */
+.tag.src { border-color: var(--line); background: transparent; color: var(--muted); text-decoration: none; }
+a.tag.src:hover { border-color: rgba(52, 229, 200, 0.45); color: var(--cyan-ink); }
 
 /* 表格 */
 

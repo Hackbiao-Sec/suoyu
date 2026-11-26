@@ -14,14 +14,27 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .config import DATA_DIR
-from .utils import clean_host, is_ip, is_valid_domain, root_domain
+from .utils import clean_host, ip_host, is_ip, is_valid_domain, package_origin, root_domain
 
 DB_PATH = DATA_DIR / "arlx.db"
 
-# 资产面：Web / 小程序 / 公众号 / APP 各看各的，企业主体、股权、邮箱这类是任务元数据；
-# 网段（ASN 归集出来的 CIDR）单独一面，不算站点，避免把 Web 的条数撑大
-SURFACE_LABEL = {"web": "Web", "applet": "小程序", "mp": "公众号", "app": "APP",
+# 资产面：各看各的。口径按「这条记录最终是什么」分，不按来源分：
+#   web    完整可请求的 http(s) 地址（站点 / 仓库 / 对象存储 / 前端资源 / 组件 URL）
+#   host   域名、IP、ip:port、旁站、vhost —— 知道它在，但没有完整地址
+#   api    从 JS / 包体里抽出来的接口路径
+#   leak   小程序包 / APP / JS / 爬虫里扫出来的裸 IP、账号、邮箱线索（带出处）
+# 企业主体、股权、邮箱这类是任务元数据；网段（ASN 归集出来的 CIDR）单独一面。
+SURFACE_LABEL = {"web": "Web 站点", "host": "主机与端口", "api": "接口路径",
+                 "leak": "泄露线索", "applet": "小程序", "mp": "公众号", "app": "APP",
                  "netblock": "网段", "meta": "主体与邮箱", "icp": "备案"}
+# 能当 Web 面的资产类型：这几个是「拿一条地址就能发请求」的记录，
+# 真算 Web 还要 url 带 http(s) 前缀（裸域名 / 裸 IP 归 host，见 surface_cond）
+_WEB_KINDS = "'site','web','bucket','git','component','js'"
+# 只有主机坐标、没有完整地址的记录
+_HOST_KINDS = "'domain','ip','port','sibling','vhost','service'"
+_HTTP_URL = "(url LIKE 'http://%' OR url LIKE 'https://%')"
+# 扫出来的线索：不登录也能看到内容，但本身打不开，靠 source_url 追出处
+_LEAK_KINDS = "'leak','leakfile','codeleak'"
 # 分支机构、控股企业、对外投资、股东、软著、微博账号与主体/股权同属「主体侧」：
 # 没有站点 URL，混进 Web 会把站点条数撑大
 _META_KINDS = ("'enterprise','equity','mailinfo','email','branch','weibo',"
@@ -36,8 +49,22 @@ _APPLET_KINDS = "'applet','applet_hint','applet_icp'"
 
 
 def surface_cond(key: str, alias: str = "") -> str:
-    """把资产面换成 SQL 条件；alias 是表别名（如 ``a``）。未知面按 Web 处理。"""
+    """把资产面换成 SQL 条件；alias 是表别名（如 ``a``）。
+
+    Web 面只收完整可请求地址，裸域名 / 裸 IP / 端口 / 接口路径各有各的面，
+    这样「Web 资产」点开就是能直接打开的站，不会被域名行撑大。
+    """
     p = f"{alias}." if alias else ""
+    if key == "web":
+        return f"({p}kind IN ({_WEB_KINDS}) AND {p}{_HTTP_URL})"
+    if key == "host":
+        # 组件记录里没抽到 URL 的那批（只有 ip）落在主机面
+        return (f"({p}kind IN ({_HOST_KINDS})"
+                f" OR ({p}kind IN ({_WEB_KINDS}) AND NOT {p}{_HTTP_URL}))")
+    if key == "api":
+        return f"({p}kind='api' AND NOT {p}{_HTTP_URL})"
+    if key == "leak":
+        return f"{p}kind IN ({_LEAK_KINDS})"
     if key == "applet":
         return f"{p}kind IN ({_APPLET_KINDS})"
     if key == "mp":
@@ -50,7 +77,7 @@ def surface_cond(key: str, alias: str = "") -> str:
         return f"{p}kind='netblock'"
     if key == "icp":
         return f"{p}kind='icp'"
-    return (f"{p}kind NOT IN ({_APPLET_KINDS},'mobile','netblock','icp',{_MP_KIND},{_META_KINDS})")
+    return f"({p}kind IN ({_WEB_KINDS}) AND {p}{_HTTP_URL})"
 
 
 # 控股比例散在 extra_json 里，工商各源键名不同；SQL 侧取各键最大值，取不到算 0，
@@ -85,6 +112,45 @@ RISK_RULES: tuple[tuple[str, str, str], ...] = (
 )
 
 
+PROBE_TEXT = {
+    "alive": "存活", "auth": "需认证", "bad": "异常响应", "open": "端口开放",
+    "dns": "已解析", "dead": "未连通", "space": "测绘收录", "unknown": "未探测",
+}
+
+# 解析失败时采集器会写 ``0.0.0.1`` 当占位。它不是任何一台机器，
+# 留在库里会让 IP 列显示一台不存在的机器，进库和补数两处都得清掉。
+IP_SENTINEL = "0.0.0.1"
+
+
+def clean_ip(value: str) -> str:
+    """去掉占位 IP；正常地址原样返回。"""
+    text = str(value or "").strip()
+    return "" if text == IP_SENTINEL else text
+
+
+def clean_ip_list(value: str) -> str:
+    """``ips`` 是逗号串，剔掉里面的占位 IP。"""
+    keep = [x.strip() for x in str(value or "").split(",") if x.strip()]
+    return ",".join(x for x in keep if x != IP_SENTINEL)
+
+
+def probe_of(code: int) -> str:
+    """状态码 → 探活状态。只有 401/403 算「需认证」。
+
+    404 / 405 / 429 这类是服务器正常回答、只是这条路径没有内容，主机是活的；
+    一律归 auth 会让资产表把一堆活的站标成「需认证」，按存活筛也筛不出来。
+    5xx 才是异常响应。
+    """
+    code = int(code or 0)
+    if not code:
+        return ""
+    if code in (401, 403):
+        return "auth"
+    if code >= 500:
+        return "bad"
+    return "alive"
+
+
 def live_state(row: dict[str, Any]) -> tuple[str, str]:
     """资产存活判定：返回 ``(机器状态, 中文说明)``，给列表/导出共用。
 
@@ -95,11 +161,17 @@ def live_state(row: dict[str, Any]) -> tuple[str, str]:
     kind = str(row.get("kind") or "")
     code = int(row.get("status_code") or 0)
     if code:
-        if code < 400:
+        state = probe_of(code)
+        if state == "alive":
             return "alive", f"存活 {code}"
-        if code < 500:
-            return "auth", f"响应 {code}"
+        if state == "auth":
+            return "auth", f"需认证 {code}"
         return "bad", f"异常 {code}"
+    # 各阶段自己探到的结论（DNS 解析 / 端口开放 / 探活失败）优先于按来源猜，
+    # 「所有环节都要探活」靠这一列体现，而不是只看有没有状态码。
+    probe = str(row.get("probe_state") or "")
+    if probe in ("alive", "auth", "bad", "open", "dns", "dead", "space"):
+        return probe, PROBE_TEXT.get(probe, "未探测")
     src = str(row.get("sources") or "")
     if kind == "domain":
         has_ip = bool(str(row.get("ip") or "").strip() or str(row.get("ips") or "").strip())
@@ -154,6 +226,12 @@ def normalize_asset(item: dict[str, Any]) -> dict[str, Any]:
     if str(out.get("url") or "").startswith("mobile:"):
         out["root_domain"] = ""
 
+    # 占位 IP 不进库：解析失败的采集器会拿 0.0.0.1 填坑
+    if "ip" in out:
+        out["ip"] = clean_ip(out.get("ip") or "")
+    if "ips" in out:
+        out["ips"] = clean_ip_list(out.get("ips") or "")
+
     if out.get("root_domain"):
         out["root_domain"] = str(out["root_domain"]).strip().lower()
     return out
@@ -205,6 +283,10 @@ CREATE TABLE IF NOT EXISTS assets (
     root_domain TEXT,
     extra_json TEXT,
     task_id TEXT,
+    source_type TEXT,         -- 这条资产是从哪类入口发现的（域名目标/工商/股权/小程序/APP/JS/被动源/测绘/爬虫）
+    source_url TEXT,          -- 具体出处：页面 URL / appid / 包名 / JS 地址
+    probe_state TEXT,         -- 最近一次探活结论：alive / auth / open / dns / dead / space
+    probe_at REAL,            -- 探活时间
     first_seen REAL,
     last_seen REAL
 );
@@ -345,15 +427,39 @@ CREATE TABLE IF NOT EXISTS task_sources (
     updated_at REAL,
     PRIMARY KEY (task_id, stage, source)
 );
+
+-- 归属审核流水：每个「要不要把这个根域 / 主体并进本任务」的判断都留一条，
+-- 规则判定与 AI 复核共用一张表，界面上按放行 / 待审 / 拒绝三类看。
+CREATE TABLE IF NOT EXISTS asset_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT,
+    stage TEXT,
+    kind TEXT,
+    subject TEXT,
+    target TEXT,
+    verdict TEXT,
+    reason TEXT,
+    engine TEXT,
+    ratio REAL,
+    source_type TEXT,
+    source_url TEXT,
+    created_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_review_task ON asset_reviews(task_id, id);
+CREATE INDEX IF NOT EXISTS idx_review_verdict ON asset_reviews(task_id, verdict);
 """
 
 # 老库升级：缺列则补
 MIGRATIONS = {
     "tasks": {"phase": "TEXT", "schedule_id": "TEXT"},
-    "assets": {"is_new": "INTEGER DEFAULT 0"},
+    "assets": {"is_new": "INTEGER DEFAULT 0", "source_type": "TEXT", "source_url": "TEXT",
+               "probe_state": "TEXT", "probe_at": "REAL"},
     # stage：这条资产是流水线哪个阶段收进来的。任务是按阶段跑出来的，
     # 资产行本身按 url 全局合并，只有关联表能记住「哪个阶段给的」。
     "task_assets": {"is_new": "INTEGER DEFAULT 0", "stage": "TEXT"},
+    # 审核记录上的来源：同一个根域可能是小程序带出来的，也可能是工商确认的，
+    # 光看结论分不出「这条为什么可疑」，界面上要能按来源筛。
+    "asset_reviews": {"source_type": "TEXT", "source_url": "TEXT"},
 }
 
 
@@ -588,11 +694,85 @@ class Store:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    # ─────── 归属审核 ───────
+    def add_review(self, task_id: str, *, stage: str = "", kind: str = "", subject: str = "",
+                   target: str = "", verdict: str = "review", reason: str = "",
+                   engine: str = "rule", ratio: float | None = None,
+                   source_type: str = "", source_url: str = "") -> int:
+        with self._write_lock:
+            cur = self.conn().execute(
+                "INSERT INTO asset_reviews (task_id,stage,kind,subject,target,verdict,reason,"
+                "engine,ratio,source_type,source_url,created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (task_id, stage, kind, subject, target, verdict, reason, engine, ratio,
+                 source_type, source_url, time.time()),
+            )
+            self.conn().commit()
+            return int(cur.lastrowid)
+
+    def query_reviews(self, task_id: str = "", verdict: str = "", limit: int = 200,
+                      offset: int = 0, kind: str = "", keyword: str = "",
+                      source_type: str = "") -> list[dict]:
+        sql = "SELECT * FROM asset_reviews WHERE 1=1"
+        vals: list[Any] = []
+        if task_id:
+            sql += " AND task_id=?"
+            vals.append(task_id)
+        if verdict:
+            sql += " AND verdict=?"
+            vals.append(verdict)
+        if kind:
+            sql += " AND kind=?"
+            vals.append(kind)
+        if source_type:
+            sql += " AND source_type=?"
+            vals.append(source_type)
+        if keyword:
+            sql += " AND (subject LIKE ? OR reason LIKE ?)"
+            vals.extend([f"%{keyword}%", f"%{keyword}%"])
+        sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+        vals.extend([int(limit), int(offset)])
+        return [dict(r) for r in self.conn().execute(sql, vals).fetchall()]
+
+    def set_review_verdict(self, rid: int, verdict: str, *, note: str = "") -> bool:
+        """人工改判一条审核记录；返回是否真的改到了行。"""
+        if str(verdict) not in ("allow", "deny", "review"):
+            return False
+        with self._write_lock:
+            old = self.conn().execute(
+                "SELECT reason, engine FROM asset_reviews WHERE id=?", (int(rid),)).fetchone()
+            if old is None:
+                return False
+            reason = str(old["reason"] or "")
+            if note:
+                reason = (reason + "；" + note) if reason else note
+            self.conn().execute(
+                "UPDATE asset_reviews SET verdict=?, reason=?, engine='manual' WHERE id=?",
+                (verdict, reason, int(rid)),
+            )
+            self.conn().commit()
+        return True
+
+    def review_summary(self, task_id: str = "") -> dict[str, int]:
+        sql = "SELECT verdict, COUNT(*) n FROM asset_reviews"
+        vals: list[Any] = []
+        if task_id:
+            sql += " WHERE task_id=?"
+            vals.append(task_id)
+        sql += " GROUP BY verdict"
+        out = {"allow": 0, "review": 0, "deny": 0, "total": 0}
+        for r in self.conn().execute(sql, vals).fetchall():
+            v = str(r["verdict"] or "")
+            if v in out:
+                out[v] = int(r["n"] or 0)
+            out["total"] += int(r["n"] or 0)
+        return out
+
     # ─────── assets ───────
     ASSET_COLS = (
         "kind", "url", "host", "ip", "port", "scheme", "title", "status_code", "length",
         "fingerprint", "cdn", "server", "ips", "cnames", "sources", "root_domain",
-        "extra_json", "task_id",
+        "extra_json", "task_id", "source_type", "source_url", "probe_state", "probe_at",
     )
 
     def upsert_asset(self, item: dict[str, Any]) -> int:
@@ -629,6 +809,14 @@ class Store:
             for col in ("title", "fingerprint", "cdn", "server", "cnames", "root_domain", "host"):
                 if not row[col] and item.get(col):
                     updates[col] = item[col]
+            # 出处只补空：同一条资产先被「被动源」收到、后被「爬虫」再收一次时，
+            # 保留最早那个能回答「它从哪来」的出处。
+            for col in ("source_type", "source_url"):
+                if not row[col] and item.get(col):
+                    updates[col] = item[col]
+            if item.get("probe_state"):
+                updates["probe_state"] = item["probe_state"]
+                updates["probe_at"] = item.get("probe_at") or now
             if not row["ip"] and item.get("ip"):
                 updates["ip"] = item["ip"]
             if not row["port"] and item.get("port"):
@@ -723,8 +911,9 @@ class Store:
                 if not code:
                     continue
                 self.conn().execute(
-                    "UPDATE assets SET status_code=?, last_seen=? WHERE id=?",
-                    (code, now, row["id"]),
+                    "UPDATE assets SET status_code=?, probe_state=?, probe_at=?,"
+                    " last_seen=? WHERE id=?",
+                    (code, probe_of(code), now, now, row["id"]),
                 )
                 updated += 1
             if updated:
@@ -798,7 +987,8 @@ class Store:
             return 0
 
         sql = ("SELECT a.id, a.host, a.ip, t.task_id FROM assets a"
-               " JOIN task_assets t ON t.asset_id=a.id WHERE a.status_code IS NULL")
+               " JOIN task_assets t ON t.asset_id=a.id WHERE a.status_code IS NULL"
+               " AND a.kind NOT IN ('leak','leakfile')")
         vals = []
         if task_id:
             sql += " AND t.task_id=?"
@@ -821,6 +1011,407 @@ class Store:
                 "UPDATE assets SET status_code=?, last_seen=? WHERE id=?", marks)
             self.conn().commit()
         return len(marks)
+
+    def backfill_probe_state(self) -> int:
+        """按已有状态码补探活状态，让「存活」这一维对历史资产也能筛。
+
+        探活状态是后加的字段，老任务的资产有状态码却没状态标签，资产列表里
+        一律显示「未探测」，按存活筛也筛不出东西。状态码归一走 probe_of，
+        已经标过的行不覆盖，重启跑一遍也不会把实测结论改回按码推算。
+        """
+        with self._write_lock:
+            cur = self.conn().execute(
+                "UPDATE assets SET probe_state = CASE"
+                " WHEN status_code IN (401, 403) THEN 'auth'"
+                " WHEN status_code >= 500 THEN 'bad'"
+                " WHEN status_code >= 100 THEN 'alive' ELSE probe_state END"
+                " WHERE COALESCE(probe_state,'')='' AND COALESCE(status_code,0) > 0")
+            # 旧版把 404 也标成「需认证」，这里按状态码改正；只动这一种自相矛盾的
+            # 组合，端口开放 / DNS 解析这类实测结论不受影响。
+            fix = self.conn().execute(
+                "UPDATE assets SET probe_state = CASE"
+                " WHEN status_code >= 500 THEN 'bad' ELSE 'alive' END"
+                " WHERE probe_state='auth' AND COALESCE(status_code,0) > 0"
+                " AND status_code NOT IN (401, 403)")
+            self.conn().commit()
+            return int(cur.rowcount or 0) + int(fix.rowcount or 0)
+
+    def inherit_liveness(self) -> int:
+        """给「从来没探过」的行补存活：端口实测的直接算开放，同一主机的沿用状态码。
+
+        用户要求每个环节的资产都能看存活。实际情况是只有 site / web 行真的发过
+        HTTP：端口扫描出来的 ``service:`` 行、DNS 解析出来的 ``ip:`` / ``domain:``
+        行、小程序包里看到的 IP 行一直是空的，资产列表按存活筛时全被埋掉。
+        这里一次补两层：
+        1. port / service / sibling 行来自端口实测，端口通了就是活的，标 open；
+        2. domain / ip / api 行按主机名或 IP 去借同主机已探到的状态码。
+        只填空值，已有的实测结论一律不覆盖。
+        """
+        now = time.time()
+
+        def rank(code: int) -> int:
+            if 200 <= code < 400:
+                return 0
+            if 400 <= code < 500:
+                return 1
+            return 2
+
+        with self._write_lock:
+            c = self.conn()
+            ports = c.execute(
+                "UPDATE assets SET probe_state='open', probe_at=? WHERE COALESCE(probe_state,'')=''"
+                " AND COALESCE(status_code,0)=0 AND kind IN ('port','service','sibling')",
+                (now,)).rowcount
+            best: dict[str, tuple[int, int, Any]] = {}
+            for r in c.execute(
+                    "SELECT host, ip, status_code, probe_at FROM assets"
+                    " WHERE COALESCE(status_code,0)>0 AND kind IN ('site','web','api')"):
+                code = int(r["status_code"] or 0)
+                tier = rank(code)
+                for key in (str(r["host"] or "").lower(), str(r["ip"] or "").lower()):
+                    if not key:
+                        continue
+                    old = best.get(key)
+                    if old is None or tier < old[0]:
+                        best[key] = (tier, code, r["probe_at"])
+            if not best:
+                self.conn().commit()
+                return int(ports or 0)
+            marks: list[tuple] = []
+            for r in c.execute(
+                    "SELECT id, host, ip FROM assets WHERE COALESCE(probe_state,'')=''"
+                    " AND COALESCE(status_code,0)=0 AND kind IN ('domain','ip','api')"):
+                hit = None
+                for key in (str(r["host"] or "").lower(), str(r["ip"] or "").lower()):
+                    if key and best.get(key):
+                        hit = best[key]
+                        break
+                if hit:
+                    marks.append((hit[1], probe_of(hit[1]), hit[2] or now, int(r["id"])))
+            if marks:
+                c.executemany(
+                    "UPDATE assets SET status_code=?, probe_state=?, probe_at=? WHERE id=?", marks)
+            c.commit()
+            return int(ports or 0) + len(marks)
+
+    def liveness_targets(self, task_id: str = "", limit: int = 2000,
+                         kinds: tuple[str, ...] = ("site", "domain", "ip", "api", "port", "leak",
+                                                   "leakfile", "js", "component"),
+                         ) -> list[dict[str, Any]]:
+        """挑出「还没探过」的资产，拼成能直接发 HTTP 的地址。
+
+        只取 ``probe_state`` 为空且没有状态码的行；site 用入库时的 url，域名 / IP
+        补协议头（探的时候先 https 再 http），端口行带上端口。api 行里那种没有主机
+        的相对路径（``/api/user``）单独发不出请求，跳过。泄露线索只在记到 IP 时探
+        那台机器本身，出处页面不重复探。JS / 泄露文件是完整地址，直接探；
+        指纹阶段记成 ``tcp:IP:端口:协议`` 的组件行，按其中的 IP 和端口探。
+
+        同一个地址可能被多条资产占着（例如泄露线索记的 IP 与 IP 资产是同一台机器），
+        这里按地址分组返回 ``{"url": 地址, "ids": [资产 id, ...]}``，一次请求的结果
+        写回组里全部资产行，避免后来者永远停在「未探测」。
+        """
+        sql = ("SELECT a.id, a.kind, a.url, a.host, a.ip, a.port, a.scheme, a.extra_json"
+               " FROM assets a")
+        vals: list[Any] = []
+        if task_id:
+            sql += " JOIN task_assets t ON t.asset_id=a.id"
+        sql += (" WHERE COALESCE(a.probe_state,'')='' AND COALESCE(a.status_code,0)=0"
+                " AND a.kind IN (%s)" % ",".join("?" * len(kinds)))
+        vals.extend(kinds)
+        # 发不出请求的行在 SQL 里就排掉：相对路径的 api、没记到 IP 也没有完整地址的
+        # 泄露线索。否则它们永远占着 ORDER BY id 的头几条，分批探活每批都取到同一批空转。
+        # 小程序包里抽出来的接口地址记在 extra_json 的 value 里，同样要探。
+        sql += (" AND ((a.kind='leak' AND (COALESCE(a.ip,'')<>''"
+                " OR a.url LIKE 'http://%' OR a.url LIKE 'https://%'"
+                " OR (json_valid(a.extra_json)"
+                " AND (json_extract(a.extra_json,'$.value') LIKE 'http://%'"
+                " OR json_extract(a.extra_json,'$.value') LIKE 'https://%'))))"
+                " OR (a.kind<>'leak' AND (a.url LIKE 'http://%' OR a.url LIKE 'https://%'"
+                " OR COALESCE(a.host,'')<>'' OR a.url LIKE 'tcp:%')))")
+        if task_id:
+            sql += " AND t.task_id=?"
+            vals.append(task_id)
+        # 泄露线索里的 IP 排在前面：它们本来就是要优先确认的暴露面，数量也少
+        sql += " ORDER BY CASE a.kind WHEN 'leak' THEN 0 ELSE 1 END, a.id LIMIT ?"
+        vals.append(max(1, int(limit)))
+        grouped: dict[str, list[int]] = {}
+        for r in self.conn().execute(sql, vals):
+            url = str(r["url"] or "").strip()
+            scheme = str(r["scheme"] or "").strip() or "http"
+            host = clean_host(str(r["host"] or "")) or str(r["ip"] or "").strip()
+            port = int(r["port"] or 0)
+            if r["kind"] == "leak":
+                ip = clean_ip(str(r["ip"] or "")) or ip_host(url)
+                if url.startswith(("http://", "https://")):
+                    # 小程序 / APP 里抽出的接口本身就能请求，直接探这条地址
+                    target = url
+                elif ip:
+                    target = f"http://{ip}"
+                else:
+                    # 包体里抽出来的地址记在 value 上，url 只是带 appid 的线索串
+                    try:
+                        val = json.loads(r["extra_json"] or "{}").get("value") or ""
+                    except (TypeError, ValueError):
+                        val = ""
+                    if isinstance(val, str) and val.startswith(("http://", "https://")):
+                        target = val
+                    else:
+                        continue
+            elif url.startswith(("http://", "https://")):
+                target = url
+            elif url.startswith("tcp:"):
+                # 指纹阶段把开放端口记成 tcp:IP:端口:协议，探的就是这台上面的 Web 服务
+                parts = url.split(":")
+                if len(parts) < 3 or not parts[1]:
+                    continue
+                target = f"http://{parts[1]}"
+                if parts[2].isdigit() and int(parts[2]) not in (80,):
+                    target += f":{parts[2]}"
+            elif host:
+                target = f"{scheme}://{host}"
+                if port and port not in (80, 443):
+                    target += f":{port}"
+            elif url and not url.startswith("/"):
+                # ``ip:1.2.3.4`` 这类行的 url 里就是裸 IP
+                bare = ip_host(url)
+                if not bare:
+                    continue
+                target = f"{scheme}://{bare}"
+            else:
+                continue
+            grouped.setdefault(target, []).append(int(r["id"]))
+        return [{"url": url, "ids": ids} for url, ids in grouped.items()]
+
+    def reset_leak_probe(self) -> int:
+        """清掉泄露线索行借来的存活结论，让批量探活按线索自己去探。
+
+        泄露行以前会跟着出处网站的状态码走（页面是 200，被泄露的 IP 就显示存活），
+        那不是这台机器的结论。有 IP 的线索清空后由探活实测，没探过的保持未探测。
+        已经真探过的（``probe_at`` 有值）不动，重启不会反复清。
+        """
+        with self._write_lock:
+            cur = self.conn().execute(
+                "UPDATE assets SET status_code=NULL, probe_state=NULL"
+                " WHERE kind IN ('leak','leakfile') AND probe_at IS NULL"
+                " AND (COALESCE(status_code,0)>0 OR COALESCE(probe_state,'')<>'')")
+            self.conn().commit()
+            return int(cur.rowcount or 0)
+
+    def apply_probe(self, marks: list[dict[str, Any]]) -> int:
+        """把真实探活结果写回资产行：状态码、存活状态、探活时间。
+
+        ``marks`` 每项 ``{"id": 资产 id, "status": 状态码}``。打不通（没有状态码）
+        记 ``dead``，这样「存活」这一维能区分「探过没通」和「还没探」。
+        """
+        if not marks:
+            return 0
+        now = time.time()
+        rows: list[tuple] = []
+        for m in marks:
+            aid = int(m.get("id") or 0)
+            if not aid:
+                continue
+            code = int(m.get("status") or 0)
+            rows.append((code, probe_of(code) if code else "dead", now, now, aid))
+        if not rows:
+            return 0
+        with self._write_lock:
+            self.conn().executemany(
+                "UPDATE assets SET status_code=?, probe_state=?, probe_at=?, last_seen=?"
+                " WHERE id=?", rows)
+            self.conn().commit()
+        return len(rows)
+
+    # 阶段 → 资产来源。与 pipeline.Runner.PHASE_SOURCE 同义，放在 db 侧是为了
+    # 能给历史资产补「来源」，不必反过来导入流水线。
+    STAGE_SOURCE = {
+        "target_parse": "target", "enterprise": "enterprise", "equity": "equity",
+        "mobile": "mobile", "passive": "passive", "space": "space", "brute": "brute",
+        "dns": "dns", "port": "port", "web": "web", "crawl": "crawl", "leak": "leak",
+        "vhost": "vhost", "takeover": "takeover", "sibling": "sibling", "deep": "deep",
+        "assetdiff": "assetdiff", "report": "report",
+    }
+
+    # 老数据的 ``sources`` 列写着这条资产是哪个采集器收到的，映射成来源类型。
+    # 阶段记录缺失时用它兜底，历史资产才说得清「这台机器是从 DNS 解析到的」。
+    LEGACY_SOURCES = {
+        "applet": "applet", "applet-local": "applet", "applet-remote": "applet",
+        "dns": "dns", "altdns": "dns", "maildns": "dns",
+        "portscan": "port", "nmap-probe": "port",
+        "csegment": "sibling", "asn": "asn", "icp": "icp", "miit": "icp",
+        "brute": "brute", "crawl": "crawl", "js-deep": "js", "fileleak": "leak",
+        "equity": "equity", "enterprise": "enterprise", "web": "web", "handshake": "web",
+        "crtsh": "passive", "certspotter": "passive", "hackertarget": "passive",
+        "robtex_rev": "passive", "ip138_rev": "passive", "subdomain_center": "passive",
+        "rdap": "whois", "whois": "whois",
+        "fofa": "space", "quake": "space", "hunter": "space", "zerozone": "space",
+        "shodan": "space", "censys": "space", "daydaymap": "space",
+    }
+
+    def backfill_asset_sources(self) -> int:
+        """给历史资产补「来源」：按入库阶段还原，裸 IP 直连的站补成 ip。
+
+        来源字段是新加的，老任务的资产全是空值，资产表里看不出某条是小程序包里
+        看到的、还是 DNS 解析出来的。阶段记录本来就在 ``task_assets.stage``，
+        这里一次性搬过来；``122.22.22.22`` 这类裸 IP 的站单归 ip 直连。
+        没有阶段记录的老行再退一层看 ``sources`` 列（采集器标签），DNS 解析出来
+        的 IP 还能指回是哪条域名的解析结果。
+        """
+        c = self.conn()
+        stage_of: dict[int, str] = {}
+        for r in c.execute("SELECT asset_id, stage FROM task_assets"
+                           " WHERE stage IS NOT NULL AND stage!=''"):
+            aid = int(r["asset_id"])
+            if not stage_of.get(aid):
+                stage_of[aid] = str(r["stage"])
+        # IP → 记录过它的域名：域名行解析时把 IP 写在 ips 列，这层对应关系能当出处
+        ip_domain: dict[str, str] = {}
+        for r in c.execute("SELECT host, ips FROM assets WHERE kind='domain'"
+                           " AND COALESCE(ips,'')!=''"):
+            host = str(r["host"] or "")
+            if not host:
+                continue
+            for ip in str(r["ips"] or "").split(","):
+                ip = ip.strip()
+                if ip and ip not in ip_domain:
+                    ip_domain[ip] = host
+        todo = c.execute("SELECT id, kind, host, ip, url, sources FROM assets"
+                         " WHERE source_type IS NULL OR source_type=''").fetchall()
+        marks: list[tuple] = []
+        for r in todo:
+            kind = str(r["kind"] or "")
+            stage = stage_of.get(int(r["id"]), "")
+            src = self.STAGE_SOURCE.get(stage, "")
+            origin = ""
+            if not src:
+                for token in str(r["sources"] or "").split(","):
+                    token = token.strip()
+                    if not token:
+                        continue
+                    head, _, tail = token.partition(":")
+                    src = self.LEGACY_SOURCES.get(head, "")
+                    if src:
+                        if src == "applet" and tail:
+                            origin = f"applet:{tail}"
+                        break
+            if kind == "site" and ip_host(str(r["host"] or "")):
+                # 裸 IP 直连探测出来的 web 资产：出处是解析 / 测绘 / 小程序包
+                src = "ip"
+            if kind in ("ip", "site") and src in ("dns", "port") and not origin:
+                ip = str(r["ip"] or "").strip() or ip_host(str(r["url"] or ""))
+                if ip in ip_domain:
+                    origin = f"domain:{ip_domain[ip]}"
+            if src:
+                marks.append((src, origin, int(r["id"])))
+        if not marks:
+            return 0
+        with self._write_lock:
+            self.conn().executemany(
+                "UPDATE assets SET source_type=?, source_url=COALESCE(NULLIF(source_url,''), ?)"
+                " WHERE id=?", [(s, o, i) for s, o, i in marks])
+            self.conn().commit()
+        return len(marks)
+
+    def backfill_asset_origins(self) -> int:
+        """补出处：小程序 / APP 包记回是哪个包，泄露线索记回是哪个页面。
+
+        包分析阶段落的行没有阶段记录可还原，但 url 本身就写着出处
+        （``applet:<appid>:…``、``mobile:<平台>:<包名>``）；泄露阶段落下的
+        IP / 邮箱 / 手机号 / JS 片段把出处写在 ``extra_json`` 的 ``where``
+        （发现它的页面）或 ``from_js``（哪个 JS）。补上之后资产表的「来源」列
+        才能显示「站点爬虫 · cbs.cmbchina.com」，方便按出处回查。
+        只补空值，已经有出处的不覆盖。
+        """
+        marks: list[tuple] = []          # (source_type, source_url, ip, id)
+        for r in self.conn().execute(
+                "SELECT id, kind, url, ip, extra_json FROM assets"
+                " WHERE COALESCE(source_type,'')='' OR COALESCE(source_url,'')=''"
+                " OR (kind IN ('leak','leakfile') AND url LIKE 'leak:ip:%'"
+                "     AND COALESCE(ip,'')='')"):
+            url = str(r["url"] or "")
+            stype, origin = package_origin(url)
+            try:
+                extra = json.loads(r["extra_json"] or "{}")
+            except Exception:
+                extra = {}
+            if not isinstance(extra, dict):
+                extra = {}
+            ip = ""
+            if url.startswith(("http://", "https://")) and r["kind"] in ("leak", "leakfile"):
+                # 敏感文件这类线索本身就是可访问的网址，出处写它自己
+                stype = stype or "leak"
+                origin = origin or url
+            if url.startswith("leak:") or url.startswith("leakfile:"):
+                kind = url.split(":", 2)[1] if url.count(":") >= 2 else ""
+                page = str(extra.get("where") or extra.get("from") or "").strip()
+                from_js = str(extra.get("from_js") or "").strip()
+                if kind == "js":
+                    stype = stype or "js"
+                    origin = origin or from_js or page
+                elif kind == "ip":
+                    # 泄露的 IP 自己当资产记，出处是被扫到的那个页面
+                    stype = stype or "crawl"
+                    origin = origin or page or from_js
+                    ip = clean_ip(str(extra.get("value") or "").strip() or url.rsplit(":", 1)[-1])
+                elif kind in ("email", "phone", "url", "domain", "token"):
+                    stype = stype or "crawl"
+                    origin = origin or page or from_js
+                else:
+                    stype = stype or "leak"
+                    origin = origin or page or from_js
+            if not (stype or origin or ip):
+                continue
+            marks.append((stype or "", origin or "", ip, int(r["id"])))
+        if not marks:
+            return 0
+        with self._write_lock:
+            c = self.conn()
+            c.executemany(
+                "UPDATE assets SET source_type=COALESCE(NULLIF(source_type,''), ?),"
+                " source_url=COALESCE(NULLIF(source_url,''), ?),"
+                " ip=COALESCE(NULLIF(ip,''), ?) WHERE id=?", marks)
+            c.commit()
+        return len(marks)
+
+    def clean_ip_sentinel(self) -> int:
+        """清掉历史资产里的占位 IP。``0.0.0.1`` 是解析失败的坑，不是主机。
+
+        旧版本把这种值写进了 ``ip`` / ``ips``，资产表 IP 列就冒出一堆
+        「0.0.0.1」假行。清空后这些行按「未探测」处理，批量探活会重新实测。
+        """
+        with self._write_lock:
+            c = self.conn()
+            n = int(c.execute("UPDATE assets SET ip='' WHERE ip=?",
+                              (IP_SENTINEL,)).rowcount or 0)
+            rows = 0
+            for r in c.execute("SELECT id, ips FROM assets WHERE ips LIKE ?",
+                               (f"%{IP_SENTINEL}%",)):
+                left = clean_ip_list(str(r["ips"] or ""))
+                c.execute("UPDATE assets SET ips=? WHERE id=?", (left, int(r["id"])))
+                rows += 1
+            c.commit()
+        return n + rows
+
+    def js_secret_rows(self) -> list[dict[str, Any]]:
+        """所有从 JS 里抽出来的「敏感信息」线索，供误报清理逐条复核。
+
+        返回 ``{"id", "type", "value"}``；判定放在 ``beauty.fake_secret``，
+        入库和清历史共用一套规则。
+        """
+        import json
+
+        out: list[dict[str, Any]] = []
+        c = self.conn()
+        for r in c.execute("SELECT id, extra_json FROM assets"
+                           " WHERE kind='leak' AND url LIKE 'leak:js:%'"):
+            try:
+                extra = json.loads(r["extra_json"] or "{}")
+            except (ValueError, TypeError):
+                extra = {}
+            out.append({"id": int(r["id"]),
+                        "type": str(extra.get("type") or ""),
+                        "value": str(extra.get("value") or "")})
+        return out
 
     def merge_assets(self, keep_id: int, drop_ids: list[int],
                      extra: dict | None = None) -> int:
@@ -973,6 +1564,18 @@ class Store:
                 else:
                     where.append(f"{k}=?")
                 vals.append(filters[k])
+        # 出处分类：域名目标 / 工商 / 股权 / 小程序 / APP / JS / 被动源 / 测绘 / 爬虫
+        if filters.get("source_type"):
+            where.append("source_type=?")
+            vals.append(str(filters["source_type"]))
+        # 探活状态：alive / auth / bad / open / dns / dead / space / unknown
+        probe = str(filters.get("probe_state") or filters.get("alive") or "")
+        if probe:
+            if probe == "unknown":
+                where.append("COALESCE(probe_state,'')='' AND COALESCE(status_code,0)=0")
+            else:
+                where.append("probe_state=?")
+                vals.append(probe)
         # 分表口径：一张表可能对应多个 kind（APP 同时有本机解包和工商两路来源），
         # 单 kind 的用法保持不变，多 kind 走 kinds。
         kinds = filters.get("kinds")
@@ -1441,11 +2044,11 @@ class Store:
         return " WHERE id IN (SELECT asset_id FROM task_assets WHERE task_id=?)", [task_id]
 
     def surface_counts(self, task_id: str = "", stage: str = "") -> dict[str, int]:
-        """各资产面条数：Web / 小程序 / 公众号 / APP / 网段 / 备案 / 主体与邮箱"""
+        """各资产面条数：Web 站点 / 主机与端口 / 接口路径 / 泄露线索 / 小程序 / 公众号 / APP / 网段 / 备案 / 主体与邮箱"""
         c = self.conn()
         scope, vals = self._task_scope(task_id, stage)
         out: dict[str, int] = {}
-        for key in ("web", "applet", "mp", "app", "netblock", "icp", "meta"):
+        for key in ("web", "host", "api", "leak", "applet", "mp", "app", "netblock", "icp", "meta"):
             sql = (f"SELECT COUNT(*) FROM assets{scope}"
                    f"{' AND ' if scope else ' WHERE '}{surface_cond(key)}")
             out[key] = int(c.execute(sql, vals).fetchone()[0])
@@ -1565,10 +2168,19 @@ class Store:
             " GROUP BY root_domain ORDER BY n DESC LIMIT 40", vals)]
         return {"total": sum(hit.values()), "buckets": buckets, "templates": tpl, "roots": roots}
 
-    def facets(self, task_id: str = "", stage: str = "") -> dict[str, Any]:
-        """资产搜索左侧分面；给任务 ID 时分面只统计该任务的资产"""
+    def facets(self, task_id: str = "", stage: str = "", kinds=()) -> dict[str, Any]:
+        """资产搜索左侧分面；给任务 ID 时分面只统计该任务的资产。
+
+        ``kinds`` 用来把分面缩到一类资产上：泄露线索页只要 leak 的来源分布，
+        不需要把域名、端口那几万条也算进来。
+        """
         c = self.conn()
         where, vals = self._task_scope(task_id, stage)
+        kinds = [str(x).strip() for x in (kinds or ()) if str(x or "").strip()]
+        if kinds:
+            where += (" AND " if where else " WHERE ") + \
+                f"kind IN ({','.join('?' * len(kinds))})"
+            vals = list(vals) + kinds
 
         def grouped(col: str, extra: str = "", limit: int = 40) -> list[dict]:
             sql = (f"SELECT {col}, COUNT(*) c FROM assets{where}")
@@ -1583,8 +2195,13 @@ class Store:
         root = grouped("root_domain", "root_domain IS NOT NULL AND root_domain!=''", 40)
         cdn = grouped("cdn", "cdn IS NOT NULL AND cdn!=''", 20)
         src = grouped("sources", "sources IS NOT NULL AND sources!=''", 30)
+        origin = grouped("source_type", "source_type IS NOT NULL AND source_type!=''", 30)
+        # 存活分面：没探过的归到 unknown，和列表里「未探测」的筛选口径一致
+        probe = [{"value": r[0], "count": r[1]} for r in c.execute(
+            "SELECT CASE WHEN COALESCE(probe_state,'')='' THEN 'unknown' ELSE probe_state END s,"
+            f" COUNT(*) c FROM assets{where} GROUP BY s ORDER BY c DESC", vals)]
         return {"kind": kind, "port": port, "fingerprint": fp, "root_domain": root,
-                "cdn": cdn, "sources": src}
+                "cdn": cdn, "sources": src, "source_type": origin, "probe": probe}
 
     # ─────── 自定义指纹 ───────
     def list_fingerprints(self) -> list[dict]:

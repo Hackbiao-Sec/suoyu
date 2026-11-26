@@ -28,6 +28,16 @@ FOREIGN_ROOTS: tuple[str, ...] = (
     "jsdelivr.net", "unpkg.com", "cdnjs.cloudflare.com", "bootstrapcdn.com",
     "bootcdn.net", "staticfile.org", "staticfile.net", "jquery.com", "fontawesome.com",
     "w3.org", "schema.org", "googleusercontent.com", "gstatic.com", "jqueryui.com",
+    "npmjs.com", "npmjs.org", "js.org", "mozilla.org", "apache.org", "sourceforge.net",
+    # 地图 / 定位 / 推送 / 统计这类会嵌进小程序和 App 包的第三方 SDK。
+    # 包里的域名是 SDK 自己的，跟着并进自家根域就会把整片第三方资产拉进来。
+    "amap.com", "gaode.com", "autonavi.com", "qqmap.com", "mapbar.com",
+    "hotjar.com", "clarity.ms", "matomo.cloud", "googlesyndication.com",
+    # 代码托管 / 开发者社区：包和页面里引用的仓库、示例、文档都是别人的
+    "github.io", "github.dev", "ghcr.io", "gitee.com", "gitee.io", "gitlab.io",
+    "bitbucket.org", "csdn.net", "juejin.cn", "zhihu.com", "jianshu.com",
+    "oschina.net", "cnblogs.com", "51cto.com", "segmentfault.com", "infoq.cn",
+    "w3schools.com", "runoob.com", "gitbook.io", "readthedocs.io",
     # 网络基础设施
     "akamai.net", "akamaized.net", "akamaiedge.net", "cloudflare.net", "cloudflare.com",
     "fastly.net", "awsdns.org", "azureedge.net", "azurewebsites.net",
@@ -44,8 +54,36 @@ SEARCH_ROOTS: tuple[str, ...] = (
     "censys.io", "shodan.io", "fofa.info", "hunter.qianxin.com", "quake.360.net",
     "zoomeye.org", "virustotal.com", "securitytrails.com", "passivetotal.com",
     "chaos.projectdiscovery.io", "github.com", "githubapp.com", "githubusercontent.com",
+    "github.io", "gitee.com", "gitee.io", "gitlab.com", "bitbucket.org", "npmjs.com",
     "qqmail.com", "exmail.qq.com", "w3.org",
 )
+
+# 第三方根域的中文归属，给审核记录写人话用（「高德地图 SDK」比「foreign」好读）
+FOREIGN_LABEL: dict[str, str] = {
+    "amap.com": "高德地图 SDK", "gaode.com": "高德地图", "autonavi.com": "高德（Autonavi）",
+    "qqmap.com": "腾讯地图 SDK", "mapbar.com": "图吧地图 SDK",
+    "github.com": "GitHub", "github.io": "GitHub Pages", "githubapp.com": "GitHub",
+    "githubusercontent.com": "GitHub 静态资源", "gitee.com": "Gitee", "gitlab.com": "GitLab",
+    "npmjs.com": "npm 包站", "jsdelivr.net": "公共 CDN", "unpkg.com": "公共 CDN",
+    "csdn.net": "CSDN 开发者社区", "juejin.cn": "掘金社区", "zhihu.com": "知乎",
+    "qq.com": "腾讯开放平台", "weixin.qq.com": "微信开放平台", "alipay.com": "支付宝开放平台",
+    "umeng.com": "友盟统计 SDK", "jpush.cn": "极光推送 SDK", "getui.com": "个推 SDK",
+    "bugly.qq.com": "Bugly 崩溃采集 SDK", "sentry.io": "Sentry 监控",
+    "hotjar.com": "Hotjar 埋点", "clarity.ms": "Clarity 埋点", "google-analytics.com": "Google 统计",
+    "baidu.com": "百度", "bdstatic.com": "百度静态资源", "xiaomi.com": "小米",
+    "mi.com": "小米", "huawei.com": "华为", "aliyun.com": "阿里云", "aliyuncs.com": "阿里云",
+}
+
+
+def foreign_label(domain: str) -> str:
+    """命中的第三方根域叫什么；没命中返回空串。"""
+    d = _norm(domain)
+    for root, label in FOREIGN_LABEL.items():
+        if d == root or d.endswith("." + root):
+            return label
+    if is_foreign(d):
+        return "第三方平台 / 公共资源"
+    return ""
 
 # 静态资源尾巴：域名正则会把文件名、CSS 选择器、JS 变量误当域名（`favicon.ico`、
 # `document.write`、`Math.random`、`p.desc`）。只挡明确的非域名形态。

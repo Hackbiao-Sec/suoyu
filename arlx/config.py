@@ -170,10 +170,16 @@ DEFAULTS: dict = {
         # 凭据验证：指向目录（内含 <组件名>.txt，每行 user:pass）；留空=不验证
         "credential_lists": "",
         "dns_source_policy": "all",    # all | arl13 | custom
-        # 股权穿透：全资（累计持股 100%）子/孙公司并进目标池；参股只记不挖
+        # 股权穿透：累计持股达到门槛的子/孙公司并进目标池；其余只记不挖
         "equity_expand": True,
         "equity_depth": 2,             # 向下穿透层数
-        "equity_ratio": 100,           # 入池门槛（累计持股百分比）
+        "equity_ratio": 100,           # 入池门槛（累计持股百分比，1~100，可自定义）
+        # 归属审核：每个要并进目标池的根域 / 主体都过一道闸。规则先判，规则说不清的
+        # 交给 AI 复核（需已配 deepseek/openai key）；跑不出结论就退回人工待审。
+        "ai_review": True,
+        # 持续探活：任务每个阶段收进来的资产都当场发一次 HTTP 判断存活，
+        # 而不是等任务跑完再手动点「批量探活」
+        "stage_probe": True,
         # 最终受益人：股东树按有效持股折算，累计到控制线算控制
         "equity_ubo_threshold": 25,    # 控制线（百分比）；25 是工商常用口径
         "equity_ubo_levels": 1,        # 机构股东往上再穿几层（0 = 不额外请求）

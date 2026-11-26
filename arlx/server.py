@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .config import DATA_DIR, ROOT, config, src_base
+from . import db
 from .db import RISK_RULES, SURFACE_LABEL, audit, store
 from .db import with_liveness, live_state
 from .engine import ai as ai_engine
@@ -36,6 +37,7 @@ from .engine import space as space_mod
 from .engine import source_health
 from .engine.collectors import enterprise, equity, mobile
 from .engine.collectors import applet as applet_mod
+from .engine.collectors import review
 from .engine.http_engine import fetch_text
 from .engine.portscan import PORT_PRESETS, parse_ports, ports_for_type
 from .engine.sources.passive import DOMAIN_SOURCES, FREE_SOURCES, fofa_search, source_meta
@@ -116,6 +118,35 @@ def current_user(request: Request) -> str:
     raise HTTPException(status_code=401, detail="未登录或登录已过期")
 
 
+async def _backfill_once() -> None:
+    """历史资产补「来源」和「存活」两个后加字段。
+
+    来源按资产入库的阶段还原（被动源 / 空间测绘 / 小程序 / JS…），裸 IP 直连的
+    web 资产单归 ip 直连；小程序包 / APP 包里落的线索再按 url 前缀补回具体包名，
+    泄露线索按 ``extra_json`` 记回发现它的页面；存活拿任务里已探到的 site 状态码
+    回填同一主机的其它行，端口实测行直接算开放。这些函数都只处理仍为空的行，
+    重启再跑一遍也不重复写。
+    """
+    def run() -> None:
+        try:
+            k = store.clean_ip_sentinel()
+            n = store.backfill_asset_sources()
+            o = store.backfill_asset_origins()
+            m = store.repair_liveness()
+            p = store.backfill_probe_state()
+            q = store.inherit_liveness()
+            r = store.reset_leak_probe()
+            bad = [row["id"] for row in store.js_secret_rows()
+                   if beauty.fake_secret(row["type"], row["value"])]
+            d = store.delete_assets(bad)
+            print(f"[backfill] 占位IP {k} 条 / 来源 {n + o} 条 / 存活 {m + p + q + r} 条"
+                  f" / 误报 {d} 条", flush=True)
+        except Exception as e:
+            print(f"[backfill] 跳过：{e}", flush=True)
+
+    await asyncio.to_thread(run)
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     # 出厂管理员：hkbb / hkbb666；老库里的 admin/arlpass 若还没被改过，一并迁过来
@@ -128,6 +159,7 @@ async def on_startup() -> None:
         if t.get("status") in ("running", "stopping"):
             store.update_task(t["id"], status="stopped", message="服务重启，任务中断")
     asyncio.create_task(_scheduler_loop())
+    asyncio.create_task(_backfill_once())
     try:
         st = await listener.start()
         print(f"[listener] dns={st['dns'] or '-'} http={st['http'] or '-'} "
@@ -927,11 +959,13 @@ def query_assets(request: Request, kind: str = "", kinds: str = "", keyword: str
                        cdn: str = "", port: int = 0, limit: int = 100, offset: int = 0,
                        order: str = "last_seen DESC", is_new: int = 0,
                        surface: str = "", risk: str = "", stage: str = "",
+                       source_type: str = "", alive: str = "",
                        min_ratio: float = 0.0) -> dict:
     current_user(request)
     f = {"kind": kind or None, "keyword": keyword or None, "host": host or None, "ip": ip or None,
          "root_domain": root_domain or None, "task_id": task_id or None, "cdn": cdn or None,
          "surface": surface or None, "risk": risk or None, "stage": stage or None,
+         "source_type": source_type or None, "alive": alive or None,
          "kinds": [k.strip() for k in (kinds or "").split(",") if k.strip()] or None,
          "min_ratio": float(min_ratio or 0) or None,
          "is_new": is_new or None,
@@ -961,6 +995,101 @@ def repair_liveness(request: Request, task_id: str = "") -> dict:
     return {"ok": True, "updated": hit, "task_id": task_id}
 
 
+# 批量探活的后台作业状态：资产页点一次「批量探活」，进度就从这个字典读。
+PROBE_JOB: dict[str, Any] = {
+    "running": False, "total": 0, "done": 0, "alive": 0, "dead": 0,
+    "updated": 0, "task_id": "", "started": 0, "msg": "空闲",
+}
+_probe_job_task: asyncio.Task | None = None
+PROBE_CONCURRENT_MAX = 64
+
+
+async def _run_probe_sweep(task_id: str, limit: int) -> None:
+    """把「从来没探过」的资产真的打一遍 HTTP，结果写回状态码与存活状态。
+
+    资产页、任务详情、报告看到的「存活」全靠这一列；只按已有状态码回填会把
+    「没探过」永远留在空值里，所以这里补的是实际请求。域名先走 https、失败了再走
+    http，避免只有 https 的站被记成打不通。
+    """
+    from .engine.http_engine import probe
+
+    job = PROBE_JOB
+    try:
+        targets = await asyncio.to_thread(store.liveness_targets, task_id, limit)
+        job["total"] = len(targets)
+        if not targets:
+            job["msg"] = "没有待探活的资产"
+            return
+        job["msg"] = "探活中"
+        conc = int(config.get("http", "concurrent") or 100)
+        sem = asyncio.Semaphore(max(1, min(conc, PROBE_CONCURRENT_MAX)))
+        pending: list[dict] = []
+
+        async def one(t: dict) -> None:
+            url = t["url"]
+            tries = [url]
+            if url.startswith("http://"):
+                tries.insert(0, "https://" + url[len("http://"):])
+            code = 0
+            async with sem:
+                for u in tries:
+                    try:
+                        info = await probe(u, want_body=False, want_cert=False, timeout=8)
+                    except Exception:
+                        info = None
+                    code = int(getattr(info, "status", 0) or 0)
+                    if code:
+                        break
+            pending.extend({"id": aid, "status": code} for aid in t["ids"])
+            job["done"] += 1
+            if code:
+                job["alive"] += 1
+            else:
+                job["dead"] += 1
+            if len(pending) >= 20:
+                rows, pending[:] = pending[:], []
+                job["updated"] += await asyncio.to_thread(store.apply_probe, rows)
+            if job["done"] % 50 == 0:
+                job["msg"] = f"探活中 {job['done']}/{job['total']}"
+
+        await asyncio.gather(*(one(t) for t in targets), return_exceptions=True)
+        if pending:
+            job["updated"] += await asyncio.to_thread(store.apply_probe, pending)
+        job["msg"] = (f"完成：探 {job['total']} 个，存活 {job['alive']} 个，"
+                      f"未通 {job['dead']} 个")
+    except Exception as e:  # 后台作业不能把异常吞成静默失败
+        job["msg"] = f"中断：{type(e).__name__}: {e}"[:200]
+    finally:
+        job["running"] = False
+
+
+@app.post("/api/assets/probe")
+async def probe_assets(request: Request, body: dict = Body(default={})) -> dict:
+    """批量探活：对资产库里还没探过的行真的发一次 HTTP。
+
+    请求体可选 ``task_id``（只探一个任务）、``limit``（默认 2000）。已经在跑时直接
+    返回当前进度，不会叠加第二个作业。
+    """
+    global _probe_job_task
+    current_user(request)
+    if PROBE_JOB.get("running"):
+        return {"ok": True, **PROBE_JOB, "already": True}
+    task_id = str(body.get("task_id") or "")
+    limit = max(1, min(int(body.get("limit") or 2000), 50000))
+    PROBE_JOB.update({"running": True, "total": 0, "done": 0, "alive": 0, "dead": 0,
+                      "updated": 0, "task_id": task_id, "started": time.time(),
+                      "msg": "准备中"})
+    _probe_job_task = asyncio.create_task(_run_probe_sweep(task_id, limit))
+    return {"ok": True, **PROBE_JOB}
+
+
+@app.get("/api/assets/probe")
+def probe_assets_status(request: Request) -> dict:
+    """批量探活的进度：前端轮询这个接口画进度条。"""
+    current_user(request)
+    return {"ok": True, **PROBE_JOB}
+
+
 @app.post("/api/assets/delete")
 def delete_assets(request: Request, body: dict = Body(...)) -> dict:
     """批量删资产：body 传 {"ids": [1,2,3]}，任务关联一起清。"""
@@ -976,10 +1105,48 @@ def delete_assets(request: Request, body: dict = Body(...)) -> dict:
 # 注意顺序：/api/assets/facets 必须注册在 /api/assets/{asset_id} 之前，
 # 否则 "facets" 会被当成 asset_id 解析成整数直接 422。
 @app.get("/api/assets/facets")
-def facets(request: Request, task_id: str = "", stage: str = "") -> dict:
+def facets(request: Request, task_id: str = "", stage: str = "", kinds: str = "") -> dict:
     current_user(request)
+    picks = [k.strip() for k in kinds.split(",") if k.strip()]
     return {"ok": True, "surfaces": store.surface_counts(task_id=task_id, stage=stage),
-            "labels": SURFACE_LABEL, **store.facets(task_id=task_id, stage=stage)}
+            "labels": SURFACE_LABEL, "source_labels": review.SOURCE_LABEL,
+            "probe_labels": db.PROBE_TEXT,
+            **store.facets(task_id=task_id, stage=stage, kinds=picks)}
+
+
+@app.get("/api/reviews")
+def reviews_list(request: Request, task_id: str = "", verdict: str = "", kind: str = "",
+                 keyword: str = "", source_type: str = "",
+                 limit: int = 200, offset: int = 0) -> dict:
+    """归属审核记录：每条根域 / 主体为什么被放行、待审或拒绝。
+
+    审核分两层：规则先判（域名黑名单、已在目标池、主体名相近），规则说不清的交给
+    AI 复核。这里把两层的结论都列出来，任务里哪个域名没并线、为什么没并线可回查。
+    """
+    current_user(request)
+    lim = max(1, min(int(limit), 1000))
+    return {"ok": True,
+            "items": store.query_reviews(task_id=task_id, verdict=verdict, kind=kind,
+                                         keyword=keyword, source_type=source_type,
+                                         limit=lim, offset=max(0, int(offset))),
+            "summary": store.review_summary(task_id=task_id),
+            "labels": review.VERDICT_TEXT, "sources": review.SOURCE_LABEL}
+
+
+@app.post("/api/reviews/verdict")
+def reviews_verdict(request: Request, body: dict = Body(...)) -> dict:
+    """人工改判：把待审的根域定成放行或拒绝。
+
+    改判只动审核记录，不改已经并进目标池的根域；下一次同名根域再出现时按新结论走。
+    """
+    user = current_user(request)
+    rid = int(body.get("id") or 0)
+    verdict = str(body.get("verdict") or "").strip()
+    if not rid or verdict not in ("allow", "deny", "review"):
+        raise HTTPException(status_code=400, detail="id 与 verdict（allow/deny/review）必填")
+    ok = store.set_review_verdict(rid, verdict, note=f"人工改判（{user}）")
+    audit("review_verdict", str(rid), verdict, user=user)
+    return {"ok": bool(ok), "id": rid, "verdict": verdict}
 
 
 @app.get("/api/risk")

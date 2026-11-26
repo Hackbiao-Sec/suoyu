@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import PageHead from '@/components/PageHead.vue'
@@ -7,7 +7,8 @@ import Icon from '@/components/Icon.vue'
 import AssetTable from '@/components/AssetTable.vue'
 import {
   assetFacets, exportSheets, exportWorkbook, getTask, listAssets, listModules,
-  listTasks, repairLiveness, riskOverview,
+  listReviews, listTasks, probeAssets, probeStatus, repairLiveness, riskOverview,
+  setReviewVerdict,
 } from '@/api/endpoints'
 
 const route = useRoute()
@@ -27,23 +28,33 @@ const filters = reactive({
   is_new: route.query.is_new === '1',
   order: 'last_seen DESC',
   min_ratio: 0,
+  // 来源与存活是两个独立维度：一条资产可以是「小程序带出来的」且「已探活」
+  source_type: route.query.source || '',
+  alive: route.query.alive || '',
 })
 const items = ref([])
 const total = ref(0)
 const offset = ref(0)
 const limit = 100
 const loading = ref(false)
-const facets = ref({ kind: [], port: [], fingerprint: [], root_domain: [], cdn: [], surfaces: {}, labels: {} })
+const facets = ref({
+  kind: [], port: [], fingerprint: [], root_domain: [], cdn: [], surfaces: {}, labels: {},
+  source_type: [], source_labels: {}, probe: [], probe_labels: {},
+})
 const risks = ref({ total: 0, buckets: [] })
 const detail = ref(null)
 
-// ── 三个视角：总览（全库一张表）/ 按任务 / 分表（子公司、ICP…一张一类） ──
+// ── 五个视角：总览（全库一张表）/ 按任务 / 分表（子公司、ICP…一张一类）/
+//    泄露线索（小程序、APP、JS 里扫到的裸 IP 与接口）/ 归属审核 ──
 const VIEWS = [
   { key: 'overview', label: '总览' },
   { key: 'tasks', label: '按任务' },
   { key: 'sheets', label: '分表' },
+  { key: 'leaks', label: '泄露线索' },
+  { key: 'reviews', label: '归属审核' },
 ]
-const view = ref(['overview', 'tasks', 'sheets'].includes(route.query.view) ? route.query.view : 'overview')
+const VIEW_KEYS = ['overview', 'tasks', 'sheets', 'leaks', 'reviews']
+const view = ref(VIEW_KEYS.includes(route.query.view) ? route.query.view : 'overview')
 function setView(v) {
   view.value = v
   const q = { ...route.query }
@@ -51,6 +62,8 @@ function setView(v) {
   else q.view = v
   router.replace({ path: route.path, query: q })
   if (v === 'sheets') loadSheet()
+  if (v === 'leaks') loadLeaks()
+  if (v === 'reviews') loadReviews()
 }
 
 // 类型中文名统一取后端一份，前端不再各存一张表
@@ -104,6 +117,8 @@ async function loadSheet(reset = true) {
       task_id: filters.task_id || undefined,
       stage: filters.stage || undefined,
       root_domain: filters.root_domain || undefined,
+      source_type: filters.source_type || undefined,
+      alive: filters.alive || undefined,
       is_new: filters.is_new ? 1 : undefined,
       order: filters.order,
       limit,
@@ -204,8 +219,152 @@ async function loadTaskName() {
   }
 }
 
+// ── 归属审核：每个根域 / 主体为什么放行、待审或拒绝（规则一层，AI 一层） ──
+// 后端把每次判定都落进了 asset_reviews，这里只负责摆出来，方便回查「这趟为什么
+// 没把某个域名并进目标池」。人工改判只改审核结论，下次同名根域再出现时按新结论走。
+const reviews = ref([])
+const reviewSummary = ref({ allow: 0, review: 0, deny: 0, total: 0 })
+const reviewLabels = ref({ allow: '放行', review: '待审', deny: '拒绝' })
+const reviewSources = ref({})
+const reviewFilter = reactive({ verdict: '', keyword: '' })
+const reviewLoading = ref(false)
+const REVIEW_VERDICTS = ['allow', 'review', 'deny']
+let reviewSeq = 0
+
+function fmtTime(ts) {
+  const n = Number(ts)
+  if (!n) return '-'
+  const d = new Date(n * 1000)
+  const p = (x) => String(x).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+async function loadReviews() {
+  const seq = ++reviewSeq
+  reviewLoading.value = true
+  try {
+    const res = await listReviews({
+      task_id: filters.task_id || undefined,
+      verdict: reviewFilter.verdict || undefined,
+      keyword: reviewFilter.keyword.trim() || undefined,
+      limit: 500,
+    })
+    if (seq !== reviewSeq) return
+    reviews.value = res?.items || []
+    reviewSummary.value = res?.summary || { allow: 0, review: 0, deny: 0, total: 0 }
+    if (res?.labels) reviewLabels.value = res.labels
+    if (res?.sources) reviewSources.value = res.sources
+  } catch {
+    /* 审核记录拿不到不影响其它视角 */
+  } finally {
+    if (seq === reviewSeq) reviewLoading.value = false
+  }
+}
+
+async function markVerdict(row, verdict) {
+  try {
+    const res = await setReviewVerdict({ id: row.id, verdict })
+    if (!res?.ok) {
+      ElMessage.warning('没有改到这条审核记录')
+      return
+    }
+    ElMessage.success(`已改判为「${reviewLabels.value[verdict] || verdict}」，下次同名根域按此结论走`)
+    loadReviews()
+  } catch {
+    ElMessage.error('改判失败')
+  }
+}
+
+function reviewAssets(row) {
+  const subject = String(row.subject || '').trim()
+  if (!subject) return
+  filters.root_domain = subject
+  filters.keyword = ''
+  view.value = 'overview'
+  const q = { ...route.query, root: subject }
+  delete q.view
+  router.replace({ path: route.path, query: q })
+  search()
+}
+
+// ── 泄露线索：小程序包 / APP / JS / 爬虫里扫出来的裸 IP、接口路径、邮箱、账号，
+//    这些不是能直接打开的 Web 资产（Web 资产是一条完整可请求的 http(s) 地址）。
+//    每条都记着「从哪来的」，这里按来源分开摆，方便核对和跟踪。
+const LEAK_KINDS = 'leak,leakfile'
+const leaks = ref([])
+const leakTotal = ref(0)
+const leakOffset = ref(0)
+const leakLoading = ref(false)
+const leakSources = ref([])
+const leakSourceLabels = ref({})
+let leakSeq = 0
+
+async function loadLeaks(reset = true) {
+  if (reset) leakOffset.value = 0
+  const seq = ++leakSeq
+  leakLoading.value = true
+  try {
+    const [res, fc] = await Promise.all([
+      listAssets({
+        kinds: LEAK_KINDS,
+        keyword: filters.keyword.trim() || undefined,
+        source_type: filters.source_type || undefined,
+        alive: filters.alive || undefined,
+        task_id: filters.task_id || undefined,
+        stage: filters.stage || undefined,
+        order: filters.order,
+        limit,
+        offset: leakOffset.value,
+      }),
+      assetFacets({
+        task_id: filters.task_id || undefined,
+        stage: filters.stage || undefined,
+        kinds: LEAK_KINDS,
+      }),
+    ])
+    if (seq !== leakSeq) return
+    leaks.value = res.items || []
+    leakTotal.value = res.total || 0
+    leakSources.value = (fc?.source_type || []).filter((s) => s.count > 0)
+    leakSourceLabels.value = fc?.source_labels || {}
+  } catch {
+    if (seq === leakSeq) {
+      leaks.value = []
+      leakTotal.value = 0
+    }
+  } finally {
+    if (seq === leakSeq) leakLoading.value = false
+  }
+}
+
+function pickLeakSource(v) {
+  filters.source_type = filters.source_type === v ? '' : v
+  loadLeaks()
+}
+
+const leakPages = computed(() => Math.max(1, Math.ceil(leakTotal.value / limit)))
+const leakPage = computed(() => Math.floor(leakOffset.value / limit) + 1)
+// 来源卡片上的合计：分面只按资产类别收窄，不叠加来源，所以各来源加起来就是这类线索的总数
+const leakTotalAll = computed(() => leakSources.value.reduce((n, s) => n + (Number(s.count) || 0), 0))
+function goLeakPage(n) {
+  leakOffset.value = (n - 1) * limit
+  loadLeaks(false)
+}
+
+// 分面 / 范围芯片是两种视角共用的：在泄露视角里改条件就要重拉泄露列表，
+// 否则点掉一个芯片之后列表还是旧的。
+function refreshCurrent() {
+  if (view.value === 'leaks') return loadLeaks()
+  return search()
+}
+
+// 资产面：Web 只收完整可请求的 http(s) 地址；裸域名 / 裸 IP / 端口单独一面；
+// 从小程序、APP、JS、爬虫里扫出来的裸 IP 和账号进「泄露线索」，每条带出处。
 const SURFACES = [
-  { key: 'web', label: 'Web', icon: 'globe' },
+  { key: 'web', label: 'Web 站点', icon: 'globe' },
+  { key: 'host', label: '主机与端口', icon: 'server' },
+  { key: 'api', label: '接口路径', icon: 'link' },
+  { key: 'leak', label: '泄露线索', icon: 'alert' },
   { key: 'applet', label: '小程序', icon: 'layers' },
   { key: 'mp', label: '公众号', icon: 'chat' },
   { key: 'app', label: 'APP', icon: 'bolt' },
@@ -227,6 +386,14 @@ const ORDERS = [
   { v: 'host ASC', label: '地址排序' },
   { v: 'status_code DESC', label: '状态码' },
 ]
+// 存活维度的筛选项：后端 live_state() 给出的状态键，文案统一从 probe_labels 取
+const PROBE_KEYS = ['alive', 'auth', 'bad', 'open', 'dns', 'space', 'dead', 'unknown']
+const probeFilters = computed(() => {
+  const counts = Object.fromEntries((facets.value.probe || []).map((f) => [f.value, f.count]))
+  return PROBE_KEYS
+    .map((key) => ({ key, label: facets.value.probe_labels?.[key] || key, count: counts[key] || 0 }))
+    .filter((p) => p.count > 0)
+})
 
 const pages = computed(() => Math.max(1, Math.ceil(total.value / limit)))
 const page = computed(() => Math.floor(offset.value / limit) + 1)
@@ -244,6 +411,8 @@ function params() {
     risk: filters.risk || undefined,
     task_id: filters.task_id || undefined,
     stage: filters.stage || undefined,
+    source_type: filters.source_type || undefined,
+    alive: filters.alive || undefined,
     is_new: filters.is_new ? 1 : undefined,
     order: filters.order,
     limit,
@@ -269,7 +438,7 @@ async function search(reset = true) {
 
 function pick(field, value) {
   filters[field] = filters[field] === value ? '' : value
-  search()
+  refreshCurrent()
 }
 
 // 历史任务的域名 / 接口 / 端口行没探过 HTTP，状态一直是空。
@@ -287,14 +456,89 @@ async function repairAlive() {
   }
 }
 
+// 批量探活：对还没探过的资产真的发一次请求，进度从后端作业状态读。
+// 「补全存活状态」只搬已有状态码，探不出新东西；这个才是把未探测的资产打一遍。
+const probing = ref(false)
+const probeMsg = ref('')
+let probeTimer = null
+function stopProbePoll() {
+  if (probeTimer) {
+    clearInterval(probeTimer)
+    probeTimer = null
+  }
+}
+async function refreshAfterProbe() {
+  await search()
+  loadFacets()
+}
+function watchProbe() {
+  stopProbePoll()
+  probeTimer = setInterval(async () => {
+    try {
+      const st = await probeStatus()
+      probeMsg.value = st.msg || ''
+      if (!st.running) {
+        stopProbePoll()
+        probing.value = false
+        await refreshAfterProbe()
+        ElMessage.success(st.msg || '批量探活完成')
+      }
+    } catch {
+      stopProbePoll()
+      probing.value = false
+    }
+  }, 1500)
+}
+async function probeAll() {
+  if (probing.value) return
+  probing.value = true
+  probeMsg.value = '准备中'
+  try {
+    const res = await probeAssets({ task_id: filters.task_id || '', limit: 3000 })
+    probeMsg.value = res.msg || '探活中'
+    if (!res.running) {
+      probing.value = false
+      probeMsg.value = ''
+      await refreshAfterProbe()
+      return
+    }
+    watchProbe()
+  } catch {
+    probing.value = false
+    probeMsg.value = ''
+  }
+}
+// 页面刷新时可能有一个探活作业还在跑，接着显示进度
+async function resumeProbe() {
+  try {
+    const st = await probeStatus()
+    if (st.running) {
+      probing.value = true
+      probeMsg.value = st.msg || '探活中'
+      watchProbe()
+    }
+  } catch {
+    /* 探活状态不影响页面加载 */
+  }
+}
+onUnmounted(stopProbePoll)
+
 function pickSurface(key) {
+  // 泄露线索按来源分开摆，有自己的视图；点这张卡就切过去，而不是留在浏览表里
+  if (key === 'leak') {
+    filters.surface = ''
+    filters.source_type = ''
+    setView('leaks')
+    return
+  }
+  if (view.value === 'leaks') setView('overview')
   filters.surface = filters.surface === key ? '' : key
-  search()
+  refreshCurrent()
 }
 
 function pickRisk(key) {
   filters.risk = filters.risk === key ? '' : key
-  search()
+  refreshCurrent()
 }
 
 function clearTask() {
@@ -307,7 +551,7 @@ function clearTask() {
   loadFacets()
   loadRisks()
   loadSheets()
-  search()
+  refreshCurrent()
 }
 
 function clearRoot() {
@@ -315,7 +559,7 @@ function clearRoot() {
   const q = { ...route.query }
   delete q.root
   router.replace({ path: route.path, query: q })
-  search()
+  refreshCurrent()
 }
 
 // 阶段过滤挂在任务下面：同一个 host 可能是这趟 P4 收的、下趟 P6 才探到
@@ -325,7 +569,7 @@ function clearStage() {
   delete q.stage
   router.replace({ path: route.path, query: q })
   loadFacets()
-  search()
+  refreshCurrent()
 }
 
 function goPage(n) {
@@ -486,10 +730,12 @@ watch(() => route.query.stage, (v) => {
 })
 
 watch(() => route.query.view, (v) => {
-  const next = ['overview', 'tasks', 'sheets'].includes(v) ? v : 'overview'
+  const next = VIEW_KEYS.includes(v) ? v : 'overview'
   if (next !== view.value) {
     view.value = next
     if (next === 'sheets') loadSheet()
+    if (next === 'leaks') loadLeaks()
+    if (next === 'reviews') loadReviews()
   }
 })
 
@@ -502,6 +748,9 @@ onMounted(() => {
   loadTasks()
   search()
   if (view.value === 'sheets') loadSheet()
+  if (view.value === 'leaks') loadLeaks()
+  if (view.value === 'reviews') loadReviews()
+  resumeProbe()
 })
 </script>
 
@@ -509,6 +758,10 @@ onMounted(() => {
   <div class="stack">
     <PageHead title="资产台账" desc="全库检索：域名、站点、IP、服务、工商主体统一入库，按分表 / 任务 / 资产面拆开看">
       <template #actions>
+        <button class="btn sm" :disabled="probing" @click="probeAll">
+          <Icon name="bolt" :size="13" />{{ probing ? '探活中…' : '批量探活' }}
+        </button>
+        <span v-if="probeMsg" class="probe-hint">{{ probeMsg }}</span>
         <button class="btn sm" :disabled="repairing" @click="repairAlive">
           <Icon name="bolt" :size="13" />{{ repairing ? '补全中…' : '补全存活状态' }}
         </button>
@@ -535,6 +788,16 @@ onMounted(() => {
             <select v-model="filters.order" class="select" style="width: 120px" @change="search()">
               <option v-for="o in ORDERS" :key="o.v" :value="o.v">{{ o.label }}</option>
             </select>
+            <select v-model="filters.alive" class="select" style="width: 116px" @change="search()">
+              <option value="">存活不限</option>
+              <option v-for="p in probeFilters" :key="p.key" :value="p.key">{{ p.label }}</option>
+            </select>
+            <select v-model="filters.source_type" class="select" style="width: 132px" @change="search()">
+              <option value="">来源不限</option>
+              <option v-for="f in facets.source_type" :key="f.value" :value="f.value">
+                {{ facets.source_labels[f.value] || f.value }}（{{ f.count }}）
+              </option>
+            </select>
             <button class="btn primary sm" @click="search()"><Icon name="search" :size="13" />检索</button>
             <button class="btn sm" :class="{ primary: filters.is_new }"
                     @click="filters.is_new = !filters.is_new; search()">
@@ -547,13 +810,31 @@ onMounted(() => {
             <span class="muted" style="font-size: 11.5px">{{ taskRows.length }} 个任务有资产</span>
           </div>
 
-          <div v-else class="row">
+          <div v-else-if="view === 'sheets'" class="row">
             <input v-model="filters.keyword" class="input" style="width: 240px"
                    placeholder="在当前表里找：名称 / 备案号 / 法人" @keyup.enter="loadSheet()" />
             <select v-model="filters.order" class="select" style="width: 120px" @change="loadSheet()">
               <option v-for="o in ORDERS" :key="o.v" :value="o.v">{{ o.label }}</option>
             </select>
             <button class="btn primary sm" @click="loadSheet()"><Icon name="search" :size="13" />表内检索</button>
+          </div>
+
+          <div v-else-if="view === 'leaks'" class="row">
+            <input v-model="filters.keyword" class="input" style="width: 240px"
+                   placeholder="找线索：IP / 接口路径 / 邮箱 / 账号" @keyup.enter="loadLeaks()" />
+            <select v-model="filters.alive" class="select" style="width: 116px" @change="loadLeaks()">
+              <option value="">存活不限</option>
+              <option v-for="p in probeFilters" :key="p.key" :value="p.key">{{ p.label }}</option>
+            </select>
+            <button class="btn primary sm" @click="loadLeaks()"><Icon name="search" :size="13" />检索线索</button>
+            <button class="btn sm" :class="{ primary: filters.is_new }"
+                    @click="filters.is_new = !filters.is_new; loadLeaks()">
+              <Icon name="flow" :size="13" />只看新增
+            </button>
+          </div>
+
+          <div v-else class="row">
+            <span class="muted" style="font-size: 11.5px">这趟任务并线 / 拦下的每个根域都在下面，按结论筛</span>
           </div>
         </div>
 
@@ -568,7 +849,7 @@ onMounted(() => {
           </button>
         </div>
 
-        <div v-if="filters.task_id || filters.risk || filters.root_domain || filters.stage || filters.kind" class="scope-row">
+        <div v-if="filters.task_id || filters.risk || filters.root_domain || filters.stage || filters.kind || filters.source_type || filters.alive" class="scope-row">
           <span v-if="filters.task_id" class="chip on" :title="filters.task_id">
             任务 {{ taskName || filters.task_id }}
             <button class="chip-x" @click="clearTask">×</button>
@@ -580,6 +861,14 @@ onMounted(() => {
           <span v-if="filters.stage" class="chip on">
             阶段 <span class="mono">{{ STAGE_LABEL[filters.stage] || filters.stage }}</span>
             <button class="chip-x" @click="clearStage">×</button>
+          </span>
+          <span v-if="filters.source_type" class="chip on">
+            来源 <span class="mono">{{ facets.source_labels[filters.source_type] || filters.source_type }}</span>
+            <button class="chip-x" @click="pick('source_type', filters.source_type)">×</button>
+          </span>
+          <span v-if="filters.alive" class="chip on">
+            存活 <span class="mono">{{ facets.probe_labels[filters.alive] || filters.alive }}</span>
+            <button class="chip-x" @click="filters.alive = ''; search()">×</button>
           </span>
           <span v-if="filters.root_domain" class="chip on">
             根域 <span class="mono">{{ filters.root_domain }}</span>
@@ -663,7 +952,160 @@ onMounted(() => {
           </div>
         </div>
         <AssetTable :items="sheetItems" :sheet-kinds="sheetKinds" :kind-label="kindLabel" :loading="sheetLoading"
+                    :source-labels="facets.source_labels"
                     :empty-text="`${activeSheet?.label || '这张表'}还没有数据`" @detail="openDetail" />
+      </div>
+    </div>
+
+    <!-- 归属审核：规则 + AI 两层的判定都列出来，回查某个域名为什么没并进目标池 -->
+    <div v-else-if="view === 'reviews'" class="stack">
+      <div class="panel">
+        <div class="panel-head">
+          <span>
+            <Icon name="filter" :size="13" />归属审核
+            <span class="muted" style="font-size: 11px">· 规则先判，规则说不清的交给 AI 复核</span>
+          </span>
+          <div class="flex gap-8">
+            <input v-model="reviewFilter.keyword" class="input" style="width: 190px"
+                   placeholder="根域 / 判定依据" @keyup.enter="loadReviews()" />
+            <button class="btn primary sm" @click="loadReviews()"><Icon name="search" :size="12" />检索</button>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="surface-row" style="margin-top: 0">
+            <button class="surface" :class="{ on: !reviewFilter.verdict }"
+                    @click="reviewFilter.verdict = ''; loadReviews()">
+              <span class="surface-name">全部</span>
+              <span class="surface-num mono">{{ (reviewSummary.total || 0).toLocaleString() }}</span>
+            </button>
+            <button v-for="v in REVIEW_VERDICTS" :key="v" class="surface"
+                    :class="{ on: reviewFilter.verdict === v }"
+                    @click="reviewFilter.verdict = v; loadReviews()">
+              <span class="surface-name">{{ reviewLabels[v] || v }}</span>
+              <span class="surface-num mono">{{ (reviewSummary[v] || 0).toLocaleString() }}</span>
+            </button>
+            <span class="muted" style="font-size: 11px; margin-left: auto">
+              人工改判只影响下次同名根域的判定，已入库资产不动
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <span>
+            <Icon name="layers" :size="13" /><span class="mono">{{ reviews.length.toLocaleString() }}</span> 条审核记录
+            <span v-if="filters.task_id" class="muted" style="font-size: 11px">· 任务 {{ taskName || filters.task_id }}</span>
+          </span>
+          <span class="mono muted" style="font-size: 10.5px">{{ reviewLoading ? '加载中…' : '' }}</span>
+        </div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th style="width: 112px">时间</th>
+                <th style="width: 88px">阶段</th>
+                <th style="width: 84px">来源</th>
+                <th>主体 / 根域</th>
+                <th style="width: 62px">门槛</th>
+                <th style="width: 68px">结论</th>
+                <th style="width: 62px">判定层</th>
+                <th>依据</th>
+                <th style="width: 168px">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="r in reviews" :key="r.id">
+                <td class="mono muted" style="font-size: 10.5px">{{ fmtTime(r.created_at) }}</td>
+                <td class="muted" style="font-size: 11px">{{ STAGE_LABEL[r.stage] || r.stage || '-' }}</td>
+                <td>
+                  <span v-if="r.source_type" class="tag src" :title="r.source_url || ''">
+                    {{ reviewSources[r.source_type] || r.source_type }}
+                  </span>
+                  <span v-else class="muted">-</span>
+                </td>
+                <td class="mono ellipsis" style="max-width: 260px" :title="`${r.subject}${r.target ? ' · 任务目标 ' + r.target : ''}`">
+                  {{ r.subject }}
+                </td>
+                <td class="mono muted">{{ r.ratio ? `${r.ratio}%` : '-' }}</td>
+                <td>
+                  <span class="tag" :class="{ ok: r.verdict === 'allow', warn: r.verdict === 'review', err: r.verdict === 'deny' }">
+                    {{ reviewLabels[r.verdict] || r.verdict }}
+                  </span>
+                </td>
+                <td class="muted" style="font-size: 11px">
+                  {{ r.engine === 'ai' ? 'AI' : r.engine === 'manual' ? '人工' : '规则' }}
+                </td>
+                <td class="muted" style="font-size: 11px">{{ r.reason || '-' }}</td>
+                <td>
+                  <div class="flex gap-8">
+                    <button class="btn xs" :class="{ primary: r.verdict !== 'allow' }"
+                            @click="markVerdict(r, 'allow')">放行</button>
+                    <button class="btn xs" :class="{ primary: r.verdict !== 'deny' }"
+                            @click="markVerdict(r, 'deny')">拒绝</button>
+                    <button class="btn xs" @click="reviewAssets(r)">看资产</button>
+                  </div>
+                </td>
+              </tr>
+              <tr v-if="!reviews.length">
+                <td colspan="9" class="muted" style="text-align: center; padding: 26px">
+                  {{ reviewLoading ? '加载中…' : '还没有审核记录：跑一趟任务后，每个要并进目标池的根域都会在这里留一条' }}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- 泄露线索：小程序包 / APP / JS / 爬虫里扫出来的裸 IP、接口、账号。
+         这些不是能直接打开的 Web 资产（Web 资产是一条完整可请求的 http(s) 地址），
+         所以单列一页，每条都记着从哪来，按来源分开摆，方便核对和跟踪。 -->
+    <div v-else-if="view === 'leaks'" class="stack">
+      <div class="panel">
+        <div class="panel-body">
+          <div class="leak-note">
+            <Icon name="bolt" :size="13" />
+            <span>
+              这里放的是<strong>扫出来的线索</strong>：裸 IP、接口路径、邮箱、账号口令提示。它们本身打不开，
+              要配上协议和端口才算一条 Web 资产，因此不跟域名、站点混算。每条的来源列写着从哪个链接、
+              哪个小程序、哪个 APP 包扫到的，点下面的来源卡片可以只留这一类。
+            </span>
+          </div>
+          <div class="surface-row" style="margin-top: 10px">
+            <button class="surface" :class="{ on: !filters.source_type }" @click="pickLeakSource('')">
+              <span class="surface-name">全部来源</span>
+              <span class="surface-num mono">{{ leakTotalAll.toLocaleString() }}</span>
+            </button>
+            <button v-for="s in leakSources" :key="s.value" class="surface"
+                    :class="{ on: filters.source_type === s.value }" @click="pickLeakSource(s.value)">
+              <span class="surface-name">{{ leakSourceLabels[s.value] || s.value }}</span>
+              <span class="surface-num mono">{{ (s.count || 0).toLocaleString() }}</span>
+            </button>
+            <span v-if="!leakSources.length" class="muted" style="font-size: 11px">还没有线索入库</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <span>
+            <Icon name="layers" :size="13" /><span class="mono">{{ leakTotal.toLocaleString() }}</span> 条线索
+            <span v-if="filters.source_type" class="muted" style="font-size: 11px">
+              · 来源 {{ leakSourceLabels[filters.source_type] || filters.source_type }}
+            </span>
+            <span v-if="filters.task_id" class="muted" style="font-size: 11px">· 任务 {{ taskName || filters.task_id }}</span>
+          </span>
+          <div class="flex gap-8">
+            <span class="mono muted" style="font-size: 10.5px">{{ leakPage }} / {{ leakPages }}</span>
+            <button class="btn xs" :disabled="leakPage <= 1" @click="goLeakPage(leakPage - 1)">上一页</button>
+            <button class="btn xs" :disabled="leakPage >= leakPages" @click="goLeakPage(leakPage + 1)">下一页</button>
+          </div>
+        </div>
+        <AssetTable :items="leaks" :kind-label="kindLabel" :loading="leakLoading"
+                    :source-labels="leakSourceLabels"
+                    empty-text="还没有扫到线索：跑一趟任务后，小程序包 / APP / JS 里的裸 IP 和接口会落到这里"
+                    @detail="openDetail" />
       </div>
     </div>
 
@@ -677,6 +1119,16 @@ onMounted(() => {
           </button>
           <button v-for="b in riskBuckets.filter((x) => x.key !== 'leak')" :key="b.key" class="facet" :class="{ on: filters.risk === b.key }" @click="pickRisk(b.key)">
             <span class="ellipsis">{{ b.label }}</span><span class="mono muted">{{ b.count }}</span>
+          </button>
+
+          <div class="facet-title">来源</div>
+          <button v-for="f in facets.source_type" :key="f.value" class="facet" :class="{ on: filters.source_type === f.value }" @click="pick('source_type', f.value)">
+            <span class="ellipsis">{{ facets.source_labels[f.value] || f.value }}</span><span class="mono muted">{{ f.count }}</span>
+          </button>
+
+          <div class="facet-title">存活</div>
+          <button v-for="p in probeFilters" :key="p.key" class="facet" :class="{ on: filters.alive === p.key }" @click="pick('alive', p.key)">
+            <span class="ellipsis">{{ p.label }}</span><span class="mono muted">{{ p.count }}</span>
           </button>
 
           <div class="facet-title">类型</div>
@@ -715,7 +1167,8 @@ onMounted(() => {
             <button class="btn xs" :disabled="page >= pages" @click="goPage(page + 1)">下一页</button>
           </div>
         </div>
-        <AssetTable :items="items" :kind-label="kindLabel" :loading="loading" @detail="openDetail" />
+        <AssetTable :items="items" :kind-label="kindLabel" :loading="loading"
+                    :source-labels="facets.source_labels" @detail="openDetail" />
       </div>
     </div>
 
@@ -779,7 +1232,17 @@ onMounted(() => {
 .surface.on .surface-num { color: var(--cyan-ink); }
 
 .scope-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-.chip-x {
+
+/* 泄露线索页顶部的口径说明 */
+.leak-note {
+  display: flex; align-items: flex-start; gap: 8px;
+  padding: 9px 11px; border-radius: 8px;
+  border: 1px solid var(--line);
+  background: rgba(120, 200, 220, 0.05);
+  font-size: 11.5px; line-height: 1.6; color: var(--text-2);
+}
+.leak-note strong { color: var(--text); font-weight: 600; }
+.leak-note svg { flex: 0 0 auto; margin-top: 2px; color: var(--cyan); }.chip-x {
   margin-left: 4px; border: 0; background: transparent; cursor: pointer;
   color: inherit; font-size: 12px; line-height: 1; padding: 0 2px;
 }
@@ -836,5 +1299,10 @@ onMounted(() => {
 .st-flag {
   padding: 0 4px; border-radius: 4px; font-size: 9.5px; line-height: 14px;
   border: 1px solid rgba(52, 229, 200, 0.35); color: var(--cyan);
+}
+/* 批量探活的进度提示：跟着按钮走，不占版面 */
+.probe-hint {
+  align-self: center; max-width: 260px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-size: 11px; color: var(--cyan);
 }
 </style>

@@ -104,6 +104,48 @@ def is_ip(text: str) -> bool:
         return False
 
 
+def ip_host(text: str) -> str:
+    """从 ``host`` / ``host:port`` / ``[v6]:port`` / URL 里取出裸 IP；不是 IP 就返回空串。
+
+    采集源经常把 ``122.22.22.22:8080`` 整串塞进域名字段，直接 ``is_ip`` 会判否，
+    于是这种地址被当成域名去 ``claim_root``。判归属前先归一化到裸地址。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    if "://" in raw:
+        raw = host_of(raw)
+    raw = raw.strip().strip("/")
+    if raw.startswith("[") and "]" in raw:
+        raw = raw[1:raw.index("]")]
+    elif raw.count(":") == 1:
+        head, _, tail = raw.partition(":")
+        if tail.isdigit():
+            raw = head
+    raw = raw.strip(".")
+    return raw if is_ip(raw) else ""
+
+
+def package_origin(url: str) -> tuple[str, str]:
+    """包分析线索的 url → ``(来源类型, 出处串)``；不是包线索就返回空。
+
+    小程序 / APP 包里看到的接口、路径、IP 都用 ``applet:<appid>:…``、
+    ``mobile:<平台>:<包名>`` 这类前缀入库，前缀本身就是出处。资产表的「来源」
+    列据此显示「小程序 · wx06a5…」，方便按包回查是哪一份包里的线索。
+    """
+    raw = (url or "").strip()
+    parts = raw.split(":")
+    if raw.startswith("applet:") and len(parts) >= 2:
+        return "applet", f"applet:{parts[1]}"
+    if raw.startswith("mobile:"):
+        if len(parts) >= 3:
+            return "mobile", ":".join(parts[:3])
+        return "mobile", ""
+    if raw.startswith("mp:") and len(parts) >= 2:
+        return "applet", f"mp:{parts[1]}"
+    return "", ""
+
+
 def is_public_ip(text: str) -> bool:
     """地址是否值得当资产去探。
 

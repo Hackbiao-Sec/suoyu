@@ -37,8 +37,9 @@ from collections import Counter
 
 from ..config import config
 from ..db import normalize_asset, store
-from ..utils import host_of, idn_ascii, is_ip, is_valid_domain, root_domain
-from .collectors import ownership
+from ..utils import (host_of, idn_ascii, ip_host, is_ip, is_valid_domain,
+                     package_origin, root_domain)
+from .collectors import ownership, review
 
 # 后台阶段（目前是股权穿透）资产归属用的阶段键。contextvar 是按协程任务各存一份的，
 # 后台股权边穿边落资产时前台正在跑被动收集，用 self.current_phase 会把两边记成同一个阶段。
@@ -138,7 +139,7 @@ STAGE_INPUT = {
 
 STAGE_HINT = {
     "enterprise": "按根域查工商主体、ICP 备案、邮件 DNS，产出企业实体与同主体域名",
-    "equity": "按企业名查股权穿透，只把累计 100% 控股的主体并进目标池",
+    "equity": "按企业名查股权穿透，累计持股达到门槛（默认 100%）的主体并进目标池",
     "mobile": "按企业名/品牌查应用商店与小程序，产出 APP、小程序资产",
     "passive": "按根域跑被动子域与搜索源，源开关在数据源里配",
     "space": "按根域跑空间测绘引擎检索，产出带端口与标题的资产",
@@ -256,6 +257,15 @@ class TaskRunner(StagesMixin):
         # 同一个主体就直接复用，不再跑第二遍。以前 300 秒的两次超时就是同一主体
         # 先后被前置展开和 P0 各掐一次，域名一个都没落地。
         self.expand_entities: dict[str, dict] = {}
+        # 归属审核器：懒建，缓存每个根域的结论，AI 复核也只问一次
+        self._reviewer: review.Reviewer | None = None
+        # 已经打过「没并线」日志的根域，避免同一条在每轮扩线里刷屏
+        self._review_logged: set[str] = set()
+        # IP 的来源：DNS 落点 / 空间测绘 / 小程序包字面量。P6 拿 IP 直连探活时要把
+        # 出处写进站点资产，资产表才能回答「这台机器是从哪看到的」
+        self.ip_origin: dict[str, str] = {}
+        # 小程序 / App 包里带出的域 → 出处（applet:<appid>），并线时一并落库
+        self._mobile_src: dict[str, str] = {}
 
     # ───────── 基础能力 ─────────
     def _entity_timeout(self) -> float:
@@ -405,6 +415,16 @@ class TaskRunner(StagesMixin):
         finally:
             self._stage_exit(key)
 
+    # 阶段 → 资产来源。入库时资产没自带 source_type 就按当前阶段补上，
+    # 前端「来源」列才能把每条资产归到采集环节（而不是一律空着）。
+    PHASE_SOURCE = {
+        "target_parse": "target", "enterprise": "enterprise", "equity": "equity",
+        "mobile": "mobile", "passive": "passive", "space": "space", "brute": "brute",
+        "dns": "dns", "port": "port", "web": "web", "crawl": "crawl", "leak": "leak",
+        "vhost": "vhost", "takeover": "takeover", "sibling": "sibling", "deep": "deep",
+        "assetdiff": "assetdiff", "report": "report",
+    }
+
     def save_asset(self, item: dict, count: bool = True) -> None:
         """写一条资产并挂到本任务。
 
@@ -412,6 +432,32 @@ class TaskRunner(StagesMixin):
         同一批节点每报一次就加一遍统计，任务页的资产数会越跑越虚。
         """
         try:
+            item = dict(item)
+            # 「了解详情」「тест」这类页面文字会被抓成域名，落地前挡掉：
+            # 域名资产必须是能解析的名字，否则台账里会混进一堆不是域名的东西
+            if str(item.get("kind") or "") in ("domain", "subdomain"):
+                probe = str(item.get("host") or item.get("url") or "")
+                if probe.startswith("domain:"):
+                    probe = probe.split(":", 1)[1]
+                probe = probe.split("/", 1)[0].split("?", 1)[0].strip().strip(".").lower()
+                if probe and ":" in probe and probe.rsplit(":", 1)[1].isdigit():
+                    probe = probe.rsplit(":", 1)[0]
+                if not probe or not (is_valid_domain(probe) or is_ip(probe)):
+                    self.log("store", f"丢弃非域名资产：{item.get('url')}", "warn")
+                    return
+            src = self._item_origin(item)
+            # 小程序 / APP 包里的线索：url 前缀写着 AppID 或包名，出处就以它为准
+            pack_type, pack_origin = package_origin(str(item.get("url") or ""))
+            if not item.get("source_url"):
+                item["source_url"] = src or pack_origin
+            if not item.get("source_type"):
+                head = src.split(":", 1)[0].strip().lower() if ":" in src else ""
+                phase = ASSET_PHASE.get() or self.current_phase
+                fallback = self.PHASE_SOURCE.get(str(phase or ""), "")
+                if head in review.SOURCE_LABEL:
+                    item["source_type"] = head
+                else:
+                    item["source_type"] = pack_type or fallback
             aid = store.upsert_asset(item)
             store.link_task_asset(self.task_id, aid, ASSET_PHASE.get() or self.current_phase)
             kind = item.get("kind", "asset")
@@ -428,6 +474,45 @@ class TaskRunner(StagesMixin):
         except Exception as e:
             self.log("store", f"入库失败 {item.get('url')}: {e}", "error")
 
+    def note_ip(self, ip: str, origin: str) -> None:
+        """记一条 IP 的出处；同一 IP 最多留三条，避免共享 CDN 边缘地址刷屏。"""
+        ip = str(ip or "").strip()
+        if not ip or not origin:
+            return
+        parts = self.ip_origin.get(ip, "").split(" | ") if self.ip_origin.get(ip) else []
+        if origin in parts:
+            return
+        if not parts:
+            self.ip_origin[ip] = origin
+            return
+        if len(parts) < 3:
+            parts.append(origin)
+            self.ip_origin[ip] = " | ".join(parts)
+
+    def ip_source(self, ip: str) -> tuple[str, str]:
+        """IP 出处 → ``(来源类型, 出处串)``；没记录就返回空。"""
+        raw = self.ip_origin.get(str(ip or "").strip(), "")
+        if not raw:
+            return "", ""
+        head = raw.split(" | ", 1)[0]
+        return (head.split(":", 1)[0] or "ip"), raw
+
+    def _item_origin(self, item: dict) -> str:
+        """从资产自身字段推断出处：IP 直连看解析/测绘记录，小程序包看 AppID。"""
+        kind = str(item.get("kind") or "")
+        host = str(item.get("host") or "")
+        extra = item.get("extra") or {}
+        if kind in ("ip", "service", "port"):
+            return self.ip_source(str(item.get("ip") or host))[1]
+        if kind == "site" and ip_host(host):
+            return self.ip_source(host)[1]
+        if kind == "applet":
+            return str(item.get("url") or "")
+        appid = str(extra.get("appid") or "").strip()
+        if appid:
+            return f"applet:{appid}"
+        return ""
+
     def reset_new_marks(self) -> None:
         """同一任务重跑时先清掉上一轮的新增标记，避免旧标记留到本轮"""
         try:
@@ -438,20 +523,115 @@ class TaskRunner(StagesMixin):
     def _root(self, target: str) -> str:
         return root_domain(target) or target
 
-    def claim_root(self, domain: str, owner: str = "") -> bool:
+    def claim_root(self, domain: str, owner: str = "", *, source_type: str = "",
+                   source_url: str = "") -> bool:
         """把一个根域登记成自家资产。只认有来源的根：域名目标、实体扩线、股权子公司、
         小程序包、被动源里挂在本目标下的子域。解析出来的裸 IP、IP 反查顺带捞到的
-        别的站，不许走这里。"""
-        if not domain or is_ip(domain):
+        别的站，不许走这里。
+
+        并线前统一过归属审核：明确是别人的（高德 / GitHub / 公共 CDN 这类）直接拒，
+        说不清来路的先记「待审」不并线，交给 AI 或人工确认。
+        """
+        raw = str(domain or "").strip()
+        if not raw or ip_host(raw):
             return False
-        r = self._root(domain)
-        if not r or is_ip(r):
+        if raw.count(":") == 1 and raw.rsplit(":", 1)[1].isdigit():
+            raw = raw.rsplit(":", 1)[0]
+        r = self._root(raw)
+        if not r or ip_host(r):
             return False
         r = r.lower()
+        rec = self.reviewer.assess(r, source_type=source_type, source_url=source_url,
+                                   stage=ASSET_PHASE.get() or self.current_phase)
+        if rec.get("verdict") != "allow":
+            self._note_review(r, rec, source_type)
+            return False
+        return self._claim_root_raw(r, owner)
+
+    def _claim_root_raw(self, root: str, owner: str = "") -> bool:
+        """真正登记根域，不再判归属；只给已经过闸的调用方用。"""
+        r = (root or "").strip().lower().strip(".")
+        if not r or is_ip(r):
+            return False
         self.own_roots.add(r)
         if owner and not self.root_owner.get(r):
             self.root_owner[r] = owner
         return True
+
+    def _note_review(self, root: str, rec: dict, source_type: str = "") -> None:
+        """把「这条为什么没并线」写进任务日志，同一根域只说一次。"""
+        if root in self._review_logged:
+            return
+        self._review_logged.add(root)
+        verdict = str(rec.get("verdict") or "review")
+        label = "待审" if verdict == "review" else "拒绝"
+        src = review.source_label(source_type) if source_type else "未知来源"
+        self.log("review", f"{label}并线：{root}（{src}）— {rec.get('reason') or ''}",
+                 "warn" if verdict == "review" else "info")
+
+    @property
+    def reviewer(self) -> review.Reviewer:
+        """归属审核器：一个任务一个，目标池与主体名随任务推进刷新。"""
+        if self._reviewer is None:
+            self._reviewer = review.Reviewer(
+                self.task_id, self._review_target(),
+                own_roots=self._own_roots(), targets=self.targets,
+                subject_keys=self._review_subject_keys(),
+                ratio=self.opt_equity_ratio(), enabled=bool(self.opt("ai_review", True)),
+                log=self.log,
+            )
+        else:
+            self._reviewer.sync(own_roots=self._own_roots(), targets=self.targets,
+                                subject_keys=self._review_subject_keys())
+        return self._reviewer
+
+    def _review_target(self) -> str:
+        """给 AI 的「我要收集谁」：优先企业主体名，其次目标域名。"""
+        names = [t for t in self.targets if t and not is_ip(t) and not is_valid_domain(t)]
+        if names:
+            return "、".join(names[:3])
+        return "、".join(str(t) for t in self.targets[:3])
+
+    def _review_subject_keys(self) -> set[str]:
+        """企业主体名在站点上可能出现的写法，用来判「域名像不像这家」。"""
+        keys: set[str] = set()
+        for name in self.targets:
+            if not name or is_ip(name) or is_valid_domain(name):
+                continue
+            try:
+                keys |= self._subject_keys(name)
+            except Exception:
+                continue
+        for ent in self.entities or []:
+            name = str(ent.get("name") or "").strip()
+            if not name:
+                continue
+            try:
+                keys |= self._subject_keys(name)
+            except Exception:
+                continue
+        return keys
+
+    async def review_roots(self, items: list[dict], *, stage: str = "") -> list[str]:
+        """并线前的归属审核（规则 + AI 复核），返回放行的根域。
+
+        ``items`` 每项 ``{subject, source_type, source_url, owner}``。放行的登记进
+        目标池；待审 / 拒绝的只落审核记录与日志，不并线。
+        """
+        got = await self.reviewer.review(items, stage=stage)
+        allowed: list[str] = []
+        for key, rec in got.items():
+            if rec.get("verdict") != "allow":
+                continue
+            owner = ""
+            for it in items:
+                if str(it.get("subject") or "").strip().lower() == key:
+                    owner = str(it.get("owner") or "")
+                    break
+            if self._claim_root_raw(key, owner):
+                allowed.append(key)
+            self._review_logged.discard(key)
+        return allowed
 
     def _own_roots(self) -> set[str]:
         """本任务已认定的自家根域。判第三方时放行，免得自家根被误砍。
@@ -469,17 +649,76 @@ class TaskRunner(StagesMixin):
         return ownership.in_scope(host, self._own_roots())
 
     def keep_domain(self, host: str) -> bool:
-        """域名兜底闸：文件名误判、平台/CDN、搜索引擎自身一律不进自家资产表。"""
+        """域名兜底闸：文件名误判、平台/CDN、搜索引擎自身一律不进自家资产表。
+
+        ``ip_host`` 覆盖 ``122.22.22.22:8080`` 这种把端口塞进域名字段的写法。
+        """
         if not host:
             return False
-        if is_ip(host):
+        if ip_host(host):
             return True
+        cleaned = host.split("/", 1)[0].split("?", 1)[0].strip().strip(".").lower()
+        if not is_valid_domain(cleaned):
+            # 页面文字 / 关键词被当成域名时在这里挡掉，别让它进域名池再落库
+            return False
         return not ownership.is_non_domain(host) and not ownership.is_foreign(host, self._own_roots())
 
     def opt(self, key: str, default=None):
         if key in self.options and self.options[key] is not None:
             return self.options[key]
         return config.get("scan", key, default=default)
+
+    # 任务运行期间的持续探活：每个阶段收进来的新资产都会补上存活结论，
+    # 报告和资产页不会出现一整片「未探测」。批次小、并发低，避免和采集抢带宽。
+    PROBE_BATCH = 150
+    PROBE_CONC = 24
+
+    async def _probe_loop(self) -> None:
+        from .http_engine import probe
+
+        if not self.opt("stage_probe", True):
+            return
+        sem = asyncio.Semaphore(self.PROBE_CONC)
+        probed = 0
+
+        async def one(t: dict) -> list[dict]:
+            url = str(t["url"])
+            tries = [url]
+            if url.startswith("http://"):
+                tries.insert(0, "https://" + url[len("http://"):])
+            code = 0
+            async with sem:
+                for u in tries:
+                    try:
+                        info = await probe(u, want_body=False, want_cert=False, timeout=8)
+                    except Exception:
+                        info = None
+                    code = int(getattr(info, "status", 0) or 0)
+                    if code:
+                        break
+            return [{"id": aid, "status": code} for aid in t["ids"]]
+
+        try:
+            while not self.stop_event.is_set():
+                targets = await asyncio.to_thread(
+                    store.liveness_targets, self.task_id, self.PROBE_BATCH)
+                if not targets:
+                    await asyncio.sleep(8)
+                    continue
+                parts = await asyncio.gather(*(one(t) for t in targets),
+                                             return_exceptions=True)
+                marks = [m for p in parts if isinstance(p, list) for m in p]
+                if marks:
+                    await asyncio.to_thread(store.apply_probe, marks)
+                    probed += len(marks)
+                    self.stats["probed"] = probed
+                    if probed % 1000 < len(marks):
+                        self.log("probe", f"阶段探活：累计 {probed} 条资产已拿到存活结论")
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # 探活坏了不能带走任务
+            self.log("probe", f"阶段探活异常：{type(e).__name__}: {e}", "warn")
 
     def opt_scan_local_mini(self):
         """扫本机微信小程序缓存：开关 + 上限，认配置里的 mobile 段。"""
@@ -887,6 +1126,8 @@ class TaskRunner(StagesMixin):
             pick = "全流程"
         self.log("task", f"任务开始：{brief}{more} · {pick}")
         self.reset_new_marks()
+        # 探活跟着任务一直跑：不等到最后才补，哪个阶段收进来的资产都当场有结论
+        probe_task: asyncio.Task | None = asyncio.create_task(self._probe_loop())
         try:
             await asyncio.wait_for(self.dns.start(), 30)
         except asyncio.TimeoutError:
@@ -934,6 +1175,12 @@ class TaskRunner(StagesMixin):
             self.log("task", f"任务异常: {e}\n{traceback.format_exc()}", "error")
             store.update_task(self.task_id, status="error", message=f"任务异常: {e}")
         finally:
+            if probe_task is not None:
+                probe_task.cancel()
+                try:
+                    await asyncio.wait({probe_task}, timeout=5)
+                except Exception:
+                    pass
             self.dns.close()
             try:
                 from ..db import audit

@@ -698,6 +698,18 @@ def _secret_reject(name: str, val: str) -> bool:
         if any(tok in low for tok in ("login", "logout", "password", "passwd", "signin",
                                       "register", "user/", "api/", "admin/")):
             return True
+        # 样式声明 / CSS 选择器 / MIME 串 / 网址被当成「账号:密码」是压缩包里的常见噪声
+        if val.endswith(";") or "{" in val or "}" in val:
+            return True
+        if low.startswith(("http://", "https://", "application/", "text/",
+                           "multipart/", "image/", "font/", "video/")):
+            return True
+        if ":" not in val:
+            return True
+        right = val.split(":", 1)[1].strip()
+        if re.fullmatch(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+                        r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", right):
+            return True
         left = val.split(":", 1)[0].split("/", 1)[0]
         if left.lower() in _JS_SECRET_NOISE or len(left) < 3:
             return True
@@ -708,10 +720,19 @@ def _secret_reject(name: str, val: str) -> bool:
         # 全同字符、递增/递减串是占位或填充，不是密钥
         if len(set(val)) <= 4:
             return True
+        # 字母表 / 数字表这类示例串（`0123…xyz`、`abcdefghijk…`）不是密钥
+        flat = low.replace("_", "").replace("-", "")
+        if "abcdefghijklmnopqrstuvwxyz" in flat or "0123456789" in flat:
+            return True
         return False
     if name == "手机号":
         return bool(re.search(r"0{5,}|(\d)\1{6,}", val))
     return False
+
+
+def fake_secret(name: str, val: str) -> bool:
+    """这条「敏感信息」是不是误报；入库和历史清理共用同一套判定。"""
+    return _secret_reject(str(name or ""), str(val or ""))
 
 
 def js_secrets(text: str, limit: int = 600) -> list[dict]:

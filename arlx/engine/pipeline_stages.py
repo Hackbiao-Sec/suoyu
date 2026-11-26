@@ -15,8 +15,8 @@ from urllib.parse import urlparse
 
 from ..config import DATA_DIR, config, llm_engine
 from ..db import store
-from ..utils import (CdnDetector, host_of, is_ip, is_ip_network, is_public_ip, is_valid_domain,
-                     normalize_url, port_of, root_domain, same_site)
+from ..utils import (CdnDetector, host_of, ip_host, is_ip, is_ip_network, is_public_ip,
+                     is_valid_domain, normalize_url, port_of, root_domain, same_site)
 from .collectors import active, deep, enterprise, mobile
 from .collectors import apkstatic
 from .collectors import asnmap
@@ -499,7 +499,7 @@ class StagesMixin:
         # 目标归一结果入库。域名目标本身就代表这家单位的资产，直接认作自家根。
         for d in domains:
             self.domains.add(d)
-            self.claim_root(d, "目标域名")
+            self.claim_root(d, "目标域名", source_type="domain_target")
         for ip in ips:
             self.domains.add(ip)
         self.stats["targets"] = len(domains) + len(ips) + len(cidrs)
@@ -605,7 +605,7 @@ class StagesMixin:
             for dom in ent.get("domains") or []:
                 if dom not in self.domains and same_site(dom, root):
                     self.domains.add(dom)
-                    self.claim_root(dom, ent.get("name") or root)
+                    self.claim_root(dom, ent.get("name") or root, source_type="enterprise")
             if ent.get("domains_pending"):
                 pend = ent["domains_pending"]
                 self.log("enterprise", f"{root} 另有 {len(pend)} 个待核验域没进扫描："
@@ -716,10 +716,11 @@ class StagesMixin:
 
     # ───────── P1b 小程序 / App ─────────
     async def p1c_equity(self, parsed: dict) -> None:
-        """股权穿透：把「全资控股闸」算成数据，只把累计持股 100% 的主体并进目标池。
+        """股权穿透：把「累计持股门槛」算成数据，达到门槛的主体并进目标池。
 
-        这是 P0/P1 的补线：企业名扩域只拿到一个主体，全资子公司（孙公司、曾孙公司）
-        各有自己的域，不并进来就是整片漏挖。参股/联营默认不进池，只记进实体 extra
+        门槛默认 100%（只收全资），也可以在任务里调低（如 51 收控股）。
+        这是 P0/P1 的补线：企业名扩域只拿到一个主体，子公司（孙公司、曾孙公司）
+        各有自己的域，不并进来就是整片漏挖。没达门槛的默认不进池，只记进实体 extra
         供人工复核——写错主体的洞投不进本 SRC。
         """
         if not (self.opt("equity_expand", True) or self.options.get("equity")):
@@ -972,7 +973,7 @@ class StagesMixin:
                 for dom in ent.get("domains") or []:
                     if dom and dom not in self.domains and self.keep_domain(dom):
                         self.domains.add(dom)
-                        self.claim_root(dom, sub)
+                        self.claim_root(dom, sub, source_type="equity")
                         self.log("equity", f"  + {sub} → {dom}")
                 self._save_asset_once({
                     "kind": "enterprise", "url": f"enterprise:{sub}", "host": "",
@@ -1023,9 +1024,10 @@ class StagesMixin:
                                + "（恢复工商源后单阶段重跑股权穿透补上）", "warn")
         done_subs = [s for s in merged_ok]
         if done_subs:
-            self.log("equity", f"全资主体并入 {len(done_subs)} 家：" + "、".join(done_subs[:6]))
+            self.log("equity", f"持股达 {ratio:g}% 的主体并入 {len(done_subs)} 家："
+                               + "、".join(done_subs[:6]))
         else:
-            self.log("equity", "全资主体并线：本轮没有可并入的子公司")
+            self.log("equity", f"持股达 {ratio:g}% 的主体并线：本轮没有可并入的子公司")
 
     async def p1b_mobile(self, parsed: dict) -> None:
         """小程序 / 公众号 / App 三条移动端面：主体名/应用名 → 包名、AppID、公众号、包内域名。
@@ -1396,18 +1398,28 @@ class StagesMixin:
         except Exception as e:
             self.log("mobile", f"本机小程序解析异常：{type(e).__name__}: {str(e)[:80]}", "warn")
 
-        added = 0
+        # 移动端 / 小程序包里带出的域要过归属审核再并线：包里嵌的高德地图、
+        # 微信 JS-SDK 这类第三方域，以前只要不在黑名单就整片认成自家根域。
+        roots: dict[str, list[str]] = {}
         for d in sorted(found):
-            if is_ip(d) or not d:
+            if ip_host(d) or not d or not self.keep_domain(d):
                 continue
-            if not self.keep_domain(d):
+            roots.setdefault(self._root(d), []).append(d)
+        items = []
+        for r, hosts in roots.items():
+            # 每个根域带一条出处：优先取第一个有记录的成员域，方便回查是哪个包
+            src = next((self._mobile_src[h] for h in hosts if self._mobile_src.get(h)), "")
+            items.append({"subject": r, "source_type": "applet", "source_url": src,
+                          "owner": "移动端包 / 应用商店"})
+        allowed = set(await self.review_roots(items, stage="mobile")) if items else set()
+        added = 0
+        for r, hosts in roots.items():
+            if r not in allowed:
                 continue
-            # 移动端带出的域只当「同一主体下的业务域」并线，根域也要认下来，
-            # 否则 P2/P3 的根域闸会把它当外人踢掉
-            self.claim_root(d, "移动端包 / 应用商店")
-            if d not in self.domains:
-                self.domains.add(d)
-                added += 1
+            for d in hosts:
+                if d not in self.domains:
+                    self.domains.add(d)
+                    added += 1
         if added:
             self.log("mobile", f"新增域 {added} 个，并入后续被动收集")
         self.progress("mobile", 100, "小程序 / 公众号 / App 完成")
@@ -1457,12 +1469,26 @@ class StagesMixin:
                         "sources": f"applet-bundle:{appid}",
                         "extra": {"appid": appid, "rule": rid, "value": val},
                     })
+            # 包里写死的公网 IP：是「这台机器在代码里出现过」的线索，不能当 web
+            # 资产。记成泄露线索并带上 AppID，资产表里能看出是从哪个小程序包里看到的。
+            for ipv in (res.get("ips") or [])[:60]:
+                ip_only = ip_host(ipv) or ipv
+                self.note_ip(ip_only, f"applet:{appid}")
+                self.save_asset({
+                    "kind": "leak", "url": f"applet:{appid}:ip:{ipv[:60]}",
+                    "host": appid, "ip": ip_only,
+                    "title": "IP 直连线索（小程序包）",
+                    "sources": f"applet-bundle:{appid}",
+                    "source_type": "applet", "source_url": f"applet:{appid}",
+                    "extra": {"appid": appid, "rule": "ip", "value": ipv},
+                })
             for d in res.get("domains") or []:
                 # 包里的后端域要能挂到已认主体根下（`api.xxx.com` → `xxx.com`），
                 # 或者本身就是本任务目标域名的变体；否则是包里嵌的 SDK / 第三方服务。
                 if d and (any(same_site(d, r) for r in self._own_roots())
                           or any(same_site(d, t) for t in self.targets)):
                     found.add(d)
+                    self._mobile_src[d] = f"applet:{appid}"
                 elif d:
                     self.log("mobile", f"小程序包 {appid} 域 {d} 不属于本目标，不并入扩线")
             self.log("mobile", f"小程序包 {appid} v{res.get('version') or '?'}: "
@@ -1571,6 +1597,7 @@ class StagesMixin:
             self.save_asset({
                 "kind": "applet", "url": f"applet:{aid}", "host": aid, "root_domain": aid,
                 "title": title, "sources": "applet-local",
+                "source_type": "applet", "source_url": f"applet:{aid}",
                 "extra": {"appid": aid, "name": nm, "subject": subj,
                           "gh_ids": app.get("gh_ids") or [],
                           "version": app.get("version") or "",
@@ -1590,6 +1617,7 @@ class StagesMixin:
                 self.save_asset({
                     "kind": "api", "url": url, "host": host_of(url) or "",
                     "title": f"小程序接口 {label}", "sources": f"applet-local:{aid}",
+                    "source_type": "applet", "source_url": f"applet:{aid}",
                     "extra": {"appid": aid, "applet": label},
                 })
             hit_n = 0
@@ -1600,12 +1628,27 @@ class StagesMixin:
                         "kind": "leak", "url": f"applet:{aid}:{rid}:{str(val)[:60]}",
                         "host": aid, "title": f"{names.get(rid, rid)}（小程序包）",
                         "sources": f"applet-local:{aid}",
+                        "source_type": "applet", "source_url": f"applet:{aid}",
                         "extra": {"appid": aid, "rule": rid, "value": val,
                                   "applet": label},
                     })
+            # 本机包里的 IP 字面量同样只当泄露线索，带上 AppID 便于回查
+            for ipv in (app.get("ips") or [])[:200]:
+                ip_only = ip_host(ipv) or ipv
+                self.note_ip(ip_only, f"applet:{aid}")
+                self.save_asset({
+                    "kind": "leak", "url": f"applet:{aid}:ip:{str(ipv)[:60]}",
+                    "host": aid, "ip": ip_only,
+                    "title": f"IP 直连线索（小程序包 {label}）",
+                    "sources": f"applet-local:{aid}",
+                    "source_type": "applet", "source_url": f"applet:{aid}",
+                    "extra": {"appid": aid, "rule": "ip", "value": ipv,
+                              "applet": label},
+                })
             for d in doms:
                 if self.keep_domain(d):
                     new_domains.add(d)
+                    self._mobile_src[d] = f"applet:{aid}"
             done.append(label)
             sums["api"] += len(apis)
             sums["files"] += files
@@ -1712,7 +1755,8 @@ class StagesMixin:
                 for sub in res.subdomains:
                     if sub not in self.domains and self.keep_domain(sub):
                         # 被动源返回的子域都挂在本次查的根下，根已认 → 子域也认
-                        self.claim_root(sub, self.root_owner.get(root) or "被动源")
+                        self.claim_root(sub, self.root_owner.get(root) or "被动源",
+                                        source_type="passive")
                         self.domains.add(sub)
                         # 发现即入库：只并进域名池的话，要等 dns 阶段才落库，
                         # 「域名收集」这一段的产出就永远是 0
@@ -1893,6 +1937,7 @@ class StagesMixin:
                 # 引擎在没查到数据时会把 `0.0.0.0:0` 和防护提示当成一条记录返回
                 return 0
             shared = bool(CdnDetector().detect_by_ip(host))
+            self.note_ip(host, f"space:{engine}")
             self.save_asset({"kind": "service", "url": f"service:{host}:{port}",
                              "ip": host, "port": port, "root_domain": root,
                              "title": title or None, "sources": engine,
@@ -1904,9 +1949,10 @@ class StagesMixin:
         if not self.keep_domain(host):
             return 0
         self.domains.add(host)
-        self.claim_root(host, f"空间测绘·{engine}")
+        self.claim_root(host, f"空间测绘·{engine}", source_type="space")
         if is_ip(ip):
             self.ips.setdefault(host, set()).add(ip)
+            self.note_ip(ip, f"space:{engine}")
         self.save_asset({"kind": "domain", "url": f"domain:{host}", "host": host,
                          "ip": ip if is_ip(ip) else None, "root_domain": root,
                          "port": port or None, "title": title or None,
@@ -2139,6 +2185,7 @@ class StagesMixin:
                     # 存成 IP 资产只会让端口扫描和存活探测去排永远连不上的地址
                     inner_ips.add(ip)
                     continue
+                self.note_ip(ip, f"dns:{d}")
                 self.save_asset({"kind": "ip", "url": f"ip:{ip}", "ip": ip, "sources": "dns",
                                  "root_domain": root})
             self.save_asset({
@@ -2453,16 +2500,24 @@ class StagesMixin:
         for ip in parsed["ips"]:
             urls.add(f"http://{ip}")
             urls.add(f"https://{ip}")
+        # 小程序 / APP 包、测绘、DNS 里看到的 IP 也进探活队列：这些正是「从某个包里
+        # 扫出来的一堆 IP」，不探活就只是线索，探过之后才知道哪台真有业务面。
+        for ip in self.ip_origin:
+            if is_ip(ip) and is_public_ip(ip):
+                urls.add(f"http://{ip}")
+                urls.add(f"https://{ip}")
         urls |= {u for u in self.hosts_to_probe
                  if is_ip(host_of(u) or "") or self._root(host_of(u) or "") in own}
         urls = {u for u in urls if normalize_url(u)}
         limit = int(self.opt("probe_limit", 0) or 0) or MAX_PROBE_DEFAULT
         if len(urls) > limit:
-            # 先探域名（有意义的为主），再探 IP:端口
+            # 域名优先，但给 IP 留三成名额：包 / 测绘里看到的 IP 全被截掉，
+            # 就等于这些线索永远停在「未探测」。
             dom_urls = sorted(u for u in urls if not is_ip(host_of(u) or ""))
             ip_urls = sorted(u for u in urls if is_ip(host_of(u) or ""))
-            urls = set((dom_urls + ip_urls)[:limit])
-            self.log("web", f"URL 数超上限，截取 {limit} 个（可用 probe_limit 调整）", "warn")
+            ip_quota = min(len(ip_urls), max(limit // 3, 50))
+            urls = set(dom_urls[:limit - ip_quota] + ip_urls[:ip_quota])
+            self.log("web", f"URL 数超上限，截取 {len(urls)} 个（可用 probe_limit 调整）", "warn")
         self.log("web", f"存活探测 {len(urls)} 个 URL")
         http_conc = int(self.opt("http_concurrent", 0) or 0) or int(config.get("http", "concurrent") or 100)
         sem = asyncio.Semaphore(http_conc)
@@ -2540,6 +2595,9 @@ class StagesMixin:
             u = info.final_url or info.url
             host = host_of(info.url) or ""
             root = self._root(host) if host and not is_ip(host) else ""
+            # 裸 IP 直连探测：出处是解析 / 测绘 / 小程序包里的记录，写进资产，
+            # 资产表里才能看出「这台机器是从哪看到的」，而不是凭空冒出来的 web 资产
+            src_type, src_url = self.ip_source(host) if is_ip(host) else ("", "")
             # cdn 字段在 ARL 语义里是「域名 CNAME 到了 CDN」，IP 直连探测不参与该判定
             self.save_asset({
                 "kind": "site", "url": normalize_url(u) or info.url,
@@ -2549,6 +2607,7 @@ class StagesMixin:
                     next(iter(self.ips.get(host) or ()), "")),
                 "fingerprint": ",".join(info.fingerprint), "server": info.server,
                 "root_domain": root, "sources": "web",
+                "source_type": src_type, "source_url": src_url,
                 "extra": {"cert": info.cert, "favicon": info.favicon_hash,
                           "final_url": info.final_url, "title": info.title,
                           "fingerprint": info.fingerprint,

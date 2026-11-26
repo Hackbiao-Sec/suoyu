@@ -24,12 +24,18 @@ const UBO_CHOICES = [
   { v: 5, label: '5% 举牌线' },
 ]
 const EQUITY_CHOICES = [
-  { v: 100, label: '100% 全资' },
-  { v: 67, label: '67% 绝对控股' },
-  { v: 51, label: '51% 控盘' },
-  { v: 34, label: '34% 重大影响' },
-  { v: 0, label: '0% 全部持股' },
+  { v: 100, label: '100 全资' },
+  { v: 67, label: '67 绝对控股' },
+  { v: 51, label: '51 控盘' },
+  { v: 34, label: '34 重大影响' },
+  { v: 1, label: '1 有持股' },
 ]
+// 门槛是用户自己定的线：填 1~100 任意整数，下面几个只是常用档的快捷按钮
+function clampRatio(v) {
+  const n = Math.round(Number(v))
+  if (!Number.isFinite(n) || n <= 0) return 100
+  return Math.min(100, Math.max(1, n))
+}
 const loading = ref(false)
 const result = ref(null)
 const error = ref('')
@@ -168,7 +174,7 @@ async function run() {
       expand_mobile: expandMobile.value,
       name: taskName.value.trim() || undefined,
       policy_id: policyId.value || undefined,
-      equity_ratio: has('p1') && expandEnterprise.value ? equityRatio.value : undefined,
+      equity_ratio: has('p1') && expandEnterprise.value ? clampRatio(equityRatio.value) : undefined,
       equity_ubo_threshold: has('p1') && expandEnterprise.value ? uboThreshold.value : undefined,
       options: { ...options },
     })
@@ -273,11 +279,11 @@ onMounted(() => {
               </button>
             </div>
             <div class="row" style="gap: 10px; flex-wrap: wrap">
-              <div class="field" style="width: 148px">
-                <span class="field-label">控股门槛</span>
-                <select v-model.number="equityRatio" class="input" :disabled="!has('p1') || !expandEnterprise">
-                  <option v-for="r in EQUITY_CHOICES" :key="r.v" :value="r.v">{{ r.label }}</option>
-                </select>
+              <div class="field" style="width: 132px">
+                <span class="field-label">控股门槛 %</span>
+                <input v-model.number="equityRatio" class="input" type="number" min="1" max="100" step="1"
+                       :disabled="!has('p1') || !expandEnterprise"
+                       @blur="equityRatio = clampRatio(equityRatio)" />
               </div>
               <div class="field" style="width: 148px">
                 <span class="field-label">实控线</span>
@@ -285,7 +291,13 @@ onMounted(() => {
                   <option v-for="r in UBO_CHOICES" :key="r.v" :value="r.v">{{ r.label }}</option>
                 </select>
               </div>
-              <span class="tip flex-1">控股门槛决定收哪些子公司（100% 只收全资，0 收全部持股）；实控线是股东树折算后判定控制的线。</span>
+              <span class="tip flex-1">控股门槛填 1~100 任意值：100 只收全资，51 收控盘子公司，1 收下所有有持股的。实控线是股东树折算后判定控制的线。</span>
+            </div>
+            <div class="row" style="gap: 6px; flex-wrap: wrap">
+              <button v-for="r in EQUITY_CHOICES" :key="r.v" class="btn xs"
+                      :class="{ primary: equityRatio === r.v }"
+                      :disabled="!has('p1') || !expandEnterprise"
+                      @click="equityRatio = r.v">{{ r.label }}%</button>
             </div>
           </div>
         </div>

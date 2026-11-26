@@ -30,7 +30,7 @@ from typing import Any
 
 import httpx
 
-from ...utils import run_blocking
+from ...utils import ip_host, is_public_ip, run_blocking
 
 UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 "
       "(KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.40")
@@ -192,6 +192,11 @@ RULES: tuple[dict[str, Any], ...] = (
     {"id": "jdbc", "name": "连接串", "bucket": "连接串",
      "gate": ("jdbc", "://"),
      "re": r"""(?i)\b(?:jdbc:[a-z]+://[^\s"'<>]{8,200}|(?:mysql|postgres(?:ql)?|mongodb|redis|amqp)://[^\s"'<>]{8,200})"""},
+    # 包里写死的公网 IP：是「这台机器在代码里出现过」的线索，不是可请求站点。
+    # 只认引号包住的形式，避开版本号 / 时间戳这类裸点分数字。
+    {"id": "ip", "name": "IP 直连", "bucket": "IP 直连",
+     "gate": (".",),
+     "re": r"""["']((?:\d{1,3}\.){3}\d{1,3})(?::(\d{1,5}))?["']"""},
     {"id": "inner_host", "name": "内网主机", "bucket": "内网主机",
      "gate": ("10.", "127.", "192.168", "172.1", "172.2", "172.3"),
      "re": r"""\b((?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})(?::\d{2,5})?\b"""},
@@ -204,7 +209,7 @@ _COMPILED: tuple[tuple[dict[str, Any], re.Pattern[str]], ...] = tuple(
 BUCKETS: tuple[tuple[str, str], ...] = (
     ("api", "API"), ("url", "URL"), ("account", "账号密码"), ("key", "Key"),
     ("static", "静态资源"), ("phone", "手机号"), ("idcard", "身份证"),
-    ("jdbc", "连接串"), ("inner_host", "内网主机"),
+    ("jdbc", "连接串"), ("ip", "IP 直连"), ("inner_host", "内网主机"),
 )
 _BUCKET_LABEL = dict(BUCKETS)
 
@@ -249,6 +254,8 @@ class ScanResult:
     hits: dict[str, list[str]] = field(default_factory=dict)   # 规则 id → 命中值
     apis: list[str] = field(default_factory=list)
     domains: set = field(default_factory=set)
+    # 包里出现的公网 IP 字面量：只当泄露线索，不进可请求站点池
+    ips: set = field(default_factory=set)
     notes: list[str] = field(default_factory=list)
     # 主体还原：包内标题、应用名候选、gh_ 号、入口页
     titles: list[str] = field(default_factory=list)
@@ -312,6 +319,7 @@ class ScanResult:
             if url not in self.apis and len(self.apis) < 2000:
                 self.apis.append(url)
         self.domains.update(other.domains)
+        self.ips.update(other.ips)
         for note in other.notes:
             if note and note not in self.notes:
                 self.notes.append(note)
@@ -338,6 +346,7 @@ class ScanResult:
                 "bytes": self.bytes,
                 "hits": {k: v[:40] for k, v in self.hits.items()},
                 "apis": self.apis[:60], "domains": sorted(self.domains)[:60],
+                "ips": sorted(self.ips)[:60],
                 "notes": self.notes,
                 "name": self.app_name(),
                 "titles": self.titles[:8], "subject": self.subject,
@@ -380,6 +389,15 @@ def scan_text(box: ScanResult, text: str, source: str = "") -> None:
             val = (val or m.group(0)).strip().strip("'\"").rstrip(".,;:")
             if not val:
                 continue
+            if rid == "ip":
+                ipv = (m.group(1) or "").strip()
+                if not is_public_ip(ipv):
+                    continue
+                port = (m.group(2) or "").strip()
+                item = f"{ipv}:{port}" if port else ipv
+                box.ips.add(item)
+                _push(bucket, item)
+                continue
             if rid == "url":
                 vlow = val.lower()
                 if any(n in vlow for n in _NOISE_HOST):
@@ -389,7 +407,11 @@ def scan_text(box: ScanResult, text: str, source: str = "") -> None:
                     continue
                 host = re.sub(r"^https?://", "", vlow).split("/")[0]
                 if host:
-                    box.domains.add(host)
+                    if ip_host(host):
+                        # 包里直连 IP 的 URL：记成 IP 线索，别混进域名池去当根域
+                        box.ips.add(host)
+                    else:
+                        box.domains.add(host)
             elif rid == "api":
                 if len(val) > 120:
                     continue
@@ -1126,6 +1148,7 @@ def mini_app_record(appid: str, pkgs: list[str], *, max_pkgs: int = 6,
     item.update({
         "files": box.files, "bytes": box.bytes,
         "apis": box.apis[:500], "domains": sorted(box.domains)[:500],
+        "ips": sorted(box.ips)[:200],
         "hits": {k: v[:40] for k, v in (box.hits or {}).items()},
         "name": box.app_name(),
         "titles": box.titles[:8], "subject": box.subject,
@@ -1142,9 +1165,9 @@ def mini_app_record(appid: str, pkgs: list[str], *, max_pkgs: int = 6,
 # 目标一变就重扫不现实，于是把「读包结果」按包指纹落盘：包没动就复用，只有新包 /
 # 改过的包才重读。这样就不用靠少扫几个包来控耗时——少扫会让目标那个包根本没被看过，
 # 于是「本机明明有它，结果一条都对不上」。扫不完就如实报 scanned / total / truncated。
-_INDEX_VER = 2
+_INDEX_VER = 3
 _INDEX_KEEP = ("appid", "version", "versions", "version_total", "encrypted",
-               "files", "bytes", "apis", "domains", "gh_ids", "entry", "name",
+               "files", "bytes", "apis", "domains", "ips", "gh_ids", "entry", "name",
                "titles", "subject", "counts", "buckets", "notes")
 
 

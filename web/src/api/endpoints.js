@@ -48,12 +48,19 @@ export const assetDetail = (id) => http.get(`/api/assets/${id}`)
 export const deleteAssets = (ids) => http.post('/api/assets/delete', { ids })
 export const assetFacets = (params) => http.get('/api/assets/facets', { params })
 export const repairLiveness = (taskId = '') => http.post('/api/assets/liveness', null, { params: { task_id: taskId } })
+// 批量探活：对还没探过的资产真的发一次 HTTP，进度轮询 probeStatus
+export const probeAssets = (payload = {}) => http.post('/api/assets/probe', payload)
+export const probeStatus = () => http.get('/api/assets/probe')
 export const exportAssets = (params) => http.get('/api/export', { params, responseType: 'blob' })
 // 分表册：每张表的条数（子公司 / ICP / 站点…），资产页据此摆分类卡
 export const exportSheets = (params) => http.get('/api/export/sheets', { params })
 // 一次导出多张工作表；ratio 只作用于控股 / 对外投资 / 股东
 export const exportWorkbook = (params) =>
   http.get('/api/export/xlsx', { params, responseType: 'blob', timeout: 300000 })
+// 归属审核：每个根域 / 主体为什么放行、待审或拒绝（规则一层，AI 一层）
+export const listReviews = (params) => http.get('/api/reviews', { params })
+// 人工改判一条审核记录；下次同名根域再出现按新结论走
+export const setReviewVerdict = (payload) => http.post('/api/reviews/verdict', payload)
 // 脆弱资产分桶：不传 task_id 是整体，传了就是单个任务
 export const riskOverview = (params) => http.get('/api/risk', { params })
 // 按任务分隔的脆弱资产计数，给「整体 / 按任务」双视图用

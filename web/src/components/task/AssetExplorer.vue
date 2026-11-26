@@ -41,10 +41,11 @@ const openId = ref(null)
 let kwTimer = null
 
 const SURFACE_LABEL = {
-  web: 'Web', applet: '小程序', mp: '公众号', app: 'APP',
+  web: 'Web 站点', host: '主机与端口', api: '接口路径', leak: '泄露线索',
+  applet: '小程序', mp: '公众号', app: 'APP',
   netblock: '网段', icp: '备案', meta: '主体与邮箱',
 }
-const SURFACE_ORDER = ['web', 'applet', 'mp', 'app', 'netblock', 'icp', 'meta']
+const SURFACE_ORDER = ['web', 'host', 'api', 'leak', 'applet', 'mp', 'app', 'netblock', 'icp', 'meta']
 const MP_KINDS = ['wxmp']
 // 与后端 db._META_KINDS 对齐：漏一个类型就会被算成 Web，点了「主体与邮箱」反而看不到
 const META_KINDS = [
@@ -238,6 +239,12 @@ function rowHint(a) {
   }
   return parts.join(' · ')
 }
+// 与后端 surface_cond 对齐：Web 只算完整可请求地址，裸域名/IP/端口归主机面，
+// 接口路径单列，小程序包里扫出来的东西归泄露线索
+const WEB_KINDS = ['site', 'web', 'bucket', 'git', 'component', 'js']
+const HOST_KINDS = ['domain', 'ip', 'port', 'sibling', 'vhost', 'service']
+const LEAK_KINDS = ['leak', 'leakfile', 'codeleak']
+
 function surfaceOf(k) {
   if (k === 'applet')
     return 'applet'
@@ -251,7 +258,15 @@ function surfaceOf(k) {
     return 'netblock'
   if (k === 'icp')
     return 'icp'
-  return 'web'
+  if (LEAK_KINDS.includes(k))
+    return 'leak'
+  if (k === 'api')
+    return 'api'
+  if (WEB_KINDS.includes(k))
+    return 'web'
+  if (HOST_KINDS.includes(k))
+    return 'host'
+  return 'host'
 }
 
 const rx = computed(() => {
