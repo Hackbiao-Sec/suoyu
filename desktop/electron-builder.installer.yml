@@ -1,0 +1,44 @@
+appId: com.tianjian.suoyu
+productName: Suoyu Console
+copyright: TianJian Suoyu
+directories:
+  output: release/installer
+  buildResources: build
+files:
+  - main.js
+  - preload.js
+  - splash.html
+  - package.json
+extraResources:
+  - from: ../dist/suoyu-server.exe
+    to: bin/suoyu-server.exe
+  # 安装版把 nuclei / httpx / jadx / apktool / ffuf / ehole / dirsearch 一起带走，
+  # 外壳通过 ARLX_TOOLS 指到 resources/bin/tools，装完即可直接用，不必再下载
+  - from: ../tools
+    to: bin/tools
+  - from: assets/icon.ico
+    to: icon.ico
+asar: true
+npmRebuild: false
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: assets/icon.ico
+  requestedExecutionLevel: asInvoker
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: true
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: 天鉴·索舆
+  uninstallDisplayName: 天鉴·索舆
+  artifactName: SuoyuConsole-${version}-setup.${ext}
+  installerIcon: assets/icon.ico
+  uninstallerIcon: assets/icon.ico
+  installerHeaderIcon: assets/icon.ico
+  deleteAppDataOnUninstall: false
+  runAfterFinish: true

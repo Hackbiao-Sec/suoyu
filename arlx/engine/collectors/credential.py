@@ -13,7 +13,10 @@
 from __future__ import annotations
 
 import base64
-import subprocess
+import contextlib
+import io
+import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -441,17 +444,31 @@ TCP_TRY = {
 }
 
 
-async def _run_py(script: str, *args: str) -> str:
-    """跑一小段 Python，用当前解释器；超时或异常返回空串。"""
-    import asyncio
-    import sys
+_PY_LOCK = threading.Lock()
 
+
+async def _run_py(script: str, *args: str) -> str:
+    """在当前进程里跑一小段探测脚本，收回它 print 的结果。
+
+    早先用 ``sys.executable -c`` 起子进程：打包成单文件 exe 之后
+    ``sys.executable`` 就是程序自己，每验一组口令都会拉起第二个完整实例
+    （占端口、占内存，窗口化引导下还会闪一下黑框）。这里改成同进程执行，
+    探测脚本本身是阻塞的 socket 调用，放在工作线程里跑，不会卡事件循环。
+    """
     def work() -> str:
-        try:
-            p = subprocess.run([sys.executable, "-c", script, *args], capture_output=True, timeout=20)
-            return p.stdout.decode("utf-8", "ignore")
-        except Exception:
-            return ""
+        buf = io.StringIO()
+        with _PY_LOCK:
+            old_argv = sys.argv
+            sys.argv = ["-c", *args]
+            try:
+                code = compile(script, "<credential-probe>", "exec")
+                with contextlib.redirect_stdout(buf):
+                    exec(code, {"__name__": "__main__"})
+            except Exception:
+                return ""
+            finally:
+                sys.argv = old_argv
+        return buf.getvalue()
 
     return await run_blocking_slow(work, timeout=25)
 

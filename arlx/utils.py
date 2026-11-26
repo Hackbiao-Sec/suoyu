@@ -11,7 +11,9 @@ import functools
 import hashlib
 import ipaddress
 import json
+import os
 import re
+import subprocess
 from typing import Any
 import socket
 import threading
@@ -25,6 +27,28 @@ import sys
 import tldextract
 
 from .config import ROOT
+
+
+def hidden_creationflags() -> int:
+    """子进程创建标志：不新开控制台窗口。
+
+    引擎是窗口化打包（console=False），从它里面拉起 nuclei、jadx.bat 这类
+    控制台程序时 Windows 会默认分配新控制台，屏幕上就闪一下黑框。
+    所有 spawn 点统一带这个标志。
+    """
+    if os.name != "nt":
+        return 0
+    return int(getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+
+
+def hidden_kwargs() -> dict:
+    """给 subprocess.run/Popen 用的完整「不弹窗」参数。"""
+    if os.name != "nt":
+        return {}
+    info = subprocess.STARTUPINFO()
+    info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    info.wShowWindow = 0  # SW_HIDE
+    return {"creationflags": hidden_creationflags(), "startupinfo": info}
 
 
 def _tld_kwargs() -> dict:

@@ -3,28 +3,95 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="apple-touch-icon" href="/icon.png" />
+    <meta name="theme-color" content="#060b11" />
     <title>天鉴·索舆 · 资产侦察平台</title>
   </head>
   <body>
     <div id="app">
+      <!-- 引擎页面载入前的占位：与桌面启动动画同一套徽记与配色 -->
       <div class="boot-splash">
-        <div class="boot-ring"></div>
-        <div class="boot-text">天鉴·索舆 正在载入</div>
+        <svg class="boot-mark" viewBox="0 0 120 120" aria-hidden="true">
+          <defs>
+            <linearGradient id="bootArc" x1="0" y1="1" x2="1" y2="0">
+              <stop offset="0%" stop-color="#34e5c8" stop-opacity="0" />
+              <stop offset="55%" stop-color="#34e5c8" stop-opacity="0.9" />
+              <stop offset="100%" stop-color="#a9fff2" stop-opacity="1" />
+            </linearGradient>
+            <radialGradient id="bootSweep">
+              <stop offset="0%" stop-color="#34e5c8" stop-opacity="0.55" />
+              <stop offset="100%" stop-color="#34e5c8" stop-opacity="0" />
+            </radialGradient>
+          </defs>
+          <circle cx="60" cy="60" r="46" fill="none" stroke="#34e5c8" stroke-opacity="0.14" stroke-width="1" />
+          <circle class="boot-rim" cx="60" cy="60" r="38" fill="none" stroke="url(#bootArc)" stroke-width="1.6"
+                  stroke-dasharray="84 156" stroke-linecap="round" />
+          <circle class="boot-inner" cx="60" cy="60" r="26" fill="none" stroke="#34e5c8" stroke-opacity="0.28"
+                  stroke-width="1" stroke-dasharray="2 7" />
+          <g class="boot-sweep-g">
+            <path d="M60 60 L60 14 A46 46 0 0 1 92.5 27.5 Z" fill="url(#bootSweep)" />
+          </g>
+          <path d="M60 40 v6 M60 74 v6 M40 60 h6 M74 60 h6" stroke="#34e5c8" stroke-opacity="0.7"
+                stroke-width="1.4" stroke-linecap="round" />
+          <circle cx="60" cy="60" r="3.2" fill="#a9fff2" />
+          <circle class="boot-blip" cx="78" cy="42" r="2.6" fill="#34e5c8" />
+        </svg>
+        <div class="boot-name">天鉴<span>·</span>索舆</div>
+        <div class="boot-sub">SUOYU RECON · 正在载入作战台</div>
+        <div class="boot-line"><i></i></div>
       </div>
     </div>
     <style>
+      /* 占位页自己撑满屏；不重置外边距会多出滚动条 */
+      html, body { margin: 0; padding: 0; height: 100%; background: #060b11; }
       .boot-splash {
         height: 100vh; display: flex; flex-direction: column; align-items: center;
-        justify-content: center; gap: 18px; background: #060b11; color: #77909f;
-        font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif; font-size: 13px;
-        letter-spacing: 2px;
+        justify-content: center; gap: 14px;
+        background:
+          radial-gradient(circle at 50% 44%, rgba(52, 229, 200, 0.08), transparent 58%),
+          #060b11;
+        color: #7d97a6; font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+        overflow: hidden;
       }
-      .boot-ring {
-        width: 34px; height: 34px; border-radius: 50%;
-        border: 2px solid rgba(52, 229, 200, 0.16); border-top-color: #34e5c8;
-        animation: boot-spin 0.9s linear infinite;
+      .boot-mark { width: 132px; height: 132px; overflow: visible; }
+      .boot-rim {
+        transform-box: view-box; transform-origin: 60px 60px;
+        animation: boot-spin 3.4s linear infinite;
+      }
+      .boot-inner {
+        transform-box: view-box; transform-origin: 60px 60px;
+        animation: boot-spin 22s linear infinite reverse;
+      }
+      .boot-sweep-g {
+        transform-box: view-box; transform-origin: 60px 60px;
+        animation: boot-spin 2.6s linear infinite;
+      }
+      .boot-blip { animation: boot-blip 1.8s ease-in-out infinite; }
+      .boot-name {
+        font-size: 21px; font-weight: 600; letter-spacing: 10px; color: #e6f6f2;
+        padding-left: 10px;
+      }
+      .boot-name span { color: #34e5c8; }
+      .boot-sub {
+        font-size: 11px; letter-spacing: 3px; color: #52707f; text-transform: uppercase;
+      }
+      .boot-line {
+        margin-top: 8px; width: 188px; height: 2px; border-radius: 2px;
+        background: rgba(52, 229, 200, 0.12); overflow: hidden;
+      }
+      .boot-line i {
+        display: block; width: 42%; height: 100%; border-radius: 2px;
+        background: linear-gradient(90deg, transparent, #34e5c8, #a9fff2, transparent);
+        animation: boot-run 1.35s ease-in-out infinite;
       }
       @keyframes boot-spin { to { transform: rotate(360deg); } }
+      @keyframes boot-blip {
+        0%, 100% { opacity: 0.25; } 45% { opacity: 1; }
+      }
+      @keyframes boot-run {
+        0% { transform: translateX(-110%); } 100% { transform: translateX(340%); }
+      }
     </style>
     <script type="module" src="/src/main.js"></script>
   </body>

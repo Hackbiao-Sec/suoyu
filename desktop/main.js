@@ -21,6 +21,14 @@ let quitting = false;
 // 引擎子进程提前退出时记下来：探活还在傻等 60 秒，用户看到的就是「卡住 + 白屏」
 let engineExited = null;
 
+// 启动动画：跑满 5 秒再切主界面；淡出留给页面自己做，切过去时不留硬切
+const SPLASH_MS = 5000;
+const SPLASH_FADE_MS = 560;
+let splashStartedAt = 0;
+let splashReady = false;
+let splashGone = false;
+let pendingStep = "";
+
 // ── 自绘窗口按钮的 IPC ─────────────────────────────────────────
 // 按发送方定位窗口：内嵌窗口和外链窗口共用同一套网页按钮，不写死主窗口。
 const senderWindow = (event) => BrowserWindow.fromWebContents(event.sender);
@@ -101,6 +109,37 @@ function serverExe() {
   return candidates.find((p) => p && fs.existsSync(p)) || "";
 }
 
+/** 窗口 / 任务栏图标：安装包把它放在 resources 根，开发时读 assets。 */
+function appIcon() {
+  const packed = path.join(process.resourcesPath || "", "icon.ico");
+  const local = path.join(__dirname, "assets", "icon.ico");
+  if (packed && fs.existsSync(packed)) return packed;
+  if (fs.existsSync(local)) return local;
+  return undefined;
+}
+
+/** 安装版随包携带的工具目录（构建时把 tools/ 放到 resources/bin/tools）。 */
+function bundledTools() {
+  const dir = path.join(process.resourcesPath || "", "bin", "tools");
+  try {
+    return fs.existsSync(dir) ? dir : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * 工具装在哪：安装版直接用随包目录，装进去的工具能留到下次启动；
+ * 便携版每次解压到新的临时目录，所以改用用户数据目录，否则退出就全没了。
+ */
+function toolsDir() {
+  const bundled = bundledTools();
+  if (bundled) return bundled;
+  const dir = path.join(app.getPath("userData"), "tools");
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 function startServer(port) {
   const exe = serverExe();
   if (!exe) {
@@ -109,7 +148,8 @@ function startServer(port) {
   }
   const dataDir = path.join(app.getPath("userData"), "data");
   fs.mkdirSync(dataDir, { recursive: true });
-  log(`start engine ${exe} port=${port} data=${dataDir}`);
+  const toolRoot = toolsDir();
+  log(`start engine ${exe} port=${port} data=${dataDir} tools=${toolRoot}`);
   engineExited = null;
   const child = spawn(exe, [], {
     cwd: path.dirname(exe),
@@ -118,6 +158,9 @@ function startServer(port) {
       ARLX_PORT: String(port),
       ARLX_HOST: "127.0.0.1",
       ARLX_DATA: dataDir,
+      ARLX_TOOLS: toolRoot,
+      // 随包工具也挂到 PATH：个别工具会自己再拉兄弟程序，光靠绝对路径找不到
+      PATH: toolRoot + path.delimiter + (process.env.PATH || ""),
       PYTHONIOENCODING: "utf-8",
       PYTHONUTF8: "1",
     },
@@ -193,21 +236,43 @@ function readStatus(port) {
 }
 
 /** 启动期间窗口里是本地 splash，等引擎时用这两句更新文案，避免白屏干等 */
-function splashStep(text) {
-  if (!win || win.isDestroyed()) return;
+function applySplash(kind, text) {
+  if (!win || win.isDestroyed() || splashGone) return;
   win.webContents
-    .executeJavaScript(`window.__suoyuStep && window.__suoyuStep(${JSON.stringify(text)})`)
+    .executeJavaScript(`window.__suoyu${kind} && window.__suoyu${kind}(${JSON.stringify(text)})`)
     .catch(() => {});
+}
+
+function splashStep(text) {
+  pendingStep = text;
+  // splash 还没加载完就先攒着，did-finish-load 时补一条，文案不会丢
+  if (!splashReady) return;
+  applySplash("Step", text);
 }
 
 function splashFail(text) {
-  if (!win || win.isDestroyed()) return;
-  win.webContents
-    .executeJavaScript(`window.__suoyuFail && window.__suoyuFail(${JSON.stringify(text)})`)
-    .catch(() => {});
+  applySplash("Fail", text);
+  splashGone = true;
 }
 
-async function waitReady(port, timeoutMs = 60000) {
+/**
+ * 收尾：先让动画跑满 5 秒，再让页面淡出，最后才载入主界面。
+ * 引擎比动画慢时（首次建库）就地等它，进度条停在 100% 并提示预热中。
+ */
+async function finishSplash() {
+  if (splashGone) return;
+  const left = SPLASH_MS - (Date.now() - splashStartedAt);
+  if (left > 0) await new Promise((r) => setTimeout(r, left));
+  if (win && !win.isDestroyed()) {
+    await win.webContents
+      .executeJavaScript("window.__suoyuFinish && window.__suoyuFinish()")
+      .catch(() => {});
+  }
+  await new Promise((r) => setTimeout(r, SPLASH_FADE_MS));
+  splashGone = true;
+}
+
+async function waitReady(port, timeoutMs = 120000) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     if (await probe(port)) return true;
@@ -254,6 +319,7 @@ function createWindow() {
     title: "天鉴·索舆",
     // 只留无框窗口：不设 titleBarOverlay，右上角不会再有原生按钮压在功能区上
     titleBarStyle: "hidden",
+    icon: appIcon(),
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -265,7 +331,17 @@ function createWindow() {
   trackMaximized(win);
 
   // 先挂本地 splash：引擎冷启动十几秒，这段窗口期不能是白的
-  win.loadFile(path.join(__dirname, "splash.html")).catch((err) => log(`splash load failed ${err}`));
+  splashReady = false;
+  splashGone = false;
+  splashStartedAt = Date.now();
+  win.webContents.on("did-finish-load", () => {
+    if (splashGone) return;
+    splashReady = true;
+    if (pendingStep) applySplash("Step", pendingStep);
+  });
+  win.loadFile(path.join(__dirname, "splash.html"), {
+    query: { v: app.getVersion() },
+  }).catch((err) => log(`splash load failed ${err}`));
 
   const showWindow = (why) => {
     if (!win || win.isDestroyed() || win.isVisible()) return;
@@ -361,7 +437,7 @@ app.whenReady().then(async () => {
     splashFail(exited ? "引擎启动失败" : "引擎启动超时");
     const headline = exited
       ? `本地侦察引擎启动后立即退出${exited.error ? `：${exited.error}` : `（code=${exited.code}）`}。`
-      : "本地侦察引擎在 60 秒内没有就绪。";
+      : "本地侦察引擎在 120 秒内没有就绪。";
     const tail = engineLogTail();
     const choice = dialog.showMessageBoxSync(win, {
       type: "error",
@@ -377,7 +453,11 @@ app.whenReady().then(async () => {
   }
   const status = await readStatus(serverPort);
   log(`engine ready port=${serverPort} version=${status?.version} build=${status?.build}`);
-  splashStep("引擎就绪，正在载入界面…");
+  splashStep(
+    status?.version ? `引擎 v${status.version} 就绪，正在进入作战台…` : "引擎就绪，正在进入作战台…",
+  );
+  // 动画至少跑满 5 秒，再淡出，最后才把窗口切到工具本体
+  await finishSplash();
   await win.loadURL(`http://127.0.0.1:${serverPort}/`);
 });
 

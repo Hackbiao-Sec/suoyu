@@ -58,7 +58,7 @@ class Utf8JSONResponse(JSONResponse):
                           separators=(",", ":"), default=str).encode("utf-8")
 
 
-app = FastAPI(title=APP_TITLE, version="2.8.0", default_response_class=Utf8JSONResponse)
+app = FastAPI(title=APP_TITLE, version="2.9.0", default_response_class=Utf8JSONResponse)
 STATIC_DIR = BUILD_DIR
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -193,7 +193,7 @@ async def logout(request: Request) -> dict:
 
 @app.get("/api/me")
 async def me(request: Request) -> dict:
-    return {"username": current_user(request), "version": "2.8.0"}
+    return {"username": current_user(request), "version": "2.9.0"}
 
 
 # ─────────────── 配置 ───────────────
@@ -2145,12 +2145,12 @@ async def search(request: Request, body: dict = Body(...)) -> dict:
 # ─────────────── 总览 / 资产组 / 分面 ───────────────
 @app.get("/api/health")
 def health() -> dict:
-    return {"ok": True, "app": "suoyu", "version": "2.8.0", "ts": time.time()}
+    return {"ok": True, "app": "suoyu", "version": "2.9.0", "ts": time.time()}
 
 
 @app.get("/api/version")
 def version() -> dict:
-    return {"ok": True, "app": "天鉴·索舆", "version": "2.8.0", "build": "2026.11"}
+    return {"ok": True, "app": "天鉴·索舆", "version": "2.9.0", "build": "2026.11"}
 
 
 @app.get("/api/throttle")
@@ -3326,7 +3326,7 @@ async def listener_callback(token: str, request: Request) -> Response:
 @app.get("/api/status")
 def app_status(request: Request) -> dict:
     """套壳（Electron）轮询用的就绪探针，不需要登录。"""
-    return {"ok": True, "app": "天鉴·索舆", "version": "2.8.0", "build": _build_id()}
+    return {"ok": True, "app": "天鉴·索舆", "version": "2.9.0", "build": _build_id()}
 
 
 @app.get("/api/dashboard/stats")

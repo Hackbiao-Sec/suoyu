@@ -65,5 +65,6 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
-    icon=None,
+    # 与安装包、窗口、网页共用一套品牌图标；ico 缺失时退回 PyInstaller 默认图
+    icon=str(ROOT / "desktop" / "build" / "icon.ico") if (ROOT / "desktop" / "build" / "icon.ico").exists() else None,
 )

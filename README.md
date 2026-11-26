@@ -123,11 +123,16 @@ deepseek / openai（AI 扩展关键词）。
 
 | 项 | 说明 |
 |---|---|
-| 外壳源码 | `desktop/main.js`、`desktop/electron-builder.yml` |
-| 打包命令 | `cd desktop; npx electron-builder --win portable --x64` |
+| 外壳源码 | `desktop/main.js`、`desktop/electron-builder.yml`（便携版）、`desktop/electron-builder.installer.yml`（安装版） |
+| 打包命令（便携版） | `cd desktop; npm run dist:portable` |
+| 打包命令（安装版） | `cd desktop; npm run dist:installer` |
+| 打包命令（两个都打） | `cd desktop; npm run dist` |
 | 前端构建 | `cd web; .\node_modules\.bin\vite.cmd build`（先建前端，再建 exe，最后打外壳） |
 | 引擎打包 | `python -m PyInstaller --noconfirm --clean suoyu-server.spec` |
-| 产物 | `desktop/release/SuoyuConsole-2.8.0-portable.exe` |
+| 产物（便携版） | `desktop/release/SuoyuConsole-<版本>-portable.exe`，单文件、解压即跑，不带外部工具 |
+| 产物（安装版） | `desktop/release/installer/SuoyuConsole-<版本>-setup.exe`，NSIS 可选安装目录，随包附 `resources/bin/tools`（nuclei / httpx / jadx / apktool / ffuf / ehole / dirsearch），外壳用 `ARLX_TOOLS` 指过去，装完即用 |
+| 图标 | 引擎 exe、安装包 / 卸载器 / 向导头部、窗口与任务栏、网页 favicon 共用 `desktop/assets/icon.ico` |
+| 启动动画 | `desktop/splash.html`（5 秒品牌动画，进度跑满后等引擎就绪再淡出） |
 | 端口策略 | 从 5113 起找空闲端口；探活必须命中 `/api/status` 且 `app` 含「索舆」，避免误把本机其它服务当引擎 |
 | 数据目录 | `%APPDATA%\suoyu-console\data`（与源码调试库相互独立） |
 | 日志 | `%APPDATA%\suoyu-console\logs\shell.log`、`engine.log` |

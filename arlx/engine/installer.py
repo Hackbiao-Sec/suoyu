@@ -32,19 +32,26 @@ import httpx
 from ..config import ROOT, config
 
 def _tools_root() -> Path:
-    """程序旁边优先：便携版解包目录只读、删了就没，工具要能留在原地反复用。"""
-    cands: list[Path] = []
+    """工具目录：桌面外壳指定的位置优先，其次程序旁边的 tools，最后是源码仓库。
+
+    安装版把 nuclei 等二进制随包放在 resources/bin/tools，外壳通过 ARLX_TOOLS
+    指到这里；便携版每次解到临时目录，外壳改指用户数据目录，装过的工具才不会
+    随退出一起消失。onefile 的解包目录只作兜底——它在退出时会被整个删掉。
+    """
+    bases: list[Path] = []
+    env = str(os.environ.get("ARLX_TOOLS") or "").strip()
+    if env:
+        bases.append(Path(env))
+    if getattr(sys, "frozen", False):
+        bases.append(Path(sys.executable).resolve().parent / "tools")
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
-        cands.append(Path(meipass).parent)
-    if getattr(sys, "frozen", False):
-        cands.append(Path(sys.executable).resolve().parent)
-    cands.append(Path(ROOT))
-    for base in cands:
+        bases.append(Path(meipass).parent / "tools")
+    bases.append(Path(ROOT) / "tools")
+    for base in bases:
         try:
-            probe = base / "tools"
-            probe.mkdir(parents=True, exist_ok=True)
-            return probe
+            base.mkdir(parents=True, exist_ok=True)
+            return base
         except Exception:
             continue
     return Path(ROOT) / "tools"
@@ -113,9 +120,10 @@ def _proxy_ok() -> bool:
 
 def _run_bin(path: str, *args, timeout: float = 6.0) -> subprocess.CompletedProcess:
     """跑一下装好的工具取版本；不弹窗、不带 shell。"""
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    from ..utils import hidden_kwargs
+
     return subprocess.run([path, *args], capture_output=True, timeout=timeout,
-                          creationflags=flags if os.name == "nt" else 0)
+                          **hidden_kwargs())
 
 
 def _manifest_path() -> Path:

@@ -27,7 +27,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from ...utils import is_suffix_only, is_valid_domain, root_domain
+from ...utils import hidden_kwargs, is_suffix_only, is_valid_domain, root_domain
 
 ANDROID_NS = "http://schemas.android.com/apk/res/android"
 
@@ -530,8 +530,9 @@ def _apktool_bin() -> str:
 
 def _run_tool(cmd: list[str], timeout: int) -> bool:
     try:
+        # jadx.bat 走的是 .bat，会经 cmd.exe 起进程；不隐藏就会在屏幕上闪黑框
         proc = subprocess.run(cmd, capture_output=True, timeout=timeout,
-                              cwd=str(Path(tempfile.gettempdir())))
+                              cwd=str(Path(tempfile.gettempdir())), **hidden_kwargs())
         return proc.returncode == 0
     except Exception:
         return False

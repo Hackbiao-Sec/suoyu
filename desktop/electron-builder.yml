@@ -12,6 +12,9 @@ files:
 extraResources:
   - from: ../dist/suoyu-server.exe
     to: bin/suoyu-server.exe
+  # 窗口 / 任务栏用的图标；main.js 从 resourcesPath 根读它
+  - from: assets/icon.ico
+    to: icon.ico
 asar: true
 npmRebuild: false
 win:
@@ -19,6 +22,7 @@ win:
     - target: portable
       arch:
         - x64
+  icon: assets/icon.ico
   requestedExecutionLevel: asInvoker
 portable:
   unicode: true

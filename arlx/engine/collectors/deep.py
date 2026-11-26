@@ -16,7 +16,7 @@ import re
 from urllib.parse import quote
 
 from ...config import config, src_base
-from ...utils import is_ip, root_domain
+from ...utils import hidden_creationflags, is_ip, root_domain
 from ..sources.passive import _get
 
 # 左边必须是分隔符，否则 `//cdn…/a@b.com` 这类长 URL 会从中间咬出假邮箱
@@ -294,7 +294,9 @@ async def run_nuclei(urls: list[str], severity: str = "critical,high") -> list[d
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-            stdin=asyncio.subprocess.PIPE)
+            stdin=asyncio.subprocess.PIPE,
+            # nuclei 是控制台程序，窗口化引擎拉起它时不隐藏就会闪一个黑框
+            creationflags=hidden_creationflags())
         payload = "\n".join(urls).encode()
         out, _ = await asyncio.wait_for(proc.communicate(payload), timeout=1800)
     except Exception:
